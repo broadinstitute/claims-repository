@@ -2,7 +2,7 @@ openapi: 3.1.1
 jsonSchemaDialect: https://spec.openapis.org/oas/3.1/dialect/base
 info:
   title: Claims Repository API
-  version: 0.1.0
+  version: 0.2.0
   summary: Deposit, retrieval, and constrained graph-pattern query of DAPPER claims.
   description: >-
     v0 contract for broadinstitute/claims-repository (build-plan Tasks 5 and 7).
@@ -22,7 +22,7 @@ servers:
   - url: http://127.0.0.1:8100
     description: Local development server.
   - url: https://api-qa.hugeampkpnbi.org/api/claims
-    description: QA deployment behind the dig-service-platform shared ALB (pending service registration).
+    description: QA deployment behind the dig-service-platform shared ALB (registered 2026-11-09, priority 60).
   - url: https://api-prod.hugeampkpnbi.org/api/claims
     description: Production (reserved; not a two-week promise).
 tags:

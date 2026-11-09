@@ -141,7 +141,9 @@ summaries with triple + statement + mint count, filter by method/predicate, dete
 claim_id order, limit/offset), `GET /v1/claims/search` (`entity` matches either side of the
 triple — a gene-set *name* also matches its dapper:GeneSet ID; `subject`/`object` pin one side;
 `q` substring-matches the statement), `GET /v1/claims/{id}` (full envelope), and
-`GET /v1/objects/{id}` (dereference any object). Contract: `api/openapi.yaml`.
+`GET /v1/objects/{id}` (dereference any object). Contract: `api/openapi.yaml`, served live at
+`GET /v1/openapi.yaml` with Swagger UI at `GET /v1/docs` (the hand-written contract is the
+authority; FastAPI auto-docs are disabled).
 Propositions get the same treatment (2026-11-09, Chase): `GET /v1/propositions` /
 `/v1/propositions/search` (same search language, summaries carry `n_claims`) and
 `GET /v1/propositions/{id}` — the **fan-in view**: one statement with every claim that assesses

@@ -26,6 +26,17 @@ def test_health():
     assert body["dapper_profile"] == "0.2.0-a1"
 
 
+def test_swagger_docs_and_contract():
+    docs = client.get("/v1/docs")
+    assert docs.status_code == 200
+    assert "SwaggerUIBundle" in docs.text
+    contract = client.get("/v1/openapi.yaml")
+    assert contract.status_code == 200
+    assert contract.text.startswith("openapi:")
+    # The dapper-object lookup is part of the published contract.
+    assert "/v1/objects/{object_id}" in contract.text
+
+
 def test_deposit_is_idempotent_and_retrievable():
     first = client.post("/v1/claims", json=_bundle())
     assert first.status_code == 200

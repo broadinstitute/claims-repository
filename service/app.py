@@ -16,7 +16,7 @@ from pathlib import Path
 from ariadne import ObjectType, QueryType, ScalarType, graphql_sync, make_executable_schema
 from ariadne.explorer import ExplorerGraphiQL
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from starlette.requests import Request
 
 from . import db
@@ -525,7 +525,39 @@ schema = make_executable_schema(
 # ---------------------------------------------------------------------------
 # HTTP app
 
-app = FastAPI(title="Claims Repository", version=CONTRACT_VERSION)
+# Auto-docs are off: the hand-written api/openapi.yaml is the contract
+# authority, served at /v1/openapi.yaml with Swagger UI at /v1/docs.
+app = FastAPI(
+    title="Claims Repository",
+    version=CONTRACT_VERSION,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+SWAGGER_HTML = """<!doctype html>
+<html>
+<head>
+  <title>Claims Repository API</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui.css">
+</head>
+<body>
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"></script>
+<script>
+  // Relative URL so the page works both locally (/v1/docs) and mounted under
+  // the platform prefix (/api/claims/v1/docs).
+  SwaggerUIBundle({
+    url: "openapi.yaml",
+    dom_id: "#swagger-ui",
+    presets: [SwaggerUIBundle.presets.apis],
+    deepLinking: true,
+    defaultModelsExpandDepth: 0,
+  });
+</script>
+</body>
+</html>"""
 
 DEFAULT_EXPLORER_QUERY = """\
 # Claims repository — PIGEAN IBD examples (schema docs via the sidebar).
@@ -600,6 +632,18 @@ def vocabulary():
         "phenotypes": phenotypes,
         "collections": collections,
     }
+
+
+@app.get("/v1/docs", response_class=HTMLResponse)
+def swagger_docs():
+    """Swagger UI over the hand-written REST contract (api/openapi.yaml) —
+    every endpoint including GET /v1/objects/{id}, the dapper-object lookup."""
+    return SWAGGER_HTML
+
+
+@app.get("/v1/openapi.yaml", include_in_schema=False)
+def openapi_contract():
+    return FileResponse(ROOT / "api" / "openapi.yaml", media_type="application/yaml")
 
 
 @app.get("/v1/graphql", response_class=HTMLResponse)
