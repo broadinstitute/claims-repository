@@ -27,8 +27,17 @@ servers:
     description: Production (reserved; not a two-week promise).
 tags:
   - name: Meta
+    description: Liveness, pinned profile, and the queryable vocabulary (including identifier resolution).
+  - name: Deposit
+    description: Write path — deposit bundles of DAPPER objects with index hints. Idempotent by content address.
   - name: Claims
+    description: Read claims — list, search by proposition content, and the full envelope (scores, evidence, provenance, mint count).
+  - name: Propositions
+    description: Read propositions — same search language as claims, plus the fan-in view (every claim assessing one statement).
+  - name: Objects
+    description: The resolver — dereference ANY dapper ID (Claim, Proposition, ClaimScore, GeneSet, EvidenceItem, ValueLocator, File, Activity, ...) to its stored document. Content-negotiated (JSON / landing page).
   - name: GraphQL
+    description: The constrained query surface, composed from core + per-method modules.
 security: []
 paths:
   /v1/health:
@@ -118,7 +127,7 @@ paths:
   /v1/claims:
     post:
       operationId: depositClaims
-      tags: [Claims]
+      tags: [Deposit]
       summary: Deposit a bundle of DAPPER objects (Claims with their Propositions and ClaimScores)
       description: >-
         Validates every object against the pinned DAPPER profile, verifies the
@@ -218,7 +227,7 @@ paths:
   /v1/propositions:
     get:
       operationId: listPropositions
-      tags: [Claims]
+      tags: [Propositions]
       summary: List deposited propositions
       description: >-
         Compact proposition summaries (triple, statement, kind) with
@@ -238,7 +247,7 @@ paths:
   /v1/propositions/search:
     get:
       operationId: searchPropositions
-      tags: [Claims]
+      tags: [Propositions]
       summary: Search propositions by content
       description: >-
         Same search language as /v1/claims/search, over propositions:
@@ -263,7 +272,7 @@ paths:
   /v1/propositions/{proposition_id}:
     get:
       operationId: getProposition
-      tags: [Claims]
+      tags: [Propositions]
       summary: One proposition with every claim that assesses it
       description: >-
         The fan-in view the proposition/claim split exists for: the verbatim
@@ -312,7 +321,7 @@ paths:
   /v1/objects/{object_id}:
     get:
       operationId: getObject
-      tags: [Claims]
+      tags: [Objects]
       summary: Dereference any deposited DAPPER object by ID (the resolver)
       description: >-
         The URL form of any dapper CURIE: {base}/v1/objects/{id}. Returns the

@@ -35,6 +35,16 @@ def test_swagger_docs_and_contract():
     assert contract.text.startswith("openapi:")
     # The dapper-object lookup is part of the published contract.
     assert "/v1/objects/{object_id}" in contract.text
+    # This deployment is injected as the FIRST server, so Swagger try-it-out
+    # stays same-origin (the localhost vs 127.0.0.1 CORS trap).
+    first_server = contract.text.split("servers:\n", 1)[1].splitlines()[0]
+    assert "http://testserver" in first_server
+    # Sections: objects / claims / propositions / deposit are separate tags.
+    for tag in ("[Objects]", "[Propositions]", "[Deposit]", "[Claims]"):
+        assert tag in contract.text
+    # Cross-origin reads are allowed (browser UIs call this API directly).
+    cors = client.get("/v1/health", headers={"Origin": "http://127.0.0.1:9999"})
+    assert cors.headers.get("access-control-allow-origin") == "*"
 
 
 def test_deposit_is_idempotent_and_retrievable():

@@ -18,8 +18,9 @@ from pathlib import Path
 
 from ariadne import ObjectType, QueryType, ScalarType, graphql_sync, make_executable_schema
 from ariadne.explorer import ExplorerGraphiQL
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.requests import Request
 
 from . import db
@@ -586,6 +587,16 @@ app = FastAPI(
     openapi_url=None,
 )
 
+# Reads are open (QA decision) and browser UIs (the CFDE challenge UI, the
+# Swagger page across localhost/127.0.0.1) call cross-origin; no credentials
+# are used, so a permissive CORS policy discloses nothing new.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
 SWAGGER_HTML = """<!doctype html>
 <html>
 <head>
@@ -694,8 +705,20 @@ def swagger_docs():
 
 
 @app.get("/v1/openapi.yaml", include_in_schema=False)
-def openapi_contract():
-    return FileResponse(ROOT / "api" / "openapi.yaml", media_type="application/yaml")
+def openapi_contract(request: Request):
+    """The hand-written contract, with THIS deployment injected as the first
+    server entry — Swagger UI's try-it-out defaults to the first server, so
+    requests stay same-origin whether the page is opened via localhost,
+    127.0.0.1, or the QA/prod prefix."""
+    text = (ROOT / "api" / "openapi.yaml").read_text()
+    root_path = request.scope.get("root_path", "")
+    base = f"{request.url.scheme}://{request.url.netloc}{root_path}"
+    injected = (
+        "servers:\n"
+        f"  - url: {base}\n"
+        "    description: This deployment (same origin as this docs page).\n"
+    )
+    return Response(text.replace("servers:\n", injected, 1), media_type="application/yaml")
 
 
 @app.get("/v1/graphql", response_class=HTMLResponse)
