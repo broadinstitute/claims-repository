@@ -1,0 +1,11 @@
+{
+  "phenotype": "IBD",
+  "priorMax": 0.5,
+  "anchorMetric": "COMBINED",
+  "anchorDir": "DESC",
+  "topGenes": 20,
+  "setMetric": "BETA_UNCORRECTED",
+  "setDir": "DESC",
+  "setsPerGene": 5,
+  "first": 100
+}

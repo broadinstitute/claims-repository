@@ -1,0 +1,145 @@
+# PIGEAN method module (v0).
+#
+# This SDL is the PIGEAN claim template's QUERY SURFACE: it belongs with the
+# template in broadinstitute/kpn-dapper-toolkit (docs/pigean-ibd-claims.md) and
+# is vendored here pinned, like the DAPPER profile. Typed metric fields, filter
+# inputs, order enums, and field docstrings are all generated from the
+# template's metric table, so claim generation and query surface share one
+# source of truth and cannot drift.
+#
+# Rules for every method module (enforced in CI by composing against core):
+#   - only `extend` core types; never redefine them
+#   - concrete association types implement the core interfaces
+#   - expose typed fields only for vetted metrics; everything deposited still
+#     rides along losslessly in ClaimEnvelope.scores
+#   - order-by enums are module-private: no cross-method score blending exists
+#     in the schema, so none can be queried
+#
+# Metric interpretations are PROVISIONAL until method-lead sign-off (Day-2).
+# rs_score and n are deliberately absent: meanings unconfirmed.
+
+"One PIGEAN gene-level assessment — one combined_gene_stats.json row, one claim."
+type PigeanGeneAssociation implements GenePhenotypeAssociation {
+  gene: Gene!
+  phenotype: Phenotype!
+  collection: String!
+  claim: ClaimEnvelope!
+  "Combined log posterior odds: direct GWAS evidence plus gene-set prior evidence. Log scale, higher is stronger; not a probability. PROVISIONAL."
+  combined: Float!
+  "Log Bayes factor from direct GWAS evidence. Log scale, higher is stronger. PROVISIONAL."
+  logBf: Float!
+  "Log prior odds contributed by gene-set membership evidence. Log scale. PROVISIONAL."
+  prior: Float!
+}
+
+"One PIGEAN gene-set-level assessment — one combined_gene_set_stats.json row, one claim."
+type PigeanGeneSetAssociation implements GeneSetPhenotypeAssociation {
+  geneSet: GeneSet!
+  phenotype: Phenotype!
+  collection: String!
+  claim: ClaimEnvelope!
+  "Gene-set effect estimated jointly with the other selected gene sets (corrected). Log-odds scale. PROVISIONAL."
+  beta: Float!
+  "Marginal gene-set effect, uncorrected for other gene sets. Log-odds scale. PROVISIONAL."
+  betaUncorrected: Float!
+}
+
+input PigeanGeneAssociationFilter {
+  prior: FloatFilter
+  combined: FloatFilter
+  logBf: FloatFilter
+}
+
+enum PigeanGeneAssociationOrderField {
+  COMBINED
+  LOG_BF
+  PRIOR
+}
+
+input PigeanGeneAssociationOrder {
+  field: PigeanGeneAssociationOrderField!
+  dir: SortDir! = DESC
+}
+
+input PigeanGeneSetAssociationFilter {
+  beta: FloatFilter
+  betaUncorrected: FloatFilter
+}
+
+enum PigeanGeneSetAssociationOrderField {
+  BETA
+  BETA_UNCORRECTED
+}
+
+input PigeanGeneSetAssociationOrder {
+  field: PigeanGeneSetAssociationOrderField!
+  dir: SortDir! = DESC
+}
+
+extend type Phenotype {
+  "PIGEAN gene associations for this phenotype. filter → order → first, in that sequence, deterministic ties (gene symbol asc)."
+  pigeanGeneAssociations(
+    collection: String = "cfde-inc-v2"
+    where: PigeanGeneAssociationFilter
+    orderBy: PigeanGeneAssociationOrder
+    first: Int = 20
+  ): [PigeanGeneAssociation!]!
+
+  pigeanGeneSetAssociations(
+    collection: String = "cfde-inc-v2"
+    where: PigeanGeneSetAssociationFilter
+    orderBy: PigeanGeneSetAssociationOrder
+    first: Int = 20
+  ): [PigeanGeneSetAssociation!]!
+}
+
+extend type Gene {
+  pigeanAssociation(phenotype: ID!, collection: String = "cfde-inc-v2"): PigeanGeneAssociation
+}
+
+extend type GeneSet {
+  pigeanAssociation(phenotype: ID!, collection: String = "cfde-inc-v2"): PigeanGeneSetAssociation
+}
+
+extend type Query {
+  """
+  The CFDE validation-challenge join, grouped per anchor gene (decision
+  2026-11-09: per-gene set limits, not a global row cap). Semantics: select
+  the top `topGenes` gene associations by `orderBy` after `where` (the anchor
+  selection, applied BEFORE any join); then for each anchor gene join its
+  memberships to gene sets that themselves have a PIGEAN association with the
+  phenotype, order them within the gene by `setOrder`, and keep the top
+  `setsPerGene`. Rows keep the anchor order; a gene whose join finds nothing
+  still appears with sets: []. A missing data source (e.g. membership claims
+  not yet deposited) surfaces in warnings, never as a silent empty result.
+  """
+  pigeanValidationChallenge(
+    phenotype: ID!
+    collection: String = "cfde-inc-v2"
+    where: PigeanGeneAssociationFilter
+    orderBy: PigeanGeneAssociationOrder
+    topGenes: Int! = 20
+    setsPerGene: Int! = 10
+    setOrder: PigeanGeneSetAssociationOrder
+    first: Int = 100
+  ): PigeanValidationChallengeResult!
+}
+
+type PigeanValidationChallengeResult {
+  rows: [PigeanValidationChallengeRow!]!
+  "True when `first` cut the anchor-gene row set."
+  truncated: Boolean!
+  warnings: [String!]!
+}
+
+"One anchor gene with its top gene sets (ordered by `setOrder`, limited by `setsPerGene` — a per-gene limit, not a global cap)."
+type PigeanValidationChallengeRow {
+  geneAssociation: PigeanGeneAssociation!
+  sets: [PigeanChallengeSet!]!
+}
+
+"One of an anchor gene's sets: the membership claim linking gene to set, and the set's own association with the phenotype."
+type PigeanChallengeSet {
+  membership: GeneSetMembership!
+  geneSetAssociation: PigeanGeneSetAssociation!
+}

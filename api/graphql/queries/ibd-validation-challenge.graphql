@@ -1,0 +1,68 @@
+# Persisted Day-10 CFDE validation-challenge query.
+# The researcher-editable knobs from build-plan Task 8 (IBD concept, prior
+# threshold, score metric/direction, top 20, sets per gene) are exactly this
+# document's variables — the UI edits variables, never query text, which is
+# the whole "constrained query" guarantee. Default variables:
+# ibd-validation-challenge.variables.json
+#
+# Shape (2026-11-09, per Chase): one row per anchor gene, each carrying its
+# top `setsPerGene` gene sets; every claim returns its structured triple
+# (subject, predicate, object) and provenance refs.
+
+query IBDValidationChallenge(
+  $phenotype: ID!
+  $priorMax: Float!
+  $anchorMetric: PigeanGeneAssociationOrderField!
+  $anchorDir: SortDir!
+  $topGenes: Int!
+  $setMetric: PigeanGeneSetAssociationOrderField!
+  $setDir: SortDir!
+  $setsPerGene: Int!
+  $first: Int!
+) {
+  pigeanValidationChallenge(
+    phenotype: $phenotype
+    where: { prior: { lt: $priorMax } }
+    orderBy: { field: $anchorMetric, dir: $anchorDir }
+    topGenes: $topGenes
+    setOrder: { field: $setMetric, dir: $setDir }
+    setsPerGene: $setsPerGene
+    first: $first
+  ) {
+    truncated
+    warnings
+    rows {
+      geneAssociation {
+        gene { symbol }
+        combined
+        logBf
+        prior
+        claim {
+          id
+          triple { subject predicate object }
+          scores { metric value interpretation }
+          provenanceRefs { derivedFromFiles resolution }
+        }
+      }
+      sets {
+        membership {
+          claim {
+            id
+            triple { subject predicate object }
+            provenanceRefs { derivedFromFiles resolution }
+          }
+        }
+        geneSetAssociation {
+          geneSet { name source collection dapperGeneSetId }
+          beta
+          betaUncorrected
+          claim {
+            id
+            triple { subject predicate object }
+            provenanceRefs { derivedFromFiles geneSetRefs resolution }
+          }
+        }
+      }
+    }
+  }
+}

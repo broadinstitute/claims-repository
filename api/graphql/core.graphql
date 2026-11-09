@@ -1,0 +1,254 @@
+# Claims repository GraphQL contract — CORE schema (v0.2).
+# This file defines only method-agnostic types. Every method (PIGEAN, EAGGL, …)
+# contributes its own SDL module under api/graphql/methods/ that `extend`s these
+# types; the service concatenates core + registered modules and builds one
+# executable schema at startup. Modules may only extend — they never redefine
+# core types. See docs/method-modules.md for the design.
+#
+# Read-only surface: deposit stays on the REST contract (api/openapi.yaml);
+# there is deliberately no Mutation type.
+
+schema {
+  query: Query
+}
+
+type Query {
+  health: Health!
+
+  "Trait autocomplete and concept resolution."
+  phenotype(id: ID!): Phenotype
+  phenotypes(search: String, first: Int = 20): [Phenotype!]!
+
+  gene(symbol: ID!): Gene
+  geneSet(name: ID!, collection: String): GeneSet
+
+  "Retrieve any deposited claim by dapper:Claim ID."
+  claim(id: ID!): ClaimEnvelope
+
+  """
+  A proposition with every claim that assesses it — the fan-in view the
+  proposition/claim split exists for: one statement, many assessments
+  (measurement, interpretive tiers, other methods).
+  """
+  proposition(id: ID!): PropositionEnvelope
+
+  """
+  Trace any deposited dapper object by ID (GeneSet, GeneSetCollection,
+  Activity, File, ...) — follow provenanceRefs.geneSetRefs or a GeneSet's
+  dapperGeneSetId to its full entity record (members, collection backlink,
+  creation activity). Returns the verbatim stored document, or null.
+  """
+  dapperObject(id: ID!): JSON
+
+  "Registered method modules and their metric semantics, for UI rendering."
+  methods: [MethodInfo!]!
+}
+
+type Health {
+  status: String!
+  contractVersion: String!
+  "Pinned DAPPER release/commit used for validation, e.g. 0.2.0-a1."
+  dapperProfile: String!
+}
+
+type MethodInfo {
+  "Module name, e.g. pigean."
+  name: String!
+  "Semantics of every metric the module exposes; mirrors the SDL field docstrings."
+  metrics: [MetricSemantics!]!
+}
+
+type MetricSemantics {
+  "Exact source metric name as it appears in DAPPER ClaimScore.metric, e.g. beta_uncorrected."
+  metric: String!
+  scoreKind: ScoreKind!
+  scale: String!
+  better: Better!
+  "False until the method leads confirm the interpretation; UIs must render unconfirmed semantics as provisional."
+  confirmed: Boolean!
+  description: String!
+}
+
+"DAPPER ClaimScoreKindEnum."
+enum ScoreKind {
+  PROBABILITY
+  POSTERIOR_PROBABILITY
+  EFFECT_ESTIMATE
+  LOADING
+  SCORE
+}
+
+enum Better {
+  HIGHER
+  LOWER
+  NA
+  UNCONFIRMED
+}
+
+enum SortDir {
+  ASC
+  DESC
+}
+
+"Comparison filter for float metrics; conditions are ANDed."
+input FloatFilter {
+  lt: Float
+  lte: Float
+  gt: Float
+  gte: Float
+  eq: Float
+  ne: Float
+}
+
+input IntFilter {
+  lt: Int
+  lte: Int
+  gt: Int
+  gte: Int
+  eq: Int
+  ne: Int
+}
+
+type Phenotype {
+  "Portal trait key, e.g. IBD."
+  id: ID!
+  name: String
+  traitGroup: String
+  "Resolved public ontology CURIE (EFO/MONDO) once the Day-2 concept decision lands; null until then."
+  conceptId: String
+}
+
+type Gene {
+  "HGNC symbol as it appears in the result files."
+  symbol: ID!
+  "Gene-set memberships, backed by membership claims (method-agnostic; sourced from GMTs)."
+  memberships(collection: String, first: Int = 100): [GeneSetMembership!]!
+}
+
+type GeneSet {
+  "Full gene-set name from the result files."
+  name: ID!
+  "Upstream source tag, e.g. lincs, geobulk___igvf."
+  source: String!
+  "Gene-set collection / run tag (the result files' gene_set_size field), e.g. cfde-inc-v2."
+  collection: String!
+  "dapper:GeneSet ID when known; resolves via provenance-indexer."
+  dapperGeneSetId: String
+  members(first: Int = 100): [GeneSetMembership!]!
+}
+
+"A gene's membership in a gene set, backed by a membership claim. No scores in v0; if a method later emits per-membership weights they arrive as LOADING scores on the claim."
+type GeneSetMembership {
+  gene: Gene!
+  geneSet: GeneSet!
+  claim: ClaimEnvelope!
+}
+
+"""
+Shared shape of any method's gene-phenotype association. Concrete per-method
+types add their typed metric fields. There is deliberately no cross-method
+ordering: order-by enums exist only on concrete method types, so unlike scores
+cannot be blended by construction.
+"""
+interface GenePhenotypeAssociation {
+  gene: Gene!
+  phenotype: Phenotype!
+  collection: String!
+  claim: ClaimEnvelope!
+}
+
+interface GeneSetPhenotypeAssociation {
+  geneSet: GeneSet!
+  phenotype: Phenotype!
+  collection: String!
+  claim: ClaimEnvelope!
+}
+
+"""
+The lossless DAPPER view of one deposited claim. Typed per-method metric fields
+are conveniences; this envelope is the authority and always carries every
+deposited score with its metric, kind, and interpretation.
+"""
+type ClaimEnvelope {
+  "dapper:Claim content address."
+  id: ID!
+  "Verbatim DAPPER Claim document, validated against the pinned profile."
+  claim: JSON!
+  "Verbatim DAPPER Proposition document."
+  proposition: JSON!
+  "The proposition's structured (subject, predicate, object), lifted out of the verbatim document for direct rendering."
+  triple: ClaimTriple
+  scores: [ClaimScore!]!
+  """
+  Evidence uses on this claim (Claim.has_evidence), dereferenced. For PIGEAN
+  measurement claims: one EvidenceItem per metric, grounded by a ValueLocator
+  pinning the exact byte span of the number in the result file, re-verifiable
+  as file[byte_start : byte_start+byte_length] == value_text under the File's
+  sha256.
+  """
+  evidence: [ClaimEvidence!]!
+  """
+  Mint counter: content addressing makes re-deposits idempotent, so this
+  records how often this exact document keeps being minted from the
+  underlying data — 1 on first deposit, +1 for every re-deposit (including
+  loader re-runs).
+  """
+  timesDeposited: Int!
+  "UTC timestamps of the first deposit and the most recent (re-)deposit."
+  firstDepositedAt: String
+  lastDepositedAt: String
+  provenanceRefs: ProvenanceRefs!
+}
+
+"One evidence use: the verbatim EvidenceItem document plus its dereferenced ValueLocators."
+type ClaimEvidence {
+  item: JSON!
+  valueLocators: [JSON!]!
+}
+
+"A proposition and all of the claims assessing it."
+type PropositionEnvelope {
+  "dapper:Proposition content address."
+  id: ID!
+  "Verbatim DAPPER Proposition document."
+  proposition: JSON!
+  triple: ClaimTriple
+  "Every deposited claim whose `proposition` is this document, claim_id order."
+  claims: [ClaimEnvelope!]!
+}
+
+"""
+The claim's statement as a structured triple, from its Proposition's
+subject_entity / relation / object_entity. Subject and object are canonical
+IDs: gene symbol, phenotype key, or a dereferenceable dapper:GeneSet ID
+(follow it via Query.dapperObject).
+"""
+type ClaimTriple {
+  subject: String!
+  predicate: String!
+  object: String!
+}
+
+type ClaimScore {
+  id: ID!
+  scoreKind: ScoreKind!
+  metric: String!
+  value: Float!
+  interpretation: String!
+}
+
+"References only; resolution belongs to provenance-indexer (Task 6)."
+type ProvenanceRefs {
+  derivedFromFiles: [String!]!
+  geneSetRefs: [String!]!
+  resolveVia: String!
+  resolution: ProvenanceResolution!
+}
+
+enum ProvenanceResolution {
+  UNRESOLVED
+  RESOLVED
+  UNAVAILABLE
+}
+
+scalar JSON

@@ -1,0 +1,63 @@
+{
+  "data": {
+    "pigeanValidationChallenge": {
+      "truncated": false,
+      "warnings": [
+        "Metric interpretations are provisional until confirmed by the method leads (Day-2 decision)."
+      ],
+      "rows": [
+        {
+          "geneAssociation": {
+            "gene": { "symbol": "NOD2" },
+            "combined": 9.8,
+            "logBf": 7.1,
+            "prior": 0.42,
+            "claim": {
+              "id": "dapper:Claim.SYNTHG01",
+              "scores": [
+                { "metric": "combined", "value": 9.8, "interpretation": "PIGEAN combined log posterior odds of gene-phenotype association; log scale, larger is stronger. PROVISIONAL." },
+                { "metric": "log_bf", "value": 7.1, "interpretation": "PIGEAN log Bayes factor from direct GWAS evidence; log scale. PROVISIONAL." },
+                { "metric": "prior", "value": 0.42, "interpretation": "PIGEAN log prior odds contributed by gene-set membership evidence; log scale. PROVISIONAL." }
+              ],
+              "provenanceRefs": { "derivedFromFiles": ["dapper:File.SYNTHGENESTATS"], "resolution": "UNRESOLVED" }
+            }
+          },
+          "membership": { "claim": { "id": "dapper:Claim.SYNTHM01" } },
+          "geneSetAssociation": {
+            "geneSet": { "name": "SYNTH_CFDE__innate_immune_signature_up", "source": "synthetic", "collection": "cfde-inc-v2", "dapperGeneSetId": "dapper:GeneSet.SYNTHGS01" },
+            "beta": 1.52,
+            "betaUncorrected": 1.94,
+            "claim": { "id": "dapper:Claim.SYNTHS01", "provenanceRefs": { "derivedFromFiles": ["dapper:File.SYNTHGENESETSTATS"], "geneSetRefs": ["dapper:GeneSet.SYNTHGS01"], "resolution": "UNRESOLVED" } }
+          }
+        },
+        {
+          "geneAssociation": {
+            "gene": { "symbol": "IL23R" },
+            "combined": 8.9,
+            "logBf": 6.8,
+            "prior": 0.31,
+            "claim": {
+              "id": "dapper:Claim.SYNTHG02",
+              "scores": [
+                { "metric": "combined", "value": 8.9, "interpretation": "PIGEAN combined log posterior odds of gene-phenotype association; log scale, larger is stronger. PROVISIONAL." },
+                { "metric": "log_bf", "value": 6.8, "interpretation": "PIGEAN log Bayes factor from direct GWAS evidence; log scale. PROVISIONAL." },
+                { "metric": "prior", "value": 0.31, "interpretation": "PIGEAN log prior odds contributed by gene-set membership evidence; log scale. PROVISIONAL." }
+              ],
+              "provenanceRefs": { "derivedFromFiles": ["dapper:File.SYNTHGENESTATS"], "resolution": "UNRESOLVED" }
+            }
+          },
+          "membership": { "claim": { "id": "dapper:Claim.SYNTHM02" } },
+          "geneSetAssociation": {
+            "geneSet": { "name": "SYNTH_CFDE__innate_immune_signature_up", "source": "synthetic", "collection": "cfde-inc-v2", "dapperGeneSetId": "dapper:GeneSet.SYNTHGS01" },
+            "beta": 1.52,
+            "betaUncorrected": 1.94,
+            "claim": { "id": "dapper:Claim.SYNTHS01", "provenanceRefs": { "derivedFromFiles": ["dapper:File.SYNTHGENESETSTATS"], "geneSetRefs": ["dapper:GeneSet.SYNTHGS01"], "resolution": "UNRESOLVED" } }
+          }
+        }
+      ]
+    }
+  },
+  "extensions": {
+    "fixture_notice": "SYNTHETIC FIXTURE. Gene symbols are real HGNC symbols and the phenotype is the real portal trait key so UI work looks right, but every score value, DAPPER ID (.SYNTH… suffixes), gene set, and provenance reference is invented for contract testing. Live DAPPER IDs are computed content addresses. Do not cite any value here as a scientific result."
+  }
+}

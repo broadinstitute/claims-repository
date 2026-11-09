@@ -1,0 +1,600 @@
+openapi: 3.1.1
+jsonSchemaDialect: https://spec.openapis.org/oas/3.1/dialect/base
+info:
+  title: Claims Repository API
+  version: 0.1.0
+  summary: Deposit, retrieval, and constrained graph-pattern query of DAPPER claims.
+  description: >-
+    v0 contract for broadinstitute/claims-repository (build-plan Tasks 5 and 7).
+    The service owns deposited DAPPER Claims; it never copies pipeline datasets.
+    This REST contract covers deposit, retrieval, and meta endpoints (Task 5).
+    The query surface (Task 7) is GraphQL, composed from api/graphql/core.graphql
+    plus per-method schema modules shipped by claim templates; see
+    docs/method-modules.md. Claim content is validated against the pinned DAPPER profile
+    (0.2.0-a1) and stored under computed DAPPER content-address IDs. Provenance
+    for referenced dapper:File / dapper:GeneSet IDs is returned as references;
+    resolution belongs to broadinstitute/provenance-indexer (Task 6 wires the
+    join). All examples are synthetic fixtures: IDs with a .SYNTH… suffix are
+    placeholders for computed content addresses, and no example value is a
+    scientific result. Metric interpretations are provisional until the method
+    leads confirm them (Day-2 decision).
+servers:
+  - url: http://127.0.0.1:8100
+    description: Local development server.
+  - url: https://api-qa.hugeampkpnbi.org/api/claims
+    description: QA deployment behind the dig-service-platform shared ALB (pending service registration).
+  - url: https://api-prod.hugeampkpnbi.org/api/claims
+    description: Production (reserved; not a two-week promise).
+tags:
+  - name: Meta
+  - name: Claims
+  - name: GraphQL
+security: []
+paths:
+  /v1/health:
+    get:
+      operationId: getHealth
+      tags: [Meta]
+      summary: Liveness and pinned-profile report
+      responses:
+        '200':
+          description: Service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, contract_version, dapper_profile]
+                properties:
+                  status: { type: string, enum: [ok] }
+                  contract_version: { type: string, examples: ['0.1.0'] }
+                  dapper_profile:
+                    type: string
+                    description: Pinned DAPPER release/commit used for validation.
+                    examples: ['0.2.0-a1']
+  /v1/vocabulary:
+    get:
+      operationId: getVocabulary
+      tags: [Meta]
+      summary: Enumerate queryable categories, predicates, methods, metrics, and phenotypes
+      description: >-
+        REST convenience surface: metric semantics for rendering scores with
+        their meaning, and the phenotype list for trait autocomplete. GraphQL
+        clients get the same information from schema introspection and the
+        Query.methods field; this endpoint remains for non-GraphQL consumers.
+      responses:
+        '200':
+          description: Current vocabulary.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [contract_version, categories, predicates, methods, metrics, phenotypes, collections]
+                properties:
+                  contract_version: { type: string }
+                  categories:
+                    type: array
+                    items: { type: string }
+                    examples: [['gene', 'phenotype', 'gene_set']]
+                  predicates:
+                    type: array
+                    description: Allowed (subject category, predicate, object category) triples.
+                    items:
+                      type: object
+                      required: [subject_category, predicate, object_category]
+                      properties:
+                        subject_category: { type: string }
+                        predicate: { type: string }
+                        object_category: { type: string }
+                        methods:
+                          type: array
+                          items: { type: string }
+                  methods:
+                    type: array
+                    items: { type: string }
+                    examples: [['pigean']]
+                  metrics:
+                    type: object
+                    description: Keyed by '<method>.<metric>'.
+                    additionalProperties:
+                      $ref: '#/components/schemas/MetricSemantics'
+                  phenotypes:
+                    type: array
+                    description: Trait keys with claims deposited, for autocomplete.
+                    items:
+                      type: object
+                      required: [id]
+                      properties:
+                        id: { type: string, examples: ['IBD'] }
+                        name: { type: string, examples: ['Inflammatory bowel disease'] }
+                        trait_group: { type: string, examples: ['portal'] }
+                        concept_id:
+                          type: [string, 'null']
+                          description: Resolved public ontology ID once the Day-2 IBD concept decision lands (e.g. an EFO or MONDO CURIE); null until then.
+                  collections:
+                    type: array
+                    description: Gene-set collections (the result files' gene_set_size tag).
+                    items: { type: string }
+                    examples: [['cfde-inc-v2']]
+  /v1/claims:
+    post:
+      operationId: depositClaims
+      tags: [Claims]
+      summary: Deposit a bundle of DAPPER objects (Claims with their Propositions and ClaimScores)
+      description: >-
+        Validates every object against the pinned DAPPER profile, verifies the
+        computed content-address IDs, and stores objects idempotently: re-depositing
+        identical content yields the same IDs and 'exists' statuses, never a
+        duplicate. index_hints make each claim's graph edge explicit so indexing
+        never guesses entity categories from proposition text. A bundle is
+        rejected whole on validation failure (no partial deposits).
+      security:
+        - ApiKeyHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DepositBundle'
+            examples:
+              pigeanGeneClaim:
+                summary: Synthetic PIGEAN gene-phenotype claim bundle
+                externalValue: ./examples/deposit-bundle.request.json
+      responses:
+        '200':
+          description: Bundle accepted; per-object outcome reported.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deposited]
+                properties:
+                  deposited:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, class_name, status]
+                      properties:
+                        id: { type: string }
+                        class_name: { type: string }
+                        status: { type: string, enum: [created, exists] }
+                        times_deposited:
+                          type: integer
+                          description: >-
+                            Mint counter: 1 on first deposit, incremented on
+                            every idempotent re-deposit of the same content
+                            address — tracks how often the same document keeps
+                            being minted from the underlying data.
+        '400':
+          $ref: '#/components/responses/ValidationProblem'
+        '401':
+          $ref: '#/components/responses/AuthProblem'
+    get:
+      operationId: listClaims
+      tags: [Claims]
+      summary: List deposited claims (compact summaries, deterministic order)
+      description: >-
+        Browse surface for non-GraphQL consumers: compact one-line summaries
+        (structured triple, statement, mint count), ordered by claim_id for
+        deterministic pagination. Filter by method and/or predicate; use
+        /v1/claims/search to search by entity or statement text.
+      parameters:
+        - { name: method, in: query, schema: { type: string }, example: pigean }
+        - { name: predicate, in: query, schema: { type: string }, example: member_of }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: One page of claim summaries plus the filtered total.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimSummaryPage'
+  /v1/claims/search:
+    get:
+      operationId: searchClaims
+      tags: [Claims]
+      summary: Search claims by proposition content
+      description: >-
+        Same response shape as GET /v1/claims. `entity` matches either side of
+        the proposition triple; a gene-set NAME also matches claims encoded
+        against its dapper:GeneSet ID. `subject` / `object` pin one side;
+        `q` substring-matches the proposition statement. Filters are ANDed.
+      parameters:
+        - { name: entity, in: query, schema: { type: string }, example: NOD2 }
+        - { name: subject, in: query, schema: { type: string } }
+        - { name: object, in: query, schema: { type: string } }
+        - { name: q, in: query, schema: { type: string }, description: Substring match on the proposition statement. }
+        - { name: predicate, in: query, schema: { type: string } }
+        - { name: method, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: Matching claim summaries plus the filtered total.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimSummaryPage'
+  /v1/propositions:
+    get:
+      operationId: listPropositions
+      tags: [Claims]
+      summary: List deposited propositions
+      description: >-
+        Compact proposition summaries (triple, statement, kind) with
+        `n_claims` — how many deposited claims assess each statement.
+        Deterministic proposition_id order, limit/offset pagination.
+      parameters:
+        - { name: predicate, in: query, schema: { type: string }, example: associated_with }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: One page of proposition summaries plus the filtered total.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropositionSummaryPage'
+  /v1/propositions/search:
+    get:
+      operationId: searchPropositions
+      tags: [Claims]
+      summary: Search propositions by content
+      description: >-
+        Same search language as /v1/claims/search, over propositions:
+        `entity` matches either side of the triple (a gene-set NAME also
+        matches its dapper:GeneSet ID), `subject` / `object` pin one side,
+        `q` substring-matches the statement. Filters are ANDed.
+      parameters:
+        - { name: entity, in: query, schema: { type: string }, example: NOD2 }
+        - { name: subject, in: query, schema: { type: string } }
+        - { name: object, in: query, schema: { type: string } }
+        - { name: q, in: query, schema: { type: string } }
+        - { name: predicate, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: Matching proposition summaries plus the filtered total.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PropositionSummaryPage'
+  /v1/propositions/{proposition_id}:
+    get:
+      operationId: getProposition
+      tags: [Claims]
+      summary: One proposition with every claim that assesses it
+      description: >-
+        The fan-in view the proposition/claim split exists for: the verbatim
+        Proposition document, its structured triple, and a compact brief of
+        each claim whose `proposition` is this document (measurement,
+        interpretive tiers, other methods), in claim_id order.
+      parameters:
+        - name: proposition_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The proposition and its claims.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [proposition, claims]
+                properties:
+                  proposition:
+                    $ref: '#/components/schemas/DapperObject'
+                  triple:
+                    $ref: '#/components/schemas/ClaimTriple'
+                  claims:
+                    type: array
+                    items:
+                      type: object
+                      required: [claim_id, url]
+                      properties:
+                        claim_id: { type: string }
+                        method: { type: [string, 'null'] }
+                        statement: { type: string, description: The claim's own statement (the assessment). }
+                        direction: { type: [string, 'null'] }
+                        scores:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              metric: { type: string }
+                              value: { type: number }
+                        times_deposited: { type: integer }
+                        url: { type: string }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/objects/{object_id}:
+    get:
+      operationId: getObject
+      tags: [Claims]
+      summary: Dereference any deposited DAPPER object by ID
+      description: >-
+        Trace companion to the claim envelope's provenance refs: returns the
+        verbatim stored document for any deposited object (GeneSet,
+        GeneSetCollection, Activity, File, EvidenceItem, ValueLocator, ...).
+      parameters:
+        - name: object_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The verbatim stored document.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DapperObject'
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/claims/{claim_id}:
+    get:
+      operationId: getClaim
+      tags: [Claims]
+      summary: Retrieve a deposited claim by dapper:Claim ID
+      parameters:
+        - name: claim_id
+          in: path
+          required: true
+          schema: { type: string }
+          description: Full DAPPER ID, e.g. dapper:Claim.{digest}.
+      responses:
+        '200':
+          description: The claim envelope with proposition, scores, and provenance references.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClaimEnvelope'
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/graphql:
+    post:
+      operationId: graphql
+      tags: [GraphQL]
+      summary: The query surface (GraphQL over composed method modules)
+      description: >-
+        Standard GraphQL-over-HTTP endpoint executing the schema composed from
+        api/graphql/core.graphql plus every registered method module in
+        api/graphql/methods/ (design: docs/method-modules.md). Introspection is
+        enabled; standard depth/complexity limits apply. Execution semantics
+        (anchor limits before joins, deterministic ties, empty-vs-missing
+        distinction, no score blending) are documented on the schema fields
+        themselves. The Day-10 CFDE validation challenge is the persisted query
+        api/graphql/queries/ibd-validation-challenge.graphql with its
+        researcher-editable variables. Read-only: deposit stays on POST /v1/claims.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string, description: 'GraphQL document.' }
+                variables: { type: object }
+                operationName: { type: string }
+      responses:
+        '200':
+          description: GraphQL response per the GraphQL-over-HTTP spec.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: [object, 'null'] }
+                  errors:
+                    type: array
+                    items: { type: object }
+                  extensions: { type: object }
+components:
+  securitySchemes:
+    ApiKeyHeader:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Required for deposit. Read endpoints are open in the QA prototype; production auth is explicitly out of two-week scope.
+  responses:
+    ValidationProblem:
+      description: The request failed contract or DAPPER-profile validation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    AuthProblem:
+      description: Missing or invalid API key.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFoundProblem:
+      description: No object with that ID is deposited.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [title, status]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        errors:
+          type: array
+          description: Per-element validation messages (object ID or query path, plus reason).
+          items:
+            type: object
+            properties:
+              pointer: { type: string, description: 'JSON Pointer or DAPPER ID of the offending element.' }
+              message: { type: string }
+    DapperObject:
+      type: object
+      description: >-
+        A DAPPER document (Claim, Proposition, or ClaimScore) conforming to the
+        pinned DAPPER profile. The profile — not this contract — is the schema
+        authority; this shape only names the discriminator and ID.
+      required: [class_name, id]
+      properties:
+        class_name: { type: string, enum: [Claim, Proposition, ClaimScore] }
+        id: { type: string, description: 'Computed DAPPER content address, dapper:{ClassName}.{digest}.' }
+      additionalProperties: true
+    DepositBundle:
+      type: object
+      required: [objects]
+      properties:
+        fixture_notice: { type: string, description: 'Present only on synthetic fixtures.' }
+        objects:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/DapperObject'
+        index_hints:
+          type: array
+          description: One per Claim in objects; declares the claim's graph edge for indexing.
+          items:
+            type: object
+            required: [claim_id, method, predicate, subject, object]
+            properties:
+              claim_id: { type: string }
+              method: { type: string, examples: [pigean] }
+              predicate: { type: string, examples: [associated_with, member_of] }
+              subject:
+                $ref: '#/components/schemas/EntityRef'
+              object:
+                $ref: '#/components/schemas/EntityRef'
+              collection: { type: string, examples: [cfde-inc-v2] }
+              trait_group: { type: string, examples: [portal] }
+    EntityRef:
+      type: object
+      required: [category, id]
+      properties:
+        category: { type: string, enum: [gene, phenotype, gene_set] }
+        id: { type: string, description: 'Canonical ID for the category: HGNC symbol, portal trait key, or full gene-set name.' }
+    MetricSemantics:
+      type: object
+      required: [score_kind, scale, better, confirmed, description]
+      properties:
+        score_kind:
+          type: string
+          enum: [PROBABILITY, POSTERIOR_PROBABILITY, EFFECT_ESTIMATE, LOADING, SCORE]
+        scale: { type: string, examples: ['log posterior odds'] }
+        better: { type: string, enum: [higher, lower, n/a, unconfirmed] }
+        confirmed:
+          type: boolean
+          description: False until the method leads confirm the interpretation; UIs must surface unconfirmed semantics as provisional.
+        description: { type: string }
+    ClaimTriple:
+      type: object
+      description: The proposition's structured statement, lifted out for direct rendering.
+      required: [subject, predicate, object]
+      properties:
+        subject: { type: string, description: 'Gene symbol, phenotype key, or dereferenceable dapper:GeneSet ID.' }
+        predicate: { type: string, examples: [associated_with, member_of] }
+        object: { type: string }
+    ClaimSummaryPage:
+      type: object
+      required: [total, limit, offset, claims]
+      properties:
+        total: { type: integer, description: Total matches for the filters, not just this page. }
+        limit: { type: integer }
+        offset: { type: integer }
+        claims:
+          type: array
+          items:
+            type: object
+            required: [claim_id, method, triple, url]
+            properties:
+              claim_id: { type: string }
+              method: { type: string }
+              triple:
+                $ref: '#/components/schemas/ClaimTriple'
+              statement: { type: string, description: The proposition statement. }
+              times_deposited: { type: integer, description: Mint counter (see deposit response). }
+              deposited_at: { type: string, description: UTC timestamp of the first deposit. }
+              url: { type: string, description: 'Path of the full envelope: /v1/claims/{claim_id}.' }
+    PropositionSummaryPage:
+      type: object
+      required: [total, limit, offset, propositions]
+      properties:
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+        propositions:
+          type: array
+          items:
+            type: object
+            required: [proposition_id, url]
+            properties:
+              proposition_id: { type: string }
+              triple:
+                $ref: '#/components/schemas/ClaimTriple'
+              statement: { type: string }
+              proposition_kind: { type: string, examples: [RESULT, BIOLOGICAL_INTERPRETATION] }
+              n_claims:
+                type: integer
+                description: How many deposited claims assess this proposition.
+              times_deposited: { type: integer }
+              url: { type: string, description: 'Path of the fan-in view: /v1/propositions/{id}.' }
+    ClaimEnvelope:
+      type: object
+      required: [claim, proposition, scores, provenance_refs]
+      properties:
+        claim:
+          $ref: '#/components/schemas/DapperObject'
+        proposition:
+          $ref: '#/components/schemas/DapperObject'
+        triple:
+          $ref: '#/components/schemas/ClaimTriple'
+        scores:
+          type: array
+          items:
+            $ref: '#/components/schemas/DapperObject'
+        evidence:
+          type: array
+          description: >-
+            Evidence uses on this claim (Claim.has_evidence), dereferenced:
+            each entry pairs the verbatim EvidenceItem with its ValueLocators,
+            which pin exact byte spans in the result file
+            (file[byte_start : byte_start+byte_length] == value_text under the
+            File's sha256).
+          items:
+            type: object
+            required: [item, valueLocators]
+            properties:
+              item:
+                $ref: '#/components/schemas/DapperObject'
+              valueLocators:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DapperObject'
+        deposits:
+          type: object
+          description: Mint tracking for this claim document.
+          properties:
+            times: { type: integer }
+            first_at: { type: string }
+            last_at: { type: string }
+        provenance_refs:
+          type: object
+          description: References only; the claims repository never resolves provenance itself.
+          properties:
+            derived_from_files:
+              type: array
+              items: { type: string }
+            gene_set_refs:
+              type: array
+              items: { type: string }
+            resolve_via: { type: string, enum: [provenance-indexer] }
+            resolution:
+              type: string
+              enum: [unresolved, resolved, unavailable]
+              description: v0 always returns unresolved; Task 6 integration adds resolved payloads and distinguishes an unavailable indexer from empty provenance.
