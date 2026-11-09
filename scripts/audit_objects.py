@@ -94,9 +94,32 @@ def main() -> int:
             if ref not in ids:
                 problems.append(f"{oid}: dangling reference {ref}")
 
+    # Staged (precomputed, unasserted) claims get the same checks: they must
+    # be well-formed and reference only the eager data plane.
+    pending_total = 0
+    for row in con.execute("SELECT claim_id, proposition_id, payload FROM pending_claims"):
+        pending_total += 1
+        try:
+            payload = json.loads(row["payload"])
+            assert isinstance(payload, dict)
+        except Exception:
+            problems.append(f"{row['claim_id']} (pending): payload is not a JSON object")
+            continue
+        if payload.get("id") != row["claim_id"] or payload.get("class_name") != "Claim":
+            problems.append(f"{row['claim_id']} (pending): id/class mismatch")
+        if payload.get("proposition") != row["proposition_id"]:
+            problems.append(f"{row['claim_id']} (pending): proposition mismatch")
+        refs = []
+        dapper_refs({k: v for k, v in payload.items() if k != "id"}, refs)
+        for ref in refs:
+            checked_refs += 1
+            if ref not in ids:
+                problems.append(f"{row['claim_id']} (pending): dangling reference {ref}")
+
     con.close()
     for cls in sorted(counts):
         print(f"  {cls}: {counts[cls]}")
+    print(f"pending (unasserted) claims: {pending_total}")
     print(f"references checked: {checked_refs}")
     if problems:
         print(f"\nPROBLEMS ({len(problems)}):")

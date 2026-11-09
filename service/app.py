@@ -161,13 +161,63 @@ def _ts(value):
     return None if value is None else str(value)
 
 
-def envelope(con, claim_id):
+def _materialize_claim(con, claim_id):
+    """Lazy assertion (2026-11-09, Chase): move a precomputed, unasserted
+    claim from pending_claims into dapper_objects + the claims registry —
+    the mint event that justifies the query response now being served."""
+    pending = con.execute(
+        "SELECT proposition_id, method, identity_profile, payload FROM pending_claims WHERE claim_id = ?",
+        (claim_id,),
+    ).fetchone()
+    if pending is None:
+        return None
+    with con:
+        con.execute(
+            con.dialect.upsert_object,
+            (claim_id, "Claim", pending["identity_profile"], pending["payload"]),
+        )
+        con.execute(
+            f"{con.dialect.insert_or_replace} claims (claim_id, proposition_id, method) VALUES (?, ?, ?)",
+            (claim_id, pending["proposition_id"], pending["method"]),
+        )
+        con.execute("DELETE FROM pending_claims WHERE claim_id = ?", (claim_id,))
+    return con.execute(
+        "SELECT payload, times_seen, created_at, last_seen_at FROM dapper_objects WHERE id = ?",
+        (claim_id,),
+    ).fetchone()
+
+
+def envelope(con, claim_id, assert_claim=True):
+    """The claim envelope. `assert_claim=True` (the scientific query surface)
+    ASSERTS the claim: a pending claim materializes on first touch, and every
+    serve counts as an assertion (times_seen += 1, deduped per request).
+    REST dereference passes False — it reads what has been asserted."""
     row = con.execute(
         "SELECT payload, times_seen, created_at, last_seen_at FROM dapper_objects WHERE id = ?",
         (claim_id,),
     ).fetchone()
+    asserted = getattr(con, "asserted_ids", None)
+    if asserted is None:
+        asserted = con.asserted_ids = set()
     if row is None:
-        return None
+        if not assert_claim:
+            return None
+        row = _materialize_claim(con, claim_id)
+        if row is None:
+            return None
+        asserted.add(claim_id)
+    elif assert_claim and claim_id not in asserted:
+        asserted.add(claim_id)
+        with con:
+            con.execute(
+                "UPDATE dapper_objects SET times_seen = times_seen + 1, "
+                f"last_seen_at = {con.dialect.now} WHERE id = ?",
+                (claim_id,),
+            )
+        row = con.execute(
+            "SELECT payload, times_seen, created_at, last_seen_at FROM dapper_objects WHERE id = ?",
+            (claim_id,),
+        ).fetchone()
     claim = json.loads(row["payload"])
     proposition = _fetch_payload(con, claim.get("proposition")) or {}
     score_docs = _fetch_payloads(con, claim.get("has_score", []))
@@ -907,9 +957,22 @@ def get_object(object_id: str, request: Request):
     con = db.connect()
     try:
         payload = _fetch_payload(con, object_id)
+        pending = None
+        if payload is None:
+            pending = con.execute(
+                "SELECT 1 FROM pending_claims WHERE claim_id = ?", (object_id,)
+            ).fetchone()
     finally:
         con.close()
     if payload is None:
+        if pending:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"{object_id} is precomputed but not yet asserted — it materializes "
+                    "when the scientific query surface (GraphQL) first serves it"
+                ),
+            )
         raise HTTPException(status_code=404, detail=f"no deposited object with id {object_id}")
     accept = request.headers.get("accept", "")
     if "text/html" in accept and accept.find("text/html") < (
@@ -1156,10 +1219,24 @@ def get_proposition(proposition_id: str):
 def get_claim(claim_id: str):
     con = db.connect()
     try:
-        env = envelope(con, claim_id)
+        # REST dereference reads asserted claims; it does not assert.
+        env = envelope(con, claim_id, assert_claim=False)
+        pending = None
+        if env is None:
+            pending = con.execute(
+                "SELECT 1 FROM pending_claims WHERE claim_id = ?", (claim_id,)
+            ).fetchone()
     finally:
         con.close()
     if env is None:
+        if pending:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"claim {claim_id} is precomputed but not yet asserted — it "
+                    "materializes when the scientific query surface (GraphQL) first serves it"
+                ),
+            )
         raise HTTPException(status_code=404, detail=f"no deposited object with id {claim_id}")
     return {
         "resolver_url": env["resolverUrl"],

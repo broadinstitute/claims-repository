@@ -76,10 +76,14 @@ Notes that shape the contract:
 - **Membership edges are not in these two files** — they come from PIGEAN's own
   `gene_gene_set_stats/{collection}/portal/{phenotype}/gene_gene_set_stats.json` (for IBD:
   143,508 (gene, gene_set) pairs covering 12,519 genes × 3,851 sets). RESOLVED 2026-11-06, per
-  Chase: ingest **only the set name and its member genes** as score-less `member_of` claims
-  (`scripts/load_pigean.py`); the file's per-pair `beta`/`beta_uncorrected`/`rs_score` are NOT
-  ingested for now. A collection with no deposited membership still answers three-edge queries
-  with a missing-data-source warning on `e3`, never an empty "result".
+  Chase: ingest **only the set name and its member genes**; the file's per-pair
+  `beta`/`beta_uncorrected`/`rs_score` are NOT ingested for now. Amended 2026-11-09 (Chase):
+  membership is **one roster claim per gene set**, not one claim per (gene, set) pair — the
+  proposition `(dapper:GeneSet.X, has_members, dapper:GeneSetCollection.Y)` pins the exact
+  roster through the GeneSet entity's content-addressed `members` list (143,508 pairs → 3,851
+  claims). The per-pair `claim_memberships` index still drives joins. A collection with no
+  membership still answers three-edge queries with a missing-data-source warning on `e3`,
+  never an empty "result".
 - **Gene sets are first-class dapper entities** (added 2026-11-06, traceable-IDs example): the
   loader mints one `GeneSetCollection` (`cfde-inc-v2`), a placeholder creation `Activity`, and one
   `GeneSet` per distinct set (members = genes observed in `gene_gene_set_stats`, backlink
@@ -116,9 +120,17 @@ Default per the plan: **one Claim per result-file row** — a method-specific as
 Proposition, carrying all of that row's scores as typed `ClaimScore`s (one claim with three scores
 for a gene row, not three claims). `source_locator` pins the row
 (`combined_gene_stats.json#gene=NOD2`); `was_derived_from` points at the result file's
-`dapper:File`; the companion provenance sidecar (Task 2) explains how that file was made. IDs are
-computed DAPPER content addresses minted in the toolkit — the repository verifies, it never mints.
+`dapper:File`; the companion provenance sidecar (Task 2) explains how that file was made.
 Deposit is idempotent by construction: same content, same ID, `exists` status.
+
+**Lazy assertion** (2026-11-09, Chase — supersedes "the repository verifies, it never mints"):
+loader-built claims are precomputed and staged unasserted (`pending_claims`); the repository
+**materializes** a claim the first time the scientific query surface serves it — minting the
+claim that justifies the query response — and counts every serve as an assertion
+(`times_seen`). Content addressing makes materialization timing meaningless to identity: eager
+and lazy minting produce byte-identical documents. REST dereference of an unasserted claim
+returns 404 "not yet asserted"; external REST deposits are asserted by their depositor and land
+immediately. Full rationale: [inputs-and-outputs.md](inputs-and-outputs.md) §3.5.
 
 `index_hints` in the deposit bundle declare each claim's (subject, predicate, object, method,
 collection) edge explicitly, so graph indexing never parses proposition text.

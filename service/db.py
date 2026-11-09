@@ -92,6 +92,18 @@ CREATE TABLE IF NOT EXISTS gene_set_entities (
   n_genes INTEGER,
   PRIMARY KEY (collection, name)
 );
+-- Lazy assertion (2026-11-09, Chase): loader-built claims stage here,
+-- precomputed but unasserted. A claim moves to dapper_objects (and the
+-- claims registry) the first time the scientific query surface serves it —
+-- minting the claim to justify the query response. times_seen then counts
+-- assertions, not re-deposits.
+CREATE TABLE IF NOT EXISTS pending_claims (
+  claim_id TEXT PRIMARY KEY,
+  proposition_id TEXT NOT NULL,
+  method TEXT NOT NULL,
+  identity_profile TEXT NOT NULL,
+  payload TEXT NOT NULL
+);
 """
 
 

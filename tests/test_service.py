@@ -10,6 +10,7 @@ os.environ["CLAIMS_DB"] = os.path.join(tempfile.mkdtemp(), "test-claims.db")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from service import db as service_db  # noqa: E402
 from service.app import app  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -521,3 +522,66 @@ def test_proposition_search_and_claim_fanin():
     # Statement text search.
     text = client.get("/v1/propositions/search", params={"q": "member of the gene set"}).json()
     assert "dapper:Proposition.SYNTHM01" in {p["proposition_id"] for p in text["propositions"]}
+
+
+def test_lazy_claim_assertion():
+    """Loader-staged claims materialize when the scientific query surface
+    first serves them; REST before that reports 'not yet asserted'; every
+    GraphQL serve counts as an assertion."""
+    # Eager data plane: proposition + scores deposited; claim only STAGED.
+    client.post("/v1/claims", json={"objects": [
+        {"class_name": "Proposition", "id": "dapper:Proposition.LAZYP01",
+         "statement": "The gene LAZYG is associated with LAZYPHENO.",
+         "subject_entity": "LAZYG", "relation": "associated_with",
+         "object_entity": "LAZYPHENO", "proposition_kind": "RESULT"},
+        {"class_name": "ClaimScore", "id": "dapper:ClaimScore.LAZYc", "score_kind": "SCORE",
+         "metric": "combined", "value": 3.0, "interpretation": "SYNTHETIC."},
+        {"class_name": "ClaimScore", "id": "dapper:ClaimScore.LAZYl", "score_kind": "SCORE",
+         "metric": "log_bf", "value": 2.0, "interpretation": "SYNTHETIC."},
+        {"class_name": "ClaimScore", "id": "dapper:ClaimScore.LAZYp", "score_kind": "SCORE",
+         "metric": "prior", "value": 0.1, "interpretation": "SYNTHETIC."},
+    ]})
+    claim_payload = json.dumps({
+        "class_name": "Claim", "id": "dapper:Claim.LAZY01",
+        "proposition": "dapper:Proposition.LAZYP01",
+        "statement": "PIGEAN assessed the association of LAZYG with LAZYPHENO.",
+        "has_score": ["dapper:ClaimScore.LAZYc", "dapper:ClaimScore.LAZYl", "dapper:ClaimScore.LAZYp"],
+    }, sort_keys=True, separators=(",", ":"))
+    con = service_db.connect()
+    with con:
+        con.execute(
+            "INSERT OR REPLACE INTO pending_claims (claim_id, proposition_id, method, identity_profile, payload) VALUES (?, ?, ?, ?, ?)",
+            ("dapper:Claim.LAZY01", "dapper:Proposition.LAZYP01", "pigean", "local-dev-sha256-1", claim_payload),
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO pigean_gene_associations (phenotype, collection, gene, prior, combined, log_bf, n, trait_group, claim_id) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            ("LAZYPHENO", "cfde-inc-v2", "LAZYG", 0.1, 3.0, 2.0, "portal", "dapper:Claim.LAZY01"),
+        )
+    con.close()
+
+    # REST before assertion: precomputed, not yet asserted.
+    before = client.get("/v1/claims/dapper:Claim.LAZY01")
+    assert before.status_code == 404
+    assert "not yet asserted" in before.json()["detail"]
+    assert client.get("/v1/objects/dapper:Claim.LAZY01").status_code == 404
+
+    # First GraphQL serve materializes the claim (assertion #1).
+    q = """{ phenotype(id: "LAZYPHENO") { pigeanGeneAssociations(first: 5) {
+             gene { symbol } claim { id timesDeposited } } } }"""
+    first = client.post("/v1/graphql", json={"query": q}).json()["data"]["phenotype"]["pigeanGeneAssociations"][0]
+    assert first["claim"]["id"] == "dapper:Claim.LAZY01"
+    assert first["claim"]["timesDeposited"] == 1
+    # Every further serve counts as an assertion.
+    second = client.post("/v1/graphql", json={"query": q}).json()["data"]["phenotype"]["pigeanGeneAssociations"][0]
+    assert second["claim"]["timesDeposited"] == 2
+
+    # Now asserted: REST dereference works, fan-in sees it, staging is empty.
+    after = client.get("/v1/claims/dapper:Claim.LAZY01")
+    assert after.status_code == 200
+    assert {s["metric"] for s in after.json()["scores"]} == {"combined", "log_bf", "prior"}
+    fanin = client.get("/v1/propositions/dapper:Proposition.LAZYP01").json()
+    assert [c["claim_id"] for c in fanin["claims"]] == ["dapper:Claim.LAZY01"]
+    con = service_db.connect()
+    assert con.execute("SELECT COUNT(*) AS c FROM pending_claims WHERE claim_id = ?",
+                       ("dapper:Claim.LAZY01",)).fetchone()["c"] == 0
+    con.close()

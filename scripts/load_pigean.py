@@ -12,10 +12,20 @@ span of the serialized number in the result file (the dapper ValueLocator
 PROPOSAL, same structure the toolkit's tier claims use), so every number is
 byte-exactly re-verifiable against the File's sha256.
 
-Gene-set membership comes from gene_gene_set_stats.json: one score-less
-member_of Proposition + Claim per (gene, gene_set) pair — per Chase
-(2026-11-06) we ingest only the set name and its genes, not the per-pair
-effect metrics the file also carries.
+Gene-set membership comes from gene_gene_set_stats.json: ONE roster claim per
+gene set (decision 2026-11-09, Chase — not one claim per (gene, gene_set)
+pair). The proposition's subject is the content-addressed GeneSet entity,
+whose hashable `members` list pins the exact roster; the claim_memberships
+index keeps per-pair rows for joining, all pointing at the set's claim. Per
+the 2026-11-06 decision we still ingest only names + genes, never the
+per-pair effect metrics.
+
+LAZY ASSERTION (2026-11-09, Chase): this loader deposits the data plane
+eagerly — propositions, scores, evidence + locators, entities, files,
+activities — but stages every Claim in pending_claims, precomputed and
+unasserted. A claim materializes into dapper_objects the first time the
+scientific query surface (GraphQL) serves it, minting the claim to justify
+the query response; times_seen counts assertions from then on.
 
 Gene sets are also first-class dapper entities (traceable-IDs example, per
 Chase 2026-11-06): one creation Activity + one GeneSetCollection + one GeneSet
@@ -144,57 +154,49 @@ def evidence_for(metric: str, entity_label: str, phenotype: str, file_obj: dict,
     return locator, item
 
 
-def load_memberships(con, membership_stats: Path, membership_file: dict, activity: dict,
-                     agent: dict, gene_set_ids: dict[str, str]) -> None:
-    """Ingest (gene, gene_set) pairs as score-less member_of claims, chunked."""
-    total, chunk_objects, chunk_rows = 0, [], []
-
-    def flush():
-        # chunk_rows: (collection, gene, gene_set, claim_id, proposition_id)
-        unique_objects = {o["id"]: o for o in chunk_objects}
-        con.executemany(
-            con.dialect.upsert_object,
-            [(o["id"], o["class_name"], IDENTITY_PROFILE, canonical(o)) for o in unique_objects.values()],
-        )
-        con.executemany(
-            f"{con.dialect.insert_or_replace} claims (claim_id, proposition_id, method) VALUES (?, ?, ?)",
-            [(r[3], r[4], "pigean") for r in chunk_rows],
-        )
-        con.executemany(
-            f"{con.dialect.insert_or_replace} claim_memberships (collection, gene, gene_set, claim_id) VALUES (?, ?, ?, ?)",
-            [(r[0], r[1], r[2], r[3]) for r in chunk_rows],
-        )
-        chunk_objects.clear()
-        chunk_rows.clear()
-
-    for row in ndjson(membership_stats):
-        gene, gene_set, collection = row["gene"], row["gene_set"], row["gene_set_size"]
+def membership_roster_claims(members_by_set: dict[str, set], sets_meta: dict,
+                             gene_set_ids: dict[str, str], collection_obj: dict,
+                             membership_file: dict, activity: dict, agent: dict):
+    """ONE roster claim per gene set (2026-11-09): the proposition's subject
+    is the content-addressed GeneSet entity, which pins the exact member list
+    in its hashable `members` slot. Returns (eager propositions,
+    pending claim rows, per-pair membership index rows)."""
+    propositions, pending_rows, membership_rows = [], [], []
+    for name in sorted(members_by_set):
+        genes = sorted(members_by_set[name])
+        if not genes:
+            continue
+        _, collection = sets_meta[name]
+        gs_id = gene_set_ids[name]
         proposition = mint({
             "class_name": "Proposition",
-            "statement": f"The gene {gene} is a member of the gene set {gene_set}.",
-            "subject_entity": gene,
-            "relation": "member_of",
-            "object_entity": gene_set_ids.get(gene_set, gene_set),
-            "scope": f"PIGEAN gene-set collection {collection} membership.",
+            "statement": (
+                f"In the {collection} gene-set collection, the gene set {name} comprises "
+                f"{len(genes)} member genes; the exact roster is recorded in its "
+                "content-addressed GeneSet entity."
+            ),
+            "subject_entity": gs_id,
+            "relation": "has_members",
+            "object_entity": collection_obj["id"],
+            "scope": f"PIGEAN gene-set collection {collection} membership (observed roster).",
             "proposition_kind": "RESULT",
         })
         claim = mint({
             "class_name": "Claim",
             "proposition": proposition["id"],
-            "statement": f"The {collection} gene-set collection used by PIGEAN includes {gene} as a member of the gene set {gene_set}.",
+            "statement": (
+                f"The {collection} gene-set collection used by PIGEAN defines the membership "
+                f"of {name}: {len(genes)} genes observed in gene_gene_set_stats.json."
+            ),
             "was_generated_by": activity["id"],
             "was_attributed_to": [agent["id"]],
             "was_derived_from": [membership_file["id"]],
-            "source_locator": f"gene_gene_set_stats.json#gene={gene};gene_set={gene_set}",
+            "source_locator": f"gene_gene_set_stats.json#gene_set={name}",
         })
-        chunk_objects.extend([proposition, claim])
-        chunk_rows.append((collection, gene, gene_set, claim["id"], proposition["id"]))
-        total += 1
-        if len(chunk_rows) >= 20000:
-            flush()
-    if chunk_objects or chunk_rows:
-        flush()
-    print(f"membership claims: {total}")
+        propositions.append(proposition)
+        pending_rows.append((claim["id"], proposition["id"], "pigean", IDENTITY_PROFILE, canonical(claim)))
+        membership_rows.extend((collection, gene, name, claim["id"]) for gene in genes)
+    return propositions, pending_rows, membership_rows
 
 
 def load(con, gene_stats: Path, gene_set_stats: Path, membership_stats: Path | None = None) -> None:
@@ -203,7 +205,9 @@ def load(con, gene_stats: Path, gene_set_stats: Path, membership_stats: Path | N
     gene_file = file_object(gene_stats, f"{S3_PREFIX}/combined_gene_stats/cfde-inc-v2/portal/IBD/combined_gene_stats.json")
     set_file = file_object(gene_set_stats, f"{S3_PREFIX}/combined_gene_set_stats/cfde-inc-v2/portal/IBD/combined_gene_set_stats.json")
 
-    objects, claims, gene_rows, set_rows = [activity, agent, gene_file, set_file], [], [], []
+    objects, gene_rows, set_rows = [activity, agent, gene_file, set_file], [], []
+    # Claims stage unasserted: (claim_id, proposition_id, method, profile, payload)
+    pending_rows = []
 
     # --- Gene-set entities (dapper GeneSet / GeneSetCollection + creation
     # Activity), minted before any claim so propositions can reference their
@@ -302,8 +306,8 @@ def load(con, gene_stats: Path, gene_set_stats: Path, membership_stats: Path | N
             "was_derived_from": [gene_file["id"]],
             "source_locator": f"combined_gene_stats.json#gene={gene}",
         })
-        objects.extend([proposition, *scores, *evidence_objs, claim])
-        claims.append((claim["id"], proposition["id"], "pigean"))
+        objects.extend([proposition, *scores, *evidence_objs])
+        pending_rows.append((claim["id"], proposition["id"], "pigean", IDENTITY_PROFILE, canonical(claim)))
         gene_rows.append((phenotype, collection, gene, row["prior"], row["combined"], row["log_bf"], row.get("n"), trait_group, claim["id"]))
 
     for row, line, offset in ndjson_spans(gene_set_stats):
@@ -336,9 +340,17 @@ def load(con, gene_stats: Path, gene_set_stats: Path, membership_stats: Path | N
             "was_derived_from": [set_file["id"]],
             "source_locator": f"combined_gene_set_stats.json#gene_set={gene_set}",
         })
-        objects.extend([proposition, *scores, *evidence_objs, claim])
-        claims.append((claim["id"], proposition["id"], "pigean"))
+        objects.extend([proposition, *scores, *evidence_objs])
+        pending_rows.append((claim["id"], proposition["id"], "pigean", IDENTITY_PROFILE, canonical(claim)))
         set_rows.append((phenotype, collection, gene_set, row["source"], row["beta"], row["beta_uncorrected"], row.get("rs_score"), row.get("n"), trait_group, claim["id"]))
+
+    membership_rows = []
+    if membership_stats is not None and sets_meta:
+        roster_props, roster_pending, membership_rows = membership_roster_claims(
+            members_by_set, sets_meta, gene_set_ids, collection_obj, membership_file, activity, agent
+        )
+        objects.extend(roster_props)
+        pending_rows.extend(roster_pending)
 
     with con:
         # Upsert: a re-run re-mints the same content addresses; count it
@@ -351,7 +363,12 @@ def load(con, gene_stats: Path, gene_set_stats: Path, membership_stats: Path | N
             con.dialect.upsert_object,
             [(o["id"], o["class_name"], IDENTITY_PROFILE, canonical(o)) for o in unique_objects.values()],
         )
-        con.executemany(f"{replace} claims (claim_id, proposition_id, method) VALUES (?, ?, ?)", claims)
+        # Claims are NOT deposited: they stage unasserted and materialize on
+        # first scientific-query serve (lazy assertion).
+        con.executemany(
+            f"{replace} pending_claims (claim_id, proposition_id, method, identity_profile, payload) VALUES (?, ?, ?, ?, ?)",
+            pending_rows,
+        )
         con.executemany(
             f"{replace} pigean_gene_associations (phenotype, collection, gene, prior, combined, log_bf, n, trait_group, claim_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             gene_rows,
@@ -364,14 +381,18 @@ def load(con, gene_stats: Path, gene_set_stats: Path, membership_stats: Path | N
             f"{replace} gene_set_entities (collection, name, dapper_id, n_genes) VALUES (?, ?, ?, ?)",
             entity_rows,
         )
+        con.executemany(
+            f"{replace} claim_memberships (collection, gene, gene_set, claim_id) VALUES (?, ?, ?, ?)",
+            membership_rows,
+        )
 
-    print(f"dapper objects: {len(objects)} (gene-set entities: {len(entity_rows)})")
-    print(f"claims: {len(claims)} (gene associations: {len(gene_rows)}, gene-set associations: {len(set_rows)})")
-    print(f"sample gene claim: {gene_rows[0][8]}")
-
-    if membership_stats is not None:
-        with con:
-            load_memberships(con, membership_stats, membership_file, activity, agent, gene_set_ids)
+    assoc_claim_ids = {g[8] for g in gene_rows} | {s[9] for s in set_rows}
+    roster_claims = sum(1 for p in pending_rows if p[0] not in assoc_claim_ids)
+    print(f"dapper objects (eager data plane): {len(objects)} (gene-set entities: {len(entity_rows)})")
+    print(f"pending claims (unasserted): {len(pending_rows)} "
+          f"(gene: {len(gene_rows)}, gene-set: {len(set_rows)}, set rosters: {roster_claims})")
+    print(f"membership pairs indexed: {len(membership_rows)}")
+    print(f"sample gene claim (pending): {gene_rows[0][8]}")
 
 
 def main() -> None:
