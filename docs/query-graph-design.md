@@ -144,6 +144,18 @@ triple — a gene-set *name* also matches its dapper:GeneSet ID; `subject`/`obje
 `GET /v1/objects/{id}` (dereference any object). Contract: `api/openapi.yaml`, served live at
 `GET /v1/openapi.yaml` with Swagger UI at `GET /v1/docs` (the hand-written contract is the
 authority; FastAPI auto-docs are disabled).
+
+**Identifier resolution** (2026-11-09, per Chase): the content-addressed CURIE
+(`dapper:{Class}.{digest}`) stays the canonical, location-independent identifier; URLs are
+presentations of it and never enter hashed content. `/v1/objects/{id}` is the resolver: a
+consistent document presentation for every class (id + class_name first, sorted keys), with
+content negotiation (browsers get a landing page whose dapper references are themselves
+resolver links). Responses carry `resolver_url` / `resolverUrl` everywhere an ID appears;
+`/v1/vocabulary.identifier_resolution` (and `Query.identifierResolution`) publish the prefix
+expansions and the resolver URL template. `scripts/audit_objects.py` sweeps every stored object
+for structural consistency + referential integrity (479,186 objects, 1,160,641 references,
+clean). A permanent-IRI layer (w3id.org/dapper) is drafted for the dapper maintainers, phased
+with the DAPPER-ID-1 cutover (dapper repo: schema/identity/w3id-namespace-proposal.md).
 Propositions get the same treatment (2026-11-09, Chase): `GET /v1/propositions` /
 `/v1/propositions/search` (same search language, summaries carry `n_claims`) and
 `GET /v1/propositions/{id}` — the **fan-in view**: one statement with every claim that assesses

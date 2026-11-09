@@ -10,7 +10,10 @@ before joins).
 """
 from __future__ import annotations
 
+import html
 import json
+import os
+import re
 from pathlib import Path
 
 from ariadne import ObjectType, QueryType, ScalarType, graphql_sync, make_executable_schema
@@ -29,6 +32,39 @@ DEFAULT_COLLECTION = "cfde-inc-v2"
 PROVISIONAL_WARNING = (
     "Metric interpretations are provisional until confirmed by the method leads (Day-2 decision)."
 )
+
+# Identity vs location (design decision 2026-11-09, per Chase): the
+# content-addressed CURIE (dapper:{Class}.{digest}) is the canonical,
+# location-independent identifier; URLs are presentations of it and never
+# enter hashed content. This service is a resolver: any dapper ID
+# dereferences at {PUBLIC_BASE}/v1/objects/{id}. A permanent-IRI layer
+# (w3id.org/dapper/object/...) is proposed to the dapper maintainers, phased
+# with the DAPPER-ID-1 identity cutover.
+PUBLIC_BASE = os.environ.get("CLAIMS_PUBLIC_BASE_URL", "").rstrip("/")
+
+# Prefix expansions mirrored from the dapper schema (dapper.yaml prefixes):
+# the vocabulary namespace (classes/slots) is deliberately distinct from the
+# instance namespace this resolver serves.
+DAPPER_PREFIXES = {
+    "dapper": "https://broadinstitute.github.io/dapper/ns#",
+    "dapper_class": "https://broadinstitute.github.io/dapper/model/reference/classes/",
+    "dapper_slot": "https://broadinstitute.github.io/dapper/model/reference/slots/",
+    "dapper_enum": "https://broadinstitute.github.io/dapper/model/reference/enums/",
+}
+
+
+def _resolver_url(object_id: str) -> str:
+    """The shareable URL form of a dapper ID: this service's resolver.
+    Absolute when CLAIMS_PUBLIC_BASE_URL is set (QA/prod), else same-origin."""
+    return f"{PUBLIC_BASE}/v1/objects/{object_id}"
+
+
+def identifier_resolution() -> dict:
+    return {
+        "canonical_form": "CURIE dapper:{Class}.{digest} — content-addressed, location-independent; URLs are presentations of it",
+        "resolver_url_template": f"{PUBLIC_BASE}/v1/objects/{{id}}",
+        "prefixes": DAPPER_PREFIXES,
+    }
 
 # One source of truth for metric semantics in this service; the toolkit's
 # template.yaml owns this table once module generation lands.
@@ -91,6 +127,14 @@ def _load_type_defs() -> str:
 def _fetch_payload(con, object_id):
     row = con.execute("SELECT payload FROM dapper_objects WHERE id = ?", (object_id,)).fetchone()
     return json.loads(row["payload"]) if row else None
+
+
+def _present_object(payload: dict) -> dict:
+    """Uniform presentation for every resolved dapper object, whatever its
+    class or depositor: id and class_name first, remaining keys sorted.
+    Content is untouched — this is ordering only."""
+    rest = {k: payload[k] for k in sorted(payload) if k not in ("id", "class_name")}
+    return {"id": payload.get("id"), "class_name": payload.get("class_name"), **rest}
 
 
 def _fetch_payloads(con, object_ids):
@@ -171,6 +215,7 @@ def envelope(con, claim_id):
         evidence.append({"item": item, "valueLocators": locators})
     return {
         "id": claim.get("id", claim_id),
+        "resolverUrl": _resolver_url(claim_id),
         "claim": claim,
         "proposition": proposition,
         "triple": triple,
@@ -351,7 +396,13 @@ def resolve_claim(_, info, id):
 
 @query.field("dapperObject")
 def resolve_dapper_object(_, info, id):
-    return _fetch_payload(info.context["con"], id)
+    payload = _fetch_payload(info.context["con"], id)
+    return _present_object(payload) if payload else None
+
+
+@query.field("identifierResolution")
+def resolve_identifier_resolution(*_):
+    return identifier_resolution()
 
 
 @query.field("proposition")
@@ -621,6 +672,7 @@ def vocabulary():
         con.close()
     return {
         "contract_version": CONTRACT_VERSION,
+        "identifier_resolution": identifier_resolution(),
         "categories": ["gene", "phenotype", "gene_set"],
         "predicates": [
             {"subject_category": "gene", "predicate": "associated_with", "object_category": "phenotype", "methods": ["pigean"]},
@@ -756,7 +808,10 @@ async def deposit(request: Request):
                 else:
                     con.execute(
                         "INSERT INTO dapper_objects (id, class_name, identity_profile, payload) VALUES (?, ?, ?, ?)",
-                        (oid, cls, obj.get("identity_profile", "unverified"), json.dumps(obj)),
+                        # Canonical storage (sorted keys) so every object reads
+                        # back consistently regardless of depositor key order.
+                        (oid, cls, obj.get("identity_profile", "unverified"),
+                         json.dumps(obj, sort_keys=True, separators=(",", ":"))),
                     )
                     times = 1
                 if cls == "Claim":
@@ -784,10 +839,48 @@ async def deposit(request: Request):
         con.close()
 
 
+_DAPPER_ID_RE = re.compile(r"dapper:[A-Za-z]+\.[A-Za-z0-9]+")
+
+
+def _object_landing_html(object_id: str, payload: dict) -> str:
+    """Human landing page for a shared dapper ID: the document, with every
+    referenced dapper ID linked through this same resolver."""
+    doc = json.dumps(payload, indent=2, sort_keys=True)
+    refs = sorted({m for m in _DAPPER_ID_RE.findall(doc) if m != object_id})
+    doc_html = html.escape(doc)
+    for ref in refs:
+        doc_html = doc_html.replace(ref, f'<a href="{_resolver_url(ref)}">{ref}</a>')
+    ref_list = "".join(
+        f'<li><a href="{_resolver_url(r)}">{html.escape(r)}</a></li>' for r in refs
+    ) or "<li>none</li>"
+    claim_links = ""
+    if payload.get("class_name") == "Claim":
+        claim_links = (
+            f'<p>Claim views: <a href="{PUBLIC_BASE}/v1/claims/{object_id}">envelope (scores, evidence, provenance)</a></p>'
+        )
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{html.escape(object_id)}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{{font-family:system-ui,sans-serif;margin:2rem auto;max-width:60rem;padding:0 1rem;color:#222}}
+pre{{background:#f6f8fa;padding:1rem;overflow-x:auto;border-radius:6px}}
+code{{background:#f6f8fa;padding:0.1rem 0.3rem;border-radius:4px}}</style></head>
+<body>
+<h1>{html.escape(payload.get("class_name", "DapperObject"))}</h1>
+<p><code>{html.escape(object_id)}</code> — a content-addressed DAPPER identifier; this page is its
+resolver view (<code>GET {html.escape(PUBLIC_BASE or "")}/v1/objects/{{id}}</code>, JSON by default).</p>
+{claim_links}
+<p>API: <a href="{PUBLIC_BASE}/v1/docs">REST docs</a> · <a href="{PUBLIC_BASE}/v1/graphql">GraphQL</a></p>
+<h2>Referenced dapper objects</h2><ul>{ref_list}</ul>
+<h2>Document</h2><pre>{doc_html}</pre>
+</body></html>"""
+
+
 @app.get("/v1/objects/{object_id}")
-def get_object(object_id: str):
+def get_object(object_id: str, request: Request):
     """Trace any deposited dapper object (GeneSet, GeneSetCollection, Activity,
-    File, ...) by its ID — companion to ClaimEnvelope.provenanceRefs."""
+    File, ...) by its ID — companion to ClaimEnvelope.provenanceRefs.
+    Content-negotiated: browsers (Accept: text/html) get a landing page with
+    referenced IDs linked; everything else gets the verbatim JSON document."""
     con = db.connect()
     try:
         payload = _fetch_payload(con, object_id)
@@ -795,7 +888,12 @@ def get_object(object_id: str):
         con.close()
     if payload is None:
         raise HTTPException(status_code=404, detail=f"no deposited object with id {object_id}")
-    return payload
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept and accept.find("text/html") < (
+        accept.find("application/json") if "application/json" in accept else len(accept)
+    ):
+        return HTMLResponse(_object_landing_html(object_id, payload))
+    return _present_object(payload)
 
 
 def _expand_entity_ids(con, value):
@@ -885,6 +983,7 @@ def _claim_search(con, *, method=None, predicate=None, subject=None, object_=Non
                 "times_deposited": r["times_seen"],
                 "deposited_at": _ts(r["created_at"]),
                 "url": f"/v1/claims/{r['claim_id']}",
+                "resolver_url": _resolver_url(r["claim_id"]),
             }
         )
     return {"total": total, "limit": limit, "offset": offset, "claims": claims}
@@ -952,6 +1051,7 @@ def _proposition_search(con, *, predicate=None, subject=None, object_=None,
                 "n_claims": r["n_claims"],
                 "times_deposited": r["times_seen"],
                 "url": f"/v1/propositions/{r['id']}",
+                "resolver_url": _resolver_url(r["id"]),
             }
         )
     return {"total": total, "limit": limit, "offset": offset, "propositions": propositions}
@@ -1039,6 +1139,7 @@ def get_claim(claim_id: str):
     if env is None:
         raise HTTPException(status_code=404, detail=f"no deposited object with id {claim_id}")
     return {
+        "resolver_url": env["resolverUrl"],
         "claim": env["claim"],
         "proposition": env["proposition"],
         "triple": env["triple"],

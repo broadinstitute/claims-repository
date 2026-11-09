@@ -42,6 +42,15 @@ type Query {
 
   "Registered method modules and their metric semantics, for UI rendering."
   methods: [MethodInfo!]!
+
+  """
+  The identifier story for clients: the canonical CURIE form, this service's
+  resolver URL template (how any dapper ID becomes a shareable link), and the
+  dapper prefix expansions — vocabulary namespace (classes/slots) kept
+  deliberately distinct from the instance namespace this resolver serves.
+  Mirrors /v1/vocabulary's identifier_resolution block.
+  """
+  identifierResolution: JSON!
 }
 
 type Health {
@@ -170,8 +179,10 @@ are conveniences; this envelope is the authority and always carries every
 deposited score with its metric, kind, and interpretation.
 """
 type ClaimEnvelope {
-  "dapper:Claim content address."
+  "dapper:Claim content address (the canonical, location-independent CURIE)."
   id: ID!
+  "Shareable URL form of the ID: this service's resolver (/v1/objects/{id}); the CURIE stays canonical."
+  resolverUrl: String!
   "Verbatim DAPPER Claim document, validated against the pinned profile."
   claim: JSON!
   "Verbatim DAPPER Proposition document."

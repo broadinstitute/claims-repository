@@ -80,6 +80,39 @@ def test_measurement_claim_carries_evidence():
     assert rest["evidence"][0]["valueLocators"][0]["value_text"] == "9.8"
 
 
+def test_identifier_resolution_and_resolver_urls():
+    """CURIE stays canonical; every response offers the shareable URL form."""
+    client.post("/v1/claims", json=_bundle())
+    idres = client.get("/v1/vocabulary").json()["identifier_resolution"]
+    assert idres["prefixes"]["dapper"].startswith("https://")
+    assert idres["resolver_url_template"].endswith("/v1/objects/{id}")
+    data = client.post("/v1/graphql", json={"query": """
+      { claim(id: "dapper:Claim.SYNTHG01") { resolverUrl } identifierResolution }
+    """}).json()["data"]
+    assert data["claim"]["resolverUrl"].endswith("/v1/objects/dapper:Claim.SYNTHG01")
+    assert "dapper" in data["identifierResolution"]["prefixes"]
+    listed = client.get("/v1/claims", params={"limit": 1}).json()
+    first = listed["claims"][0]
+    assert first["resolver_url"].endswith(f"/v1/objects/{first['claim_id']}")
+    rest = client.get("/v1/claims/dapper:Claim.SYNTHG01").json()
+    assert rest["resolver_url"].endswith("/v1/objects/dapper:Claim.SYNTHG01")
+
+
+def test_object_landing_page_negotiation():
+    """A shared resolver link opens as a page in a browser and as the
+    verbatim JSON document everywhere else."""
+    client.post("/v1/claims", json=_bundle())
+    page = client.get("/v1/objects/dapper:Claim.SYNTHG01", headers={"Accept": "text/html"})
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert "dapper:Claim.SYNTHG01" in page.text
+    # Referenced dapper IDs are linked through the same resolver.
+    assert "/v1/objects/dapper:Proposition.SYNTHG01" in page.text
+    raw = client.get("/v1/objects/dapper:Claim.SYNTHG01")
+    assert raw.headers["content-type"].startswith("application/json")
+    assert raw.json()["class_name"] == "Claim"
+
+
 def test_graph_query_over_deposited_claim():
     client.post("/v1/claims", json=_bundle())
     query = """
@@ -219,6 +252,32 @@ def test_challenge_joins_after_membership_deposit():
     membership = client.get("/v1/claims/dapper:Claim.SYNTHM01").json()
     assert membership["scores"] == []
     assert membership["proposition"]["relation"] == "member_of"
+
+
+def test_resolver_returns_consistent_documents():
+    """Every class of dapper object comes back in the same shape: id and
+    class_name first, remaining keys sorted, matching the requested ID.
+    (Runs after the missing-membership test: deposits membership data.)"""
+    client.post("/v1/claims", json=_bundle())
+    client.post("/v1/claims", json=_membership_bundle())
+    cases = [
+        ("dapper:Claim.SYNTHG01", "Claim"),
+        ("dapper:Proposition.SYNTHG01", "Proposition"),
+        ("dapper:ClaimScore.SYNTHG01combined", "ClaimScore"),
+        ("dapper:EvidenceItem.SYNTHG01combined", "EvidenceItem"),
+        ("dapper:ValueLocator.SYNTHG01combined", "ValueLocator"),
+        ("dapper:GeneSet.SYNTHSET01", "GeneSet"),
+    ]
+    for oid, cls in cases:
+        body = client.get(f"/v1/objects/{oid}").json()
+        keys = list(body)
+        assert keys[0] == "id" and keys[1] == "class_name", (oid, keys[:2])
+        assert body["id"] == oid
+        assert body["class_name"] == cls
+        assert keys[2:] == sorted(keys[2:]), oid
+        # GraphQL resolves the same document the same way.
+        gql = client.post("/v1/graphql", json={"query": f'{{ dapperObject(id: "{oid}") }}'}).json()
+        assert gql["data"]["dapperObject"]["id"] == oid
 
 
 def _second_set_bundle():

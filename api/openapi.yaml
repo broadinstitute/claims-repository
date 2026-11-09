@@ -313,11 +313,17 @@ paths:
     get:
       operationId: getObject
       tags: [Claims]
-      summary: Dereference any deposited DAPPER object by ID
+      summary: Dereference any deposited DAPPER object by ID (the resolver)
       description: >-
-        Trace companion to the claim envelope's provenance refs: returns the
-        verbatim stored document for any deposited object (GeneSet,
-        GeneSetCollection, Activity, File, EvidenceItem, ValueLocator, ...).
+        The URL form of any dapper CURIE: {base}/v1/objects/{id}. Returns the
+        stored document for any deposited object (Claim, Proposition,
+        ClaimScore, GeneSet, GeneSetCollection, Activity, File, EvidenceItem,
+        ValueLocator, ...) in a consistent presentation — id and class_name
+        first, remaining keys sorted; content verbatim. Content-negotiated:
+        Accept text/html returns a human landing page with every referenced
+        dapper ID linked through this same resolver; JSON otherwise. The CURIE
+        stays the canonical, content-addressed identifier — this URL is a
+        presentation of it (see /v1/vocabulary identifier_resolution).
       parameters:
         - name: object_id
           in: path
@@ -521,6 +527,7 @@ components:
               times_deposited: { type: integer, description: Mint counter (see deposit response). }
               deposited_at: { type: string, description: UTC timestamp of the first deposit. }
               url: { type: string, description: 'Path of the full envelope: /v1/claims/{claim_id}.' }
+              resolver_url: { type: string, description: 'Shareable URL form of the claim ID (/v1/objects/{id}, absolute when CLAIMS_PUBLIC_BASE_URL is set).' }
     PropositionSummaryPage:
       type: object
       required: [total, limit, offset, propositions]
