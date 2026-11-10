@@ -110,8 +110,11 @@ extend type Query {
   memberships to gene sets that themselves have a PIGEAN association with the
   phenotype, order them within the gene by `setOrder`, and keep the top
   `setsPerGene`. Rows keep the anchor order; a gene whose join finds nothing
-  still appears with sets: []. A missing data source (e.g. membership claims
-  not yet deposited) surfaces in warnings, never as a silent empty result.
+  still appears with sets: []. A missing data source (no memberships loaded
+  for the phenotype) surfaces in warnings and the anchors are still returned
+  with empty sets, never a silent empty result. `phenotype` accepts a
+  KPN.TRAIT ID or a legacy / PIGEAN key. Bounds: topGenes <= 200,
+  setsPerGene <= 50, first <= 500; a request asserts at most 2,000 claims.
   """
   pigeanValidationChallenge(
     phenotype: ID!
@@ -138,7 +141,7 @@ type PigeanValidationChallengeRow {
   sets: [PigeanChallengeSet!]!
 }
 
-"One of an anchor gene's sets: the membership claim linking gene to set, and the set's own association with the phenotype."
+"One of an anchor gene's sets: the membership (backed by the set's roster claim) linking gene to set, and the set's own association with the phenotype."
 type PigeanChallengeSet {
   membership: GeneSetMembership!
   geneSetAssociation: PigeanGeneSetAssociation!

@@ -1,0 +1,55 @@
+# Synthetic KPN trait release for tests (shape of broadinstitute/kpn-data-models
+# versions/trait/<v>/kpn_trait_collection.yaml). Values are not real.
+phenotypes:
+- portal_id: KPN.TRAIT:9000001
+  legacy_id: REGPHENO
+  gwas_source_category: KPN
+  phenotype_name: Registered fixture phenotype
+  legacy_trait_group: FIXTURE
+  trait_group: digestive
+  trait_type: disease
+  primary_mapping:
+    target_id: EFO:9999991
+    target_label: fixture disease
+    target_ontology: EFO
+    mapping_predicate: skos:exactMatch
+    mapping_justification: inherited
+    confidence: 0.85
+  mappings:
+  - target_id: EFO:9999991
+    target_ontology: EFO
+    mapping_predicate: skos:exactMatch
+    mapping_justification: inherited
+    confidence: 0.85
+    target_label: fixture disease
+    source: fixture
+  - target_id: MONDO:9999992
+    target_ontology: MONDO
+    mapping_predicate: skos:exactMatch
+    mapping_justification: cross_reference
+    confidence: 0.8
+    target_label: fixture disease (MONDO)
+    source: xref via EFO:9999991
+- portal_id: KPN.TRAIT:9000002
+  legacy_id: OLDKEY
+  pigean_id: PIGKEY
+  gwas_source_category: rare_v2
+  phenotype_name: Pigean-keyed fixture phenotype
+  legacy_trait_group: FIXTURE
+  trait_group: metabolic
+  trait_type: disease
+  primary_mapping:
+    target_id: ORPHANET:9999993
+    target_label: fixture rare disease
+    target_ontology: ORPHANET
+    mapping_predicate: skos:exactMatch
+    mapping_justification: inherited
+    confidence: 0.9
+  mappings:
+  - target_id: ORPHANET:9999993
+    target_ontology: ORPHANET
+    mapping_predicate: skos:exactMatch
+    mapping_justification: inherited
+    confidence: 0.9
+    target_label: fixture rare disease
+    source: fixture

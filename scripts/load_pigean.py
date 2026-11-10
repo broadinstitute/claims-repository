@@ -1,44 +1,38 @@
 #!/usr/bin/env python3
-"""Load PIGEAN combined_* NDJSON result files into the local claims DB.
+"""Load PIGEAN combined_* NDJSON result files into the claims DB.
 
-One result-file row becomes one Proposition + ClaimScores + Claim (the
-kpn-dapper-toolkit template shape, docs/pigean-ibd-claims.md) plus a row in the
-method's index table. rs_score and n are excluded from claims per the template
-(meanings unconfirmed); n is retained as an unexposed index column.
-
-Measurement claims carry an evidence layer (decision 2026-11-09, Chase): per
-metric, one EvidenceItem grounded by a ValueLocator pinning the exact byte
-span of the serialized number in the result file (the dapper ValueLocator
-PROPOSAL, same structure the toolkit's tier claims use), so every number is
-byte-exactly re-verifiable against the File's sha256.
+CLAIMS ARE MINTED WHEN QUERIED (decision 2026-11-09, Chase). This loader
+builds the DATA PLANE only:
+  - the PIGEAN index tables (one row per result-file row). Each row names the
+    content address of the claim it implies (claim_id, precomputed, NOT
+    stored), its proposition_id, and its synthesis_inputs — the reference IDs
+    the claim needs that the row's values cannot recompute (evidence items,
+    provenance activity/agent/file, the gene-set entity). A row and the claim
+    it names therefore always move together;
+  - the dapper objects that are observations rather than assessments:
+    Propositions, ClaimScores, EvidenceItems + ValueLocators (byte offsets
+    into the result file, which only exist at load time), GeneSet /
+    GeneSetCollection entities, Files, Activities, Agents;
+  - object_refs, the reference index behind GET /v1/objects/search.
+A load REPLACES the (phenotype, collection) slices it covers: no stale
+loader-written association rows or membership edges survive a reload (a
+REST-indexed row is never deleted by the slice, but a loaded row at the same
+key supersedes it). Superseded roster rows stay (keyed by their immutable
+claim address) but are no longer implied — a roster is implied only while a
+membership edge cites it; one already minted stays a stored claim. The service synthesizes a claim from its row + the
+shared template (service/pigean_template.py) whenever the scientific query
+surface serves it, and refuses it unless the result's content address equals
+the row's precomputed one.
 
 Gene-set membership comes from gene_gene_set_stats.json: ONE roster claim per
-gene set (decision 2026-11-09, Chase — not one claim per (gene, gene_set)
-pair). The proposition's subject is the content-addressed GeneSet entity,
-whose hashable `members` list pins the exact roster; the claim_memberships
-index keeps per-pair rows for joining, all pointing at the set's claim. Per
-the 2026-11-06 decision we still ingest only names + genes, never the
-per-pair effect metrics.
+gene set (2026-11-09, Chase) — proposition (dapper:GeneSet, has_members,
+dapper:GeneSetCollection), the exact roster pinned by the entity's
+content-addressed `members` list. claim_memberships keeps per-pair rows for
+joining, all pointing at their set's roster claim. Per the 2026-11-06
+decision only names + genes are ingested, never the per-pair metrics.
 
-LAZY ASSERTION (2026-11-09, Chase): this loader deposits the data plane
-eagerly — propositions, scores, evidence + locators, entities, files,
-activities — but stages every Claim in pending_claims, precomputed and
-unasserted. A claim materializes into dapper_objects the first time the
-scientific query surface (GraphQL) serves it, minting the claim to justify
-the query response; times_seen counts assertions from then on.
-
-Gene sets are also first-class dapper entities (traceable-IDs example, per
-Chase 2026-11-06): one creation Activity + one GeneSetCollection + one GeneSet
-per distinct set (members = genes observed in gene_gene_set_stats, backlink
-in_gene_set_collection). Propositions reference the dapper:GeneSet IDs as
-subject/object entities, so ClaimEnvelope.provenanceRefs.geneSetRefs resolve.
-NOTE: the local profile hashes the whole payload; DAPPER-ID-1 would exclude
-the slots the schema marks unhashable (e.g. in_gene_set_collection).
-
-LOCAL-DEV IDENTITY: IDs are deterministic sha256 digests in DAPPER shape
-(dapper:Class.local<digest>) with identity_profile 'local-dev-sha256-1'. They
-are NOT DAPPER-ID-1 content addresses — real minting belongs to the toolkit
-(Task 1) via the dapper identity tooling. Deterministic: same input, same IDs.
+rs_score and n are excluded from claims (meanings unconfirmed); n is kept as
+an unexposed index column.
 """
 from __future__ import annotations
 
@@ -51,32 +45,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from service import db  # noqa: E402
+from service import pigean_template as tpl  # noqa: E402
+from service.refs import dapper_refs  # noqa: E402
 
 TOOLKIT_DATA = Path("/Users/cyakaboski/src/research/kpn-dapper-toolkit/data/pigean/IBD")
 S3_PREFIX = "s3://dig-analysis-cfde/catalog_v2/out/pigean"
-IDENTITY_PROFILE = "local-dev-sha256-1"
-
-INTERP = {
-    "combined": ("SCORE", "PIGEAN combined log posterior odds of gene-phenotype association (direct GWAS plus gene-set prior evidence); log scale, larger is stronger. PROVISIONAL interpretation pending method-lead confirmation."),
-    "log_bf": ("SCORE", "PIGEAN log Bayes factor from direct GWAS evidence; log scale, larger is stronger. PROVISIONAL."),
-    "prior": ("SCORE", "PIGEAN log prior odds contributed by gene-set membership evidence; log scale. PROVISIONAL."),
-    "beta": ("EFFECT_ESTIMATE", "PIGEAN gene-set effect estimated jointly with other selected gene sets (corrected); log-odds scale. PROVISIONAL."),
-    "beta_uncorrected": ("EFFECT_ESTIMATE", "PIGEAN marginal gene-set effect, not corrected for other gene sets; log-odds scale. PROVISIONAL."),
-}
-
-
-def canonical(payload: dict) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
-
-def mint(payload: dict) -> dict:
-    digest = hashlib.sha256(canonical(payload).encode()).hexdigest()[:32]
-    return {"id": f"dapper:{payload['class_name']}.local{digest}", **payload}
-
-
-def score(metric: str, value: float) -> dict:
-    kind, interpretation = INTERP[metric]
-    return mint({"class_name": "ClaimScore", "score_kind": kind, "metric": metric, "value": value, "interpretation": interpretation})
+mint = tpl.mint
 
 
 def file_object(path: Path, source_uri: str) -> dict:
@@ -123,8 +97,9 @@ def locate_value(line: bytes, key: str) -> tuple[int, int, str] | None:
 
 def evidence_for(metric: str, entity_label: str, phenotype: str, file_obj: dict, file_name: str,
                  line: bytes, line_offset: int, selector_key: str, proposition_id: str) -> tuple[dict, dict]:
-    """Mint the (ValueLocator, EvidenceItem) pair grounding one metric of a
-    measurement claim at the result-file boundary."""
+    """Mint the (ValueLocator, EvidenceItem) pair grounding one metric at the
+    result-file boundary. value_text is the file's own serialization (byte-
+    exact), independent of the float normalization used for scores."""
     located = locate_value(line, metric)
     if located is None:
         raise ValueError(f"metric {metric} not found in {file_name} line for {entity_label}")
@@ -154,245 +129,353 @@ def evidence_for(metric: str, entity_label: str, phenotype: str, file_obj: dict,
     return locator, item
 
 
-def membership_roster_claims(members_by_set: dict[str, set], sets_meta: dict,
-                             gene_set_ids: dict[str, str], collection_obj: dict,
-                             membership_file: dict, activity: dict, agent: dict):
-    """ONE roster claim per gene set (2026-11-09): the proposition's subject
-    is the content-addressed GeneSet entity, which pins the exact member list
-    in its hashable `members` slot. Returns (eager propositions,
-    pending claim rows, per-pair membership index rows)."""
-    propositions, pending_rows, membership_rows = [], [], []
-    for name in sorted(members_by_set):
-        genes = sorted(members_by_set[name])
-        if not genes:
-            continue
-        _, collection = sets_meta[name]
-        gs_id = gene_set_ids[name]
-        proposition = mint({
-            "class_name": "Proposition",
-            "statement": (
-                f"In the {collection} gene-set collection, the gene set {name} comprises "
-                f"{len(genes)} member genes; the exact roster is recorded in its "
-                "content-addressed GeneSet entity."
-            ),
-            "subject_entity": gs_id,
-            "relation": "has_members",
-            "object_entity": collection_obj["id"],
-            "scope": f"PIGEAN gene-set collection {collection} membership (observed roster).",
-            "proposition_kind": "RESULT",
-        })
-        claim = mint({
-            "class_name": "Claim",
-            "proposition": proposition["id"],
-            "statement": (
-                f"The {collection} gene-set collection used by PIGEAN defines the membership "
-                f"of {name}: {len(genes)} genes observed in gene_gene_set_stats.json."
-            ),
-            "was_generated_by": activity["id"],
-            "was_attributed_to": [agent["id"]],
-            "was_derived_from": [membership_file["id"]],
-            "source_locator": f"gene_gene_set_stats.json#gene_set={name}",
-        })
-        propositions.append(proposition)
-        pending_rows.append((claim["id"], proposition["id"], "pigean", IDENTITY_PROFILE, canonical(claim)))
-        membership_rows.extend((collection, gene, name, claim["id"]) for gene in genes)
-    return propositions, pending_rows, membership_rows
+class TraitResolver:
+    """PIGEAN phenotype key -> (canonical trait id, label) via the KPN trait
+    registry (scripts/load_kpn_traits.py): pigean_id first, then legacy_id,
+    then an already-canonical KPN.TRAIT id. Unregistered keys pass through
+    unchanged (and are reported)."""
+
+    def __init__(self, con):
+        self.mysql = not con.dialect.sqlite
+        self.by_key: dict[str, tuple[str, str]] = {}
+        rows = con.execute("SELECT trait_id, legacy_id, pigean_id, name FROM kpn_traits").fetchall()
+        for r in rows:  # legacy first so a pigean_id takes precedence on a clash
+            self.by_key[r["legacy_id"]] = (r["trait_id"], r["name"])
+        self.aliases: dict[str, list[str]] = {}
+        for r in rows:
+            if r["pigean_id"]:
+                self.by_key[r["pigean_id"]] = (r["trait_id"], r["name"])
+            self.by_key[r["trait_id"]] = (r["trait_id"], r["name"])
+            self.aliases[r["trait_id"]] = [k for k in (r["trait_id"], r["pigean_id"], r["legacy_id"]) if k]
+        self.unresolved: set[str] = set()
+
+    def keys_of(self, phenotype: str) -> list[str]:
+        """Every key rows of this (canonical) phenotype may be stored under —
+        rows loaded before the registry carry the legacy key. On MySQL only
+        the keys its ascii VARCHAR(64) phenotype columns can hold (comparing
+        a non-ASCII key against them is a collation error, and no row can
+        carry one); SQLite stores any key, so every alias counts there."""
+        aliases = self.aliases.get(phenotype, [phenotype])
+        if not self.mysql:
+            return aliases
+        return [k for k in aliases if k.isascii() and len(k) <= 64] or [phenotype]
+
+    def __call__(self, key: str) -> tuple[str, str]:
+        if key in self.by_key:
+            return self.by_key[key]
+        self.unresolved.add(key)
+        return key, key
 
 
-def load(con, gene_stats: Path, gene_set_stats: Path, membership_stats: Path | None = None) -> None:
+def _check_against_store(con, documents: dict[str, dict]) -> None:
+    """Refuse to load over a stored document that differs from what this load
+    builds at the same address (data plane or implied claim): content
+    addressing makes that impossible for genuine data, so it is either a
+    forgery planted at a future address or corruption."""
+    ids = sorted(documents)
+    mismatched = []
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        marks = ",".join("?" * len(chunk))
+        for row in con.execute(f"SELECT id, payload FROM dapper_objects WHERE id IN ({marks})", chunk).fetchall():
+            if json.loads(row["payload"]) != documents[row["id"]]:
+                mismatched.append(row["id"])
+    if mismatched:
+        raise SystemExit(
+            f"refusing to load: {len(mismatched)} stored document(s) differ from the content this load "
+            f"addresses identically (forged or corrupted), e.g. {mismatched[:3]}; remove them first"
+        )
+
+
+def load(con, gene_stats: Path, gene_set_stats: Path, membership_stats: Path | None = None) -> dict:
+    resolve = TraitResolver(con)
     activity = mint({"class_name": "Activity", "description": "PIGEAN aggregation run (local development load; companion provenance sidecar pending Task 2)."})
     agent = mint({"class_name": "Agent", "description": "DIG aggregator pipeline (local development placeholder)."})
     gene_file = file_object(gene_stats, f"{S3_PREFIX}/combined_gene_stats/cfde-inc-v2/portal/IBD/combined_gene_stats.json")
     set_file = file_object(gene_set_stats, f"{S3_PREFIX}/combined_gene_set_stats/cfde-inc-v2/portal/IBD/combined_gene_set_stats.json")
 
-    objects, gene_rows, set_rows = [activity, agent, gene_file, set_file], [], []
-    # Claims stage unasserted: (claim_id, proposition_id, method, profile, payload)
-    pending_rows = []
+    objects = [activity, agent, gene_file, set_file]
+    claims: dict[str, dict] = {}  # implied claims, built only to check the store
+    gene_rows, set_rows, roster_rows, membership_rows = [], [], [], []
 
-    # --- Gene-set entities (dapper GeneSet / GeneSetCollection + creation
-    # Activity), minted before any claim so propositions can reference their
-    # computed IDs as subject/object entities.
+    # --- Gene-set entities, keyed by (collection, name): a set name may recur
+    # across collections. One GeneSetCollection (+ creation Activity) per
+    # collection. Minted first so propositions can reference their IDs.
     membership_file = None
-    members_by_set: dict[str, set] = {}
-    sets_meta: dict[str, tuple] = {}  # name -> (source, collection)
+    members: dict[tuple, set] = {}          # (collection, name) -> genes
+    membership_phenotype: dict[str, str] = {}  # collection -> phenotype of its membership file
+    sources: dict[tuple, str] = {}          # (collection, name) -> source tag
     if membership_stats is not None:
         membership_file = file_object(
             membership_stats, f"{S3_PREFIX}/gene_gene_set_stats/cfde-inc-v2/portal/IBD/gene_gene_set_stats.json"
         )
         objects.append(membership_file)
         for row in ndjson(membership_stats):
-            members_by_set.setdefault(row["gene_set"], set()).add(row["gene"])
-            sets_meta.setdefault(row["gene_set"], (row.get("source"), row["gene_set_size"]))
+            key = (row["gene_set_size"], row["gene_set"])
+            members.setdefault(key, set()).add(row["gene"])
+            sources.setdefault(key, row.get("source"))
+            trait_id = resolve(row["phenotype"])[0]
+            seen = membership_phenotype.setdefault(row["gene_set_size"], trait_id)
+            if seen != trait_id:
+                raise ValueError(
+                    f"membership file mixes phenotypes {seen!r} and {trait_id!r} in collection "
+                    f"{row['gene_set_size']!r}: PIGEAN membership is per phenotype run; load each "
+                    "phenotype's gene_gene_set_stats.json separately"
+                )
     for row in ndjson(gene_set_stats):
-        sets_meta.setdefault(row["gene_set"], (row.get("source"), row["gene_set_size"]))
+        sources.setdefault((row["gene_set_size"], row["gene_set"]), row.get("source"))
 
-    gene_set_ids: dict[str, str] = {}
+    collection_objs: dict[str, dict] = {}
+    gene_set_ids: dict[tuple, str] = {}
+    memberless: dict[tuple, dict] = {}
+    memberless_neutral: dict[tuple, dict] = {}
     entity_rows = []
-    if sets_meta:
-        collection_tag = next(iter(sets_meta.values()))[1]
+    # Which GeneSet a gene-set association names (its subject), per
+    # (phenotype, collection) slice — a pure function of this load's inputs
+    # plus, only where this load brings no membership for the slice, the
+    # slice's live rosters:
+    #   - this load's membership file covers the slice: it is authoritative
+    #     (it replaces the slice's edges). A set it lists is the member-ful
+    #     entity; a set it omits is the member-less entity — so an identical
+    #     reload names the identical subject;
+    #   - no membership for the slice in this load: the member-ful entity the
+    #     slice's live roster names (its edges stay, so association and
+    #     roster agree), else the member-less entity. Another phenotype's
+    #     observation never leaks in.
+    # Live rosters are found through the phenotype of the EDGES that keep
+    # them live (the roster row's own phenotype column is first-writer-wins).
+    set_phenotypes = sorted({(resolve(r["phenotype"])[0], r["gene_set_size"]) for r in ndjson(gene_set_stats)})
+    for collection, observed in sorted(membership_phenotype.items()):
+        if (observed, collection) not in set_phenotypes:
+            raise ValueError(
+                f"membership file observes {observed!r} in collection {collection!r}, but the gene-set "
+                "file has no rows for it there: pass that phenotype's own gene_gene_set_stats.json "
+                "(--membership-stats), or --no-membership"
+            )
+    known_entities = {}
+    for phenotype, collection in set_phenotypes:
+        if membership_phenotype.get(collection) == phenotype:
+            continue  # this load's membership replaces the slice
+        keys = resolve.keys_of(phenotype)
+        marks = ",".join("?" * len(keys))
+        for r in con.execute(
+            "SELECT DISTINCT r.gene_set, r.synthesis_inputs FROM pigean_gene_set_rosters r "
+            "JOIN claim_memberships m ON m.claim_id = r.claim_id "
+            f"WHERE m.collection = ? AND m.phenotype IN ({marks})",
+            (collection, *keys),
+        ).fetchall():
+            inputs = r["synthesis_inputs"]
+            inputs = inputs if isinstance(inputs, dict) else json.loads(inputs)
+            known_entities[(phenotype, collection, r["gene_set"])] = inputs["gene_set_entity"]
+    for collection in sorted({c for c, _ in sources}):
         creation = mint({
             "class_name": "Activity",
             "description": (
-                f"Construction of the {collection_tag} gene-set collection (CFDE DCC-built sets, "
+                f"Construction of the {collection} gene-set collection (CFDE DCC-built sets, "
                 "assembled upstream of s3://dig-analysis-bin; see kpn-dapper-toolkit "
                 "docs/pigean-geneset-lineage.md). Placeholder creation object so gene-set IDs are "
                 "traceable; full sidecar provenance is build-plan Task 2."
             ),
         })
-        collection_obj = mint({
+        collection_objs[collection] = mint({
             "class_name": "GeneSetCollection",
-            "name": collection_tag,
+            "name": collection,
             "description": (
-                f"The {collection_tag} gene-set collection used by this PIGEAN run. Member GeneSets "
+                f"The {collection} gene-set collection used by this PIGEAN run. Member GeneSets "
                 "link back via in_gene_set_collection; the complete membership manifest lives upstream."
             ),
             "member_type": "gene_set",
             "was_generated_by": creation["id"],
             "was_attributed_to": [agent["id"]],
         })
-        objects.extend([creation, collection_obj])
-        for name, (source, collection) in sets_meta.items():
-            genes = sorted(members_by_set.get(name, ()))
-            payload = {
-                "class_name": "GeneSet",
-                "name": name,
-                "description": (
-                    f"Gene set {name} from the {collection} collection (source tag: {source}). "
-                    "Record reconstructed from PIGEAN's gene_gene_set_stats output; members are the "
-                    f"genes observed there{'' if genes else ' (none observed for this set)'}."
-                ),
-                "member_type": "gene",
-                "in_gene_set_collection": [collection_obj["id"]],
-                "was_generated_by": creation["id"],
-                "was_attributed_to": [agent["id"]],
-            }
-            if genes:
-                payload["members"] = genes
-                payload["n_genes"] = len(genes)
-            if membership_file is not None:
-                payload["was_derived_from"] = [membership_file["id"]]
-            gene_set_obj = mint(payload)
+        objects.extend([creation, collection_objs[collection]])
+    def gene_set_entity(collection, name, source, genes, derived=True):
+        payload = {
+            "class_name": "GeneSet",
+            "name": name,
+            "description": (
+                f"Gene set {name} from the {collection} collection (source tag: {source}). "
+                "Record reconstructed from PIGEAN's gene_gene_set_stats output; members are the "
+                f"genes observed there{'' if genes else ' (none observed for this set)'}."
+            ),
+            "member_type": "gene",
+            "in_gene_set_collection": [collection_objs[collection]["id"]],
+            "was_generated_by": collection_objs[collection]["was_generated_by"],
+            "was_attributed_to": [agent["id"]],
+        }
+        if genes:
+            payload["members"] = genes
+            payload["n_genes"] = len(genes)
+        if derived and membership_file is not None:
+            payload["was_derived_from"] = [membership_file["id"]]
+        return mint(payload)
+
+    for (collection, name), source in sorted(sources.items()):
+        genes = sorted(members.get((collection, name), ()))
+        if genes:  # never replace a member-ful latest entity with a member-less one
+            gene_set_obj = gene_set_entity(collection, name, source, genes)
             objects.append(gene_set_obj)
-            gene_set_ids[name] = gene_set_obj["id"]
-            entity_rows.append((collection, name, gene_set_obj["id"], len(genes) or None))
+            gene_set_ids[(collection, name)] = gene_set_obj["id"]
+            entity_rows.append((collection, name, gene_set_obj["id"], len(genes)))
+        # Every set also has member-less variants, stored only if some
+        # association row names one (see below): one citing the membership
+        # file, for a set that file omits for its OWN phenotype; and a
+        # phenotype-neutral one (no membership provenance — exactly what a
+        # membership-less load mints) for every other phenotype, so another
+        # phenotype's membership file never decides its subject.
+        memberless[(collection, name)] = gene_set_entity(collection, name, source, [])
+        memberless_neutral[(collection, name)] = gene_set_entity(collection, name, source, [], derived=False)
 
-    for row, line, offset in ndjson_spans(gene_stats):
-        gene, phenotype = row["gene"], row["phenotype"]
-        collection, trait_group = row["gene_set_size"], row["trait_group"]
-        proposition = mint({
-            "class_name": "Proposition",
-            "statement": f"The gene {gene} is associated with {phenotype}.",
-            "subject_entity": gene,
-            "relation": "associated_with",
-            "object_entity": phenotype,
-            "scope": f"PIGEAN gene-level assessment; trait_group={trait_group}; gene-set collection {collection}.",
-            "proposition_kind": "RESULT",
-        })
-        scores = [score(m, row[m]) for m in ("combined", "log_bf", "prior")]
-        evidence_objs, evidence_ids = [], []
-        for m in ("combined", "log_bf", "prior"):
-            locator, item = evidence_for(m, gene, phenotype, gene_file, "combined_gene_stats.json",
+    # --- Gene-phenotype rows: eager proposition/scores/evidence; the claim is
+    # only named (claim_id) and made synthesizable (synthesis_inputs).
+    for raw, line, offset in ndjson_spans(gene_stats):
+        phenotype, label = resolve(raw["phenotype"])
+        row = {**raw, "phenotype": phenotype, "collection": raw["gene_set_size"]}
+        gene, collection = row["gene"], row["collection"]
+        proposition = tpl.gene_proposition(gene, phenotype, label, collection, row["trait_group"])
+        scores = [tpl.score(m, row[m]) for m in tpl.GENE_METRICS]
+        evidence = {}
+        for m in tpl.GENE_METRICS:
+            locator, item = evidence_for(m, gene, label, gene_file, "combined_gene_stats.json",
                                          line, offset, f"gene={gene}", proposition["id"])
-            evidence_objs.extend([locator, item])
-            evidence_ids.append(item["id"])
-        claim = mint({
-            "class_name": "Claim",
-            "proposition": proposition["id"],
-            "statement": f"PIGEAN assessed the association of {gene} with {phenotype} (combined {row['combined']}; log BF {row['log_bf']}; prior {row['prior']}) over the {collection} gene-set collection.",
-            "has_score": [s["id"] for s in scores],
-            "has_evidence": evidence_ids,
-            "was_generated_by": activity["id"],
-            "was_attributed_to": [agent["id"]],
-            "was_derived_from": [gene_file["id"]],
-            "source_locator": f"combined_gene_stats.json#gene={gene}",
-        })
-        objects.extend([proposition, *scores, *evidence_objs])
-        pending_rows.append((claim["id"], proposition["id"], "pigean", IDENTITY_PROFILE, canonical(claim)))
-        gene_rows.append((phenotype, collection, gene, row["prior"], row["combined"], row["log_bf"], row.get("n"), trait_group, claim["id"]))
+            objects.extend([locator, item])
+            evidence[m] = item["id"]
+        inputs = tpl.gene_inputs(activity["id"], agent["id"], gene_file["id"], evidence, label)
+        claim = tpl.gene_claim(row, inputs)
+        claims[claim["id"]] = claim
+        objects.extend([proposition, *scores])
+        gene_rows.append((phenotype, collection, gene, tpl.num(row["prior"]), tpl.num(row["combined"]),
+                          tpl.num(row["log_bf"]), row.get("n"), row["trait_group"], claim["id"],
+                          proposition["id"], tpl.canonical(inputs)))
 
-    for row, line, offset in ndjson_spans(gene_set_stats):
-        gene_set, phenotype = row["gene_set"], row["phenotype"]
-        collection, trait_group = row["gene_set_size"], row["trait_group"]
-        proposition = mint({
-            "class_name": "Proposition",
-            "statement": f"The gene set {gene_set} is associated with {phenotype}.",
-            "subject_entity": gene_set_ids.get(gene_set, gene_set),
-            "relation": "associated_with",
-            "object_entity": phenotype,
-            "scope": f"PIGEAN gene-set-level assessment; trait_group={trait_group}; gene-set collection {collection}.",
-            "proposition_kind": "RESULT",
-        })
-        scores = [score(m, row[m]) for m in ("beta", "beta_uncorrected")]
-        evidence_objs, evidence_ids = [], []
-        for m in ("beta", "beta_uncorrected"):
-            locator, item = evidence_for(m, gene_set, phenotype, set_file, "combined_gene_set_stats.json",
+    # --- Gene-set-phenotype rows.
+    for raw, line, offset in ndjson_spans(gene_set_stats):
+        phenotype, label = resolve(raw["phenotype"])
+        row = {**raw, "phenotype": phenotype, "collection": raw["gene_set_size"]}
+        gene_set, collection = row["gene_set"], row["collection"]
+        own_slice = membership_phenotype.get(collection) == phenotype
+        if own_slice and (collection, gene_set) in gene_set_ids:
+            subject = gene_set_ids[(collection, gene_set)]  # observed for THIS phenotype in this load
+        else:
+            subject = known_entities.get((phenotype, collection, gene_set))
+            if subject is None:
+                obj = (memberless if own_slice else memberless_neutral)[(collection, gene_set)]
+                objects.append(obj)
+                subject = obj["id"]
+        proposition = tpl.gene_set_proposition(gene_set, subject, phenotype, label, collection, row["trait_group"])
+        scores = [tpl.score(m, row[m]) for m in tpl.SET_METRICS]
+        evidence = {}
+        for m in tpl.SET_METRICS:
+            locator, item = evidence_for(m, gene_set, label, set_file, "combined_gene_set_stats.json",
                                          line, offset, f"gene_set={gene_set}", proposition["id"])
-            evidence_objs.extend([locator, item])
-            evidence_ids.append(item["id"])
-        claim = mint({
-            "class_name": "Claim",
-            "proposition": proposition["id"],
-            "statement": f"PIGEAN assessed the association of gene set {gene_set} with {phenotype} (beta {row['beta']}; beta_uncorrected {row['beta_uncorrected']}).",
-            "has_score": [s["id"] for s in scores],
-            "has_evidence": evidence_ids,
-            "was_generated_by": activity["id"],
-            "was_attributed_to": [agent["id"]],
-            "was_derived_from": [set_file["id"]],
-            "source_locator": f"combined_gene_set_stats.json#gene_set={gene_set}",
-        })
-        objects.extend([proposition, *scores, *evidence_objs])
-        pending_rows.append((claim["id"], proposition["id"], "pigean", IDENTITY_PROFILE, canonical(claim)))
-        set_rows.append((phenotype, collection, gene_set, row["source"], row["beta"], row["beta_uncorrected"], row.get("rs_score"), row.get("n"), trait_group, claim["id"]))
+            objects.extend([locator, item])
+            evidence[m] = item["id"]
+        inputs = tpl.gene_set_inputs(activity["id"], agent["id"], set_file["id"], subject, evidence, label)
+        claim = tpl.gene_set_claim(row, inputs)
+        claims[claim["id"]] = claim
+        objects.extend([proposition, *scores])
+        set_rows.append((phenotype, collection, gene_set, row["source"], tpl.num(row["beta"]),
+                         tpl.num(row["beta_uncorrected"]), row.get("rs_score"), row.get("n"),
+                         row["trait_group"], claim["id"], proposition["id"], tpl.canonical(inputs)))
 
-    membership_rows = []
-    if membership_stats is not None and sets_meta:
-        roster_props, roster_pending, membership_rows = membership_roster_claims(
-            members_by_set, sets_meta, gene_set_ids, collection_obj, membership_file, activity, agent
-        )
-        objects.extend(roster_props)
-        pending_rows.extend(roster_pending)
+    # --- Membership: one roster claim per gene set with observed members.
+    if membership_file is not None:
+        for (collection, name), genes in sorted(members.items()):
+            genes = sorted(genes)
+            phenotype = membership_phenotype[collection]
+            inputs = tpl.roster_inputs(activity["id"], agent["id"], membership_file["id"],
+                                       gene_set_ids[(collection, name)], collection_objs[collection]["id"],
+                                       len(genes))
+            proposition = tpl.roster_proposition(name, inputs["gene_set_entity"], collection,
+                                                 inputs["collection_entity"], inputs["n_genes"])
+            claim = tpl.roster_claim({"gene_set": name, "collection": collection}, inputs)
+            claims[claim["id"]] = claim
+            objects.append(proposition)
+            roster_rows.append((claim["id"], phenotype, collection, name, proposition["id"],
+                                tpl.canonical(inputs)))
+            membership_rows.extend((phenotype, collection, gene, name, claim["id"]) for gene in genes)
+
+    unique_objects = {o["id"]: o for o in objects}
+    _check_against_store(con, {**unique_objects, **claims})
+    ref_rows = sorted({(oid, ref) for oid, o in unique_objects.items() for ref in dapper_refs(o)})
+    gene_slices = sorted({(r[0], r[1]) for r in gene_rows})
+    set_slices = sorted({(r[0], r[1]) for r in set_rows})
+    membership_slices = sorted({(r[0], r[1]) for r in membership_rows})
 
     with con:
-        # Upsert: a re-run re-mints the same content addresses; count it
-        # (times_seen) instead of silently replacing. Dedupe within the run
-        # first — identical score payloads across rows share one address and
-        # are one minting event, not a re-mint.
         replace = con.dialect.insert_or_replace
-        unique_objects = {o["id"]: o for o in objects}
+        # A load replaces the (phenotype, collection) slices it covers. The
+        # slice DELETEs skip rows indexed by REST deposits (no synthesis
+        # inputs; non-roster membership claims); a loaded row written at the
+        # same key below still supersedes one.
+        # Under EVERY key of the phenotype: rows loaded before the trait
+        # registry carry the legacy key, and must not survive beside the
+        # canonical reload.
+        def slice_keys(phenotype):
+            keys = resolve.keys_of(phenotype)
+            return keys, ",".join("?" * len(keys))
+
+        for phenotype, collection in gene_slices:
+            keys, marks = slice_keys(phenotype)
+            con.execute(f"DELETE FROM pigean_gene_associations WHERE phenotype IN ({marks}) AND collection = ? "
+                        "AND synthesis_inputs IS NOT NULL", (*keys, collection))
+        for phenotype, collection in set_slices:
+            keys, marks = slice_keys(phenotype)
+            con.execute(f"DELETE FROM pigean_gene_set_associations WHERE phenotype IN ({marks}) AND collection = ? "
+                        "AND synthesis_inputs IS NOT NULL", (*keys, collection))
+        for phenotype, collection in membership_slices:
+            keys, marks = slice_keys(phenotype)
+            con.execute(f"DELETE FROM claim_memberships WHERE phenotype IN ({marks}) AND collection = ? "
+                        "AND claim_id IN (SELECT claim_id FROM pigean_gene_set_rosters)", (*keys, collection))
+        # Upsert: a re-run re-deposits the same content addresses; count it
+        # (times_seen) instead of silently replacing. Deduped within the run.
         con.executemany(
             con.dialect.upsert_object,
-            [(o["id"], o["class_name"], IDENTITY_PROFILE, canonical(o)) for o in unique_objects.values()],
+            [(o["id"], o["class_name"], tpl.IDENTITY_PROFILE, tpl.canonical(o)) for o in unique_objects.values()],
         )
-        # Claims are NOT deposited: they stage unasserted and materialize on
-        # first scientific-query serve (lazy assertion).
+        con.executemany(con.dialect.insert_ref, ref_rows)
         con.executemany(
-            f"{replace} pending_claims (claim_id, proposition_id, method, identity_profile, payload) VALUES (?, ?, ?, ?, ?)",
-            pending_rows,
-        )
-        con.executemany(
-            f"{replace} pigean_gene_associations (phenotype, collection, gene, prior, combined, log_bf, n, trait_group, claim_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"{replace} pigean_gene_associations (phenotype, collection, gene, prior, combined, log_bf, n, trait_group, claim_id, proposition_id, synthesis_inputs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             gene_rows,
         )
         con.executemany(
-            f"{replace} pigean_gene_set_associations (phenotype, collection, gene_set, source, beta, beta_uncorrected, rs_score, n, trait_group, claim_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"{replace} pigean_gene_set_associations (phenotype, collection, gene_set, source, beta, beta_uncorrected, rs_score, n, trait_group, claim_id, proposition_id, synthesis_inputs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             set_rows,
+        )
+        # Roster rows are keyed by their claim's content address: immutable.
+        con.executemany(
+            f"{con.dialect.insert_or_ignore} pigean_gene_set_rosters (claim_id, phenotype, collection, gene_set, proposition_id, synthesis_inputs) VALUES (?, ?, ?, ?, ?, ?)",
+            roster_rows,
+        )
+        con.executemany(
+            f"{replace} claim_memberships (phenotype, collection, gene, gene_set, claim_id) VALUES (?, ?, ?, ?, ?)",
+            membership_rows,
         )
         con.executemany(
             f"{replace} gene_set_entities (collection, name, dapper_id, n_genes) VALUES (?, ?, ?, ?)",
             entity_rows,
         )
-        con.executemany(
-            f"{replace} claim_memberships (collection, gene, gene_set, claim_id) VALUES (?, ?, ?, ?)",
-            membership_rows,
-        )
 
-    assoc_claim_ids = {g[8] for g in gene_rows} | {s[9] for s in set_rows}
-    roster_claims = sum(1 for p in pending_rows if p[0] not in assoc_claim_ids)
-    print(f"dapper objects (eager data plane): {len(objects)} (gene-set entities: {len(entity_rows)})")
-    print(f"pending claims (unasserted): {len(pending_rows)} "
-          f"(gene: {len(gene_rows)}, gene-set: {len(set_rows)}, set rosters: {roster_claims})")
-    print(f"membership pairs indexed: {len(membership_rows)}")
-    print(f"sample gene claim (pending): {gene_rows[0][8]}")
+    stats = {
+        "objects": len(unique_objects),
+        "refs": len(ref_rows),
+        "gene_set_entities": len(entity_rows),
+        "gene_claims": len(gene_rows),
+        "gene_set_claims": len(set_rows),
+        "roster_claims": len(roster_rows),
+        "membership_pairs": len(membership_rows),
+    }
+    print(f"dapper objects (data plane): {stats['objects']} (gene-set entities: {stats['gene_set_entities']}); "
+          f"object refs: {stats['refs']}")
+    print(f"claims synthesizable on serve (none stored): "
+          f"{stats['gene_claims'] + stats['gene_set_claims'] + stats['roster_claims']} "
+          f"(gene: {stats['gene_claims']}, gene-set: {stats['gene_set_claims']}, set rosters: {stats['roster_claims']})")
+    print(f"membership pairs indexed: {stats['membership_pairs']}")
+    if resolve.unresolved:
+        print(f"WARNING: {len(resolve.unresolved)} phenotype key(s) not in the KPN trait registry (load it "
+              f"first with scripts/load_kpn_traits.py); kept as-is: {sorted(resolve.unresolved)[:5]}")
+    stats["unresolved_phenotypes"] = sorted(resolve.unresolved)
+    return stats
 
 
 def main() -> None:
@@ -400,12 +483,18 @@ def main() -> None:
     parser.add_argument("--gene-stats", type=Path, default=TOOLKIT_DATA / "combined_gene_stats.json")
     parser.add_argument("--gene-set-stats", type=Path, default=TOOLKIT_DATA / "combined_gene_set_stats.json")
     parser.add_argument("--membership-stats", type=Path, default=TOOLKIT_DATA / "gene_gene_set_stats.json",
-                        help="gene_gene_set_stats.json; membership load is skipped if the file is absent")
+                        help="gene_gene_set_stats.json of the SAME PIGEAN run (default: the toolkit's IBD file; "
+                             "a file for a phenotype the result files lack is refused); skipped if absent")
+    parser.add_argument("--no-membership", action="store_true",
+                        help="load no membership (keeps each slice's live rosters)")
     parser.add_argument("--db", default=None, help="SQLite path (default: service default)")
     args = parser.parse_args()
-    membership = args.membership_stats if args.membership_stats.exists() else None
-    if membership is None:
-        print(f"membership stats not found at {args.membership_stats}; skipping membership load")
+    membership = None if args.no_membership else args.membership_stats
+    if membership is not None and not membership.exists():
+        print(f"WARNING: membership stats not found at {membership}; skipping membership load")
+        membership = None
+    elif membership is None:
+        print("--no-membership: skipping membership load")
     con = db.connect(args.db)
     try:
         load(con, args.gene_stats, args.gene_set_stats, membership)

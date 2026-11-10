@@ -1,0 +1,2 @@
+{"gene_set": "FIXSET_A", "source": "lincs", "beta": 0, "beta_uncorrected": 1.5, "rs_score": 0.4, "n": 2, "trait_group": "portal", "phenotype": "FIXPHENO", "gene_set_size": "fixture-v1"}
+{"gene_set": "FIXSET_B", "source": "geobulk___igvf", "beta": 0.3, "beta_uncorrected": 0.9, "rs_score": 0.1, "n": 1, "trait_group": "portal", "phenotype": "FIXPHENO", "gene_set_size": "fixture-v1"}

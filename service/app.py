@@ -12,18 +12,25 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import os
 import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from ariadne import ObjectType, QueryType, ScalarType, graphql_sync, make_executable_schema
 from ariadne.explorer import ExplorerGraphiQL
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
 from . import db
+from . import pigean_template as tpl
+from .refs import DAPPER_ID_RE, LOCAL_DEV_ID_RE, MAX_ID_LENGTH, dapper_refs
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_VERSION = "0.2.0"
@@ -51,6 +58,9 @@ DAPPER_PREFIXES = {
     "dapper_class": "https://broadinstitute.github.io/dapper/model/reference/classes/",
     "dapper_slot": "https://broadinstitute.github.io/dapper/model/reference/slots/",
     "dapper_enum": "https://broadinstitute.github.io/dapper/model/reference/enums/",
+    # KPN trait IDs (broadinstitute/kpn-data-models), the canonical phenotype
+    # identifiers claims name (e.g. KPN.TRAIT:0000505 = IBD).
+    "KPN.TRAIT": "https://broadinstitute.github.io/kpn-data-models/kpn.trait/",
 }
 
 
@@ -151,6 +161,13 @@ def _fetch_payloads(con, object_ids):
     return {r["id"]: json.loads(r["payload"]) for r in rows}
 
 
+def _id_list(value) -> list:
+    """The string ids in a reference-list slot. Stored documents (external
+    deposits) are not schema-validated, and a typed GraphQL field must never
+    fail a whole response over one malformed slot."""
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
 def _dapper_refs(values, prefix):
     return [v for v in values if isinstance(v, str) and v.startswith(prefix)]
 
@@ -161,70 +178,168 @@ def _ts(value):
     return None if value is None else str(value)
 
 
-def _materialize_claim(con, claim_id):
-    """Lazy assertion (2026-11-09, Chase): move a precomputed, unasserted
-    claim from pending_claims into dapper_objects + the claims registry —
-    the mint event that justifies the query response now being served."""
-    pending = con.execute(
-        "SELECT proposition_id, method, identity_profile, payload FROM pending_claims WHERE claim_id = ?",
-        (claim_id,),
-    ).fetchone()
-    if pending is None:
-        return None
-    with con:
-        con.execute(
-            con.dialect.upsert_object,
-            (claim_id, "Claim", pending["identity_profile"], pending["payload"]),
-        )
-        con.execute(
-            f"{con.dialect.insert_or_replace} claims (claim_id, proposition_id, method) VALUES (?, ?, ?)",
-            (claim_id, pending["proposition_id"], pending["method"]),
-        )
-        con.execute("DELETE FROM pending_claims WHERE claim_id = ?", (claim_id,))
-    return con.execute(
-        "SELECT payload, times_seen, created_at, last_seen_at FROM dapper_objects WHERE id = ?",
-        (claim_id,),
-    ).fetchone()
+# ---------------------------------------------------------------------------
+# Claim synthesis — claims are minted when queried (2026-11-09, Chase).
+#
+# Each index row names its claim's precomputed content address (claim_id) and
+# carries synthesis_inputs; the claim document is synthesized from the row +
+# the shared template, purely (no queries). Synthesis runs on EVERY serve of
+# a template-backed row, and the claim is refused unless its address equals
+# the row's precomputed one and — once stored — it is identical to the stored
+# document: template drift, a tampered row, or a forged deposit at the row's
+# address are never served. GraphQL requests run in one transaction committed
+# only when the whole response succeeded (see _execute_graphql), so a failure
+# leaves no partial mints or counts behind.
 
 
-def envelope(con, claim_id, assert_claim=True):
-    """The claim envelope. `assert_claim=True` (the scientific query surface)
-    ASSERTS the claim: a pending claim materializes on first touch, and every
-    serve counts as an assertion (times_seen += 1, deduped per request).
-    REST dereference passes False — it reads what has been asserted."""
-    row = con.execute(
-        "SELECT payload, times_seen, created_at, last_seen_at FROM dapper_objects WHERE id = ?",
-        (claim_id,),
-    ).fetchone()
-    asserted = getattr(con, "asserted_ids", None)
-    if asserted is None:
-        asserted = con.asserted_ids = set()
-    if row is None:
-        if not assert_claim:
-            return None
-        row = _materialize_claim(con, claim_id)
-        if row is None:
-            return None
-        asserted.add(claim_id)
-    elif assert_claim and claim_id not in asserted:
-        asserted.add(claim_id)
-        with con:
-            con.execute(
-                "UPDATE dapper_objects SET times_seen = times_seen + 1, "
-                f"last_seen_at = {con.dialect.now} WHERE id = ?",
-                (claim_id,),
-            )
+class ClaimSynthesisError(RuntimeError):
+    """The template no longer reproduces the claim its index row names, or
+    the stored document at that address differs from it."""
+
+
+# (family, index table) for every PIGEAN index row that implies a claim.
+CLAIM_SOURCES = (
+    ("gene", "pigean_gene_associations"),
+    ("gene_set", "pigean_gene_set_associations"),
+    ("roster", "pigean_gene_set_rosters"),
+)
+
+
+def _index_source(con, claim_id, families=None):
+    """The template-backed index row that implies this claim, or None."""
+    for family, table in CLAIM_SOURCES:
+        if families and family not in families:
+            continue
         row = con.execute(
-            "SELECT payload, times_seen, created_at, last_seen_at FROM dapper_objects WHERE id = ?",
+            f"SELECT * FROM {table} t WHERE claim_id = ? AND synthesis_inputs IS NOT NULL{_live_roster(family)} LIMIT 1",
             (claim_id,),
         ).fetchone()
-    claim = json.loads(row["payload"])
-    proposition = _fetch_payload(con, claim.get("proposition")) or {}
-    score_docs = _fetch_payloads(con, claim.get("has_score", []))
+        if row is not None:
+            return family, row
+    return None
+
+
+def _live_roster(family):
+    """A roster claim is implied only while it backs a membership edge: a
+    reload with a different roster supersedes it."""
+    if family != "roster":
+        return ""
+    return " AND EXISTS (SELECT 1 FROM claim_memberships m WHERE m.claim_id = t.claim_id)"
+
+
+def _inputs_of(row):
+    raw = row["synthesis_inputs"]
+    if raw is None:
+        return None
+    return raw if isinstance(raw, dict) else json.loads(raw)
+
+
+def synthesize_claim(family, row):
+    """The claim document a template-backed index row implies, verified
+    against the row's precomputed content address. Pure: no database access."""
+    inputs = _inputs_of(row)
+    if inputs is None:
+        raise ClaimSynthesisError(f"{row['claim_id']} is not template-backed (no synthesis inputs)")
+    try:
+        claim = tpl.CLAIM_BUILDERS[family](row, inputs)
+    except (KeyError, IndexError, TypeError, ValueError) as exc:  # sqlite3.Row raises IndexError
+        raise ClaimSynthesisError(
+            f"synthesis inputs incomplete for {row['claim_id']} ({type(exc).__name__}: {exc})"
+        ) from exc
+    if claim["id"] != row["claim_id"]:
+        raise ClaimSynthesisError(
+            f"template drift: index row names {row['claim_id']} but the template synthesizes "
+            f"{claim['id']}; refusing to serve a claim that differs from the one its data implies"
+        )
+    return claim
+
+
+def _store_object(con, obj, identity_profile):
+    """Upsert one dapper object (re-mint => times_seen += 1) plus its refs.
+    No commit: callers own the transaction."""
+    con.execute(
+        con.dialect.upsert_object,
+        (obj["id"], obj["class_name"], identity_profile, tpl.canonical(obj)),
+    )
+    refs = sorted(dapper_refs(obj))
+    if refs:
+        con.executemany(con.dialect.insert_ref, [(obj["id"], ref) for ref in refs])
+
+
+_ENVELOPE_COLS = "payload, class_name, times_seen, created_at, last_seen_at"
+
+
+# Assertions are RECORDED while a GraphQL response is resolved and written in
+# one short batch after it succeeded (_flush_assertions), in sorted claim-id
+# order: every request takes its row locks in the same order, so concurrent
+# requests serving overlapping claims cannot deadlock, and a failed response
+# writes nothing. The budget bounds what one request (aliases included) can
+# assert.
+MAX_ASSERTIONS_PER_REQUEST = 2000
+
+
+def _now_ts():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def envelope(con, claim_id, assert_claim=True, source=None):
+    """The claim envelope, or None when `claim_id` is not a claim.
+
+    With `assert_claim` (the scientific query surface) serving ASSERTS the
+    claim: a template-backed claim is synthesized and verified against its
+    index row (and the stored document) on every serve, and the assertion —
+    a first-serve mint, or a re-assertion — is recorded once per request for
+    the end-of-request flush. `source` is the (family, index row) when the
+    caller already has it. Counts in the envelope are as of this response."""
+    row = con.execute(f"SELECT {_ENVELOPE_COLS} FROM dapper_objects WHERE id = ?", (claim_id,)).fetchone()
+    if row is not None and row["class_name"] != "Claim":
+        return None
+    if not assert_claim:
+        if row is None:
+            return None
+        claim = json.loads(row["payload"])
+        times, first, last = row["times_seen"], _ts(row["created_at"]), _ts(row["last_seen_at"] or row["created_at"])
+    else:
+        if source is None or _inputs_of(source[1]) is None:
+            source = _index_source(con, claim_id) or source
+        synthesized = None
+        if source is not None and _inputs_of(source[1]) is not None:
+            synthesized = synthesize_claim(*source)
+        if row is None and synthesized is None:
+            return None
+        if row is not None and synthesized is not None and json.loads(row["payload"]) != synthesized:
+            raise ClaimSynthesisError(
+                f"stored document at {claim_id} differs from the claim its index row implies; "
+                "refusing to serve it"
+            )
+        assertions = getattr(con, "assertions", None)
+        if assertions is None:
+            assertions = con.assertions = {}
+        if claim_id not in assertions:
+            if len(assertions) >= MAX_ASSERTIONS_PER_REQUEST:
+                raise ValueError(
+                    f"this request would assert more than {MAX_ASSERTIONS_PER_REQUEST} claims; "
+                    "narrow it (fewer rows or aliases)"
+                )
+            if row is None:
+                assertions[claim_id] = {
+                    "new": True, "payload": tpl.canonical(synthesized), "identity_profile": tpl.IDENTITY_PROFILE,
+                    "proposition": synthesized["proposition"], "refs": sorted(dapper_refs(synthesized)),
+                }
+            else:
+                assertions[claim_id] = {"new": False, "payload": row["payload"], "identity_profile": "unverified"}
+        claim = synthesized if row is None else json.loads(row["payload"])
+        now = _now_ts()
+        times = (row["times_seen"] if row is not None else 0) + 1
+        first = _ts(row["created_at"]) if row is not None else now
+        last = now
+    proposition = (_fetch_payload(con, claim["proposition"]) if isinstance(claim.get("proposition"), str) else None) or {}
+    score_ids = _id_list(claim.get("has_score"))
+    score_docs = _fetch_payloads(con, score_ids)
     scores = []
-    for sid in claim.get("has_score", []):
+    for sid in score_ids:
         s = score_docs.get(sid)
-        if s:
+        if _well_formed_score(s):
             scores.append(
                 {
                     "id": s.get("id", sid),
@@ -236,7 +351,8 @@ def envelope(con, claim_id, assert_claim=True):
             )
     entity_refs = [proposition.get("subject_entity"), proposition.get("object_entity")]
     gene_set_refs = _dapper_refs(entity_refs, "dapper:GeneSet.")
-    file_refs = _dapper_refs(claim.get("was_derived_from", []), "dapper:")
+    derived_from = _id_list(claim.get("was_derived_from"))
+    file_refs = _dapper_refs(derived_from, "dapper:")
     refs_to_resolve = gene_set_refs + file_refs
     resolution = "UNRESOLVED"
     if refs_to_resolve:
@@ -246,22 +362,17 @@ def envelope(con, claim_id, assert_claim=True):
             refs_to_resolve,
         ).fetchone()["c"]
         resolution = "RESOLVED" if found == len(refs_to_resolve) else "UNRESOLVED"
-    triple = None
-    if proposition.get("relation"):
-        triple = {
-            "subject": proposition.get("subject_entity", ""),
-            "predicate": proposition["relation"],
-            "object": proposition.get("object_entity", ""),
-        }
+    triple = _triple_of(proposition)
     evidence = []
-    evidence_docs = _fetch_payloads(con, claim.get("has_evidence", []))
-    items = [evidence_docs[eid] for eid in claim.get("has_evidence", []) if eid in evidence_docs]
+    evidence_ids = _id_list(claim.get("has_evidence"))
+    evidence_docs = _fetch_payloads(con, evidence_ids)
+    items = [evidence_docs[eid] for eid in evidence_ids if isinstance(evidence_docs.get(eid), dict)]
     locator_docs = _fetch_payloads(
-        con, [vid for item in items for vid in item.get("value_locators", [])]
+        con, [vid for item in items for vid in _id_list(item.get("value_locators"))]
     )
     for item in items:
         locators = [
-            locator_docs[vid] for vid in item.get("value_locators", []) if vid in locator_docs
+            locator_docs[vid] for vid in _id_list(item.get("value_locators")) if vid in locator_docs
         ]
         evidence.append({"item": item, "valueLocators": locators})
     return {
@@ -272,11 +383,11 @@ def envelope(con, claim_id, assert_claim=True):
         "triple": triple,
         "scores": scores,
         "evidence": evidence,
-        "timesDeposited": row["times_seen"],
-        "firstDepositedAt": _ts(row["created_at"]),
-        "lastDepositedAt": _ts(row["last_seen_at"] or row["created_at"]),
+        "timesDeposited": times,
+        "firstDepositedAt": first,
+        "lastDepositedAt": last,
         "provenanceRefs": {
-            "derivedFromFiles": claim.get("was_derived_from", []),
+            "derivedFromFiles": derived_from,
             "geneSetRefs": gene_set_refs,
             "resolveVia": "provenance-indexer",
             "resolution": resolution,
@@ -284,19 +395,156 @@ def envelope(con, claim_id, assert_claim=True):
     }
 
 
-def _phenotype_view(phenotype_id, trait_group):
-    return {"id": phenotype_id, "name": None, "traitGroup": trait_group, "conceptId": None}
+# I-JSON (RFC 7493) / Number.MAX_SAFE_INTEGER, for integer LITERALS. A number
+# written as a float is an IEEE-754 double: it must be finite, and digits
+# beyond double precision are rounded on parse (9007199254740993.0 is stored
+# as 9007199254740992.0), as every JSON consumer would.
+MAX_EXACT_INT = 2 ** 53 - 1
+MAX_JSON_DEPTH = 64  # well under MySQL's JSON depth limit (100) and every recursive walk
+# The GraphQL ScoreKind enum (DAPPER ClaimScoreKindEnum): any other value
+# cannot be serialized, so a score carrying one is not well-formed.
+SCORE_KINDS = frozenset({"PROBABILITY", "POSTERIOR_PROBABILITY", "EFFECT_ESTIMATE", "LOADING", "SCORE"})
+
+
+def _finite_number(v) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, int):
+        return abs(v) <= MAX_EXACT_INT
+    return isinstance(v, float) and math.isfinite(v)
+
+
+def _well_formed_score(s) -> bool:
+    return (
+        isinstance(s, dict)
+        and all(isinstance(s.get(k), str) for k in ("score_kind", "metric", "interpretation"))
+        and s["score_kind"] in SCORE_KINDS
+        and _finite_number(s.get("value"))
+    )
+
+
+def _flush_assertions(con):
+    """Write the request's recorded assertions in one batch, sorted by claim
+    id (deterministic lock order). Upserts mint new claims and count
+    re-assertions (times_seen += 1) alike; a claim minted concurrently by
+    another request is simply counted."""
+    assertions = getattr(con, "assertions", None) or {}
+    if not assertions:
+        return
+    items = sorted(assertions.items())
+    con.executemany(
+        con.dialect.upsert_object,
+        [(cid, "Claim", a["identity_profile"], a["payload"]) for cid, a in items],
+    )
+    new = [(cid, a) for cid, a in items if a["new"]]
+    if new:
+        con.executemany(
+            f"{con.dialect.insert_or_ignore} claims (claim_id, proposition_id, method) VALUES (?, ?, ?)",
+            [(cid, a["proposition"], tpl.METHOD) for cid, a in new],
+        )
+        refs = [(cid, ref) for cid, a in new for ref in a["refs"]]
+        if refs:
+            con.executemany(con.dialect.insert_ref, refs)
+
+
+def _is_lock_conflict(exc) -> bool:
+    """MySQL deadlock / lock-wait timeout, or SQLite busy/locked: retryable."""
+    if type(exc).__module__.startswith("pymysql"):
+        return bool(exc.args) and exc.args[0] in (1205, 1213)
+    return type(exc).__name__ == "OperationalError" and any(w in str(exc) for w in ("locked", "busy"))
+
+
+def _commit_assertions(con, attempts=3):
+    """Flush + commit with retry on lock conflicts. Returns an error message,
+    or None on success."""
+    for attempt in range(attempts):
+        try:
+            _flush_assertions(con)
+            con.commit()
+            return None
+        except Exception as exc:  # noqa: BLE001 — classified below
+            con.rollback()
+            if _is_lock_conflict(exc) and attempt + 1 < attempts:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            return f"could not record this response's claim assertions: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Phenotypes: canonical KPN trait IDs (2026-11-09, Chase). The KPN trait
+# registry (scripts/load_kpn_traits.py, from broadinstitute/kpn-data-models)
+# maps legacy portal / PIGEAN keys (IBD) to KPN.TRAIT IDs (KPN.TRAIT:0000505)
+# and their ontology mappings. Every phenotype argument accepts any of those
+# keys; queries match index rows under all of a trait's keys, so rows loaded
+# before the registry still resolve.
+
+
+def _trait(con, key):
+    cache = getattr(con, "trait_cache", None)
+    if cache is None:
+        cache = con.trait_cache = {}
+    if key not in cache:
+        rec = None
+        for col in ("trait_id", "pigean_id", "legacy_id"):
+            if col == "trait_id" and not key.isascii():
+                continue  # trait_id is an ascii column; MySQL would refuse the comparison
+            rec = con.execute(f"SELECT * FROM kpn_traits WHERE {col} = ? LIMIT 1", (key,)).fetchone()
+            if rec is not None:
+                break
+        cache[key] = rec
+    return cache[key]
+
+
+_NO_PHENOTYPE = "?none"  # an ASCII key no row carries, so IN () never occurs
+
+
+def _storable_key(k) -> bool:
+    """Index phenotype columns are VARCHAR(64) ascii on MySQL; other keys can
+    never match a row (and would raise a collation error there)."""
+    return bool(k) and k.isascii() and len(k) <= 64
+
+
+def _phenotype_keys(con, key):
+    """Every key index rows may carry for this phenotype, canonical first.
+    On MySQL only keys its ascii VARCHAR(64) columns can hold; SQLite stores
+    any key (as the loader's keys_of does)."""
+    rec = _trait(con, key)
+    keys = [rec["trait_id"], rec["pigean_id"], rec["legacy_id"], key] if rec is not None else [key]
+    storable = (lambda k: bool(k)) if con.dialect.sqlite else _storable_key
+    return list(dict.fromkeys(k for k in keys if storable(k))) or [_NO_PHENOTYPE]
+
+
+def _in(keys):
+    return "IN (" + ",".join("?" * len(keys)) + ")"
+
+
+def _phenotype_view(con, key, trait_group):
+    rec = _trait(con, key)
+    if rec is None:
+        return {"id": key, "legacyId": None, "name": None, "traitGroup": trait_group, "category": None,
+                "traitType": None, "conceptId": None, "conceptLabel": None}
+    return {
+        "id": rec["trait_id"],
+        "legacyId": rec["legacy_id"],
+        "name": rec["name"],
+        "traitGroup": trait_group,
+        "category": rec["trait_group"],
+        "traitType": rec["trait_type"],
+        "conceptId": rec["primary_concept_id"],
+        "conceptLabel": rec["primary_concept_label"],
+    }
 
 
 def _gene_assoc_view(con, row):
     return {
         "gene": {"symbol": row["gene"]},
-        "phenotype": _phenotype_view(row["phenotype"], row["trait_group"]),
+        "phenotype": _phenotype_view(con, row["phenotype"], row["trait_group"]),
         "collection": row["collection"],
         "combined": row["combined"],
         "logBf": row["log_bf"],
         "prior": row["prior"],
-        "claim": envelope(con, row["claim_id"]),
+        # Serving a result row asserts the claim it implies (minted on first serve).
+        "claim": envelope(con, row["claim_id"], source=("gene", row)),
     }
 
 
@@ -309,22 +557,28 @@ def _dapper_gene_set_id(con, collection, name):
 
 
 def _set_view(con, row):
+    # Prefer the entity this row's claim was built against (its synthesis
+    # inputs) over the latest-entity lookup, which a later load may move.
+    inputs = _inputs_of(row) if "synthesis_inputs" in row.keys() else None
+    subject = (inputs or {}).get("subject")
+    if not (isinstance(subject, str) and subject.startswith("dapper:GeneSet.")):
+        subject = _dapper_gene_set_id(con, row["collection"], row["gene_set"])
     return {
         "name": row["gene_set"],
         "source": row["source"] or "",
         "collection": row["collection"],
-        "dapperGeneSetId": _dapper_gene_set_id(con, row["collection"], row["gene_set"]),
+        "dapperGeneSetId": subject,
     }
 
 
 def _set_assoc_view(con, row):
     return {
         "geneSet": _set_view(con, row),
-        "phenotype": _phenotype_view(row["phenotype"], row["trait_group"]),
+        "phenotype": _phenotype_view(con, row["phenotype"], row["trait_group"]),
         "collection": row["collection"],
         "beta": row["beta"],
         "betaUncorrected": row["beta_uncorrected"],
-        "claim": envelope(con, row["claim_id"]),
+        "claim": envelope(con, row["claim_id"], source=("gene_set", row)),
     }
 
 
@@ -342,22 +596,24 @@ def _gene_assoc_rows(con, phenotype, collection, where, order_by, limit):
     where_sql, params = _where_sql(where, GENE_FILTER_COLS)
     field = (order_by or {}).get("field", "COMBINED")
     direction = "DESC" if (order_by or {}).get("dir", "DESC") == "DESC" else "ASC"
+    keys = _phenotype_keys(con, phenotype)
     sql = (
-        "SELECT * FROM pigean_gene_associations WHERE phenotype = ? AND collection = ? "
+        f"SELECT * FROM pigean_gene_associations WHERE phenotype {_in(keys)} AND collection = ? "
         f"{where_sql} ORDER BY {GENE_ORDER_COLS[field]} {direction}, gene ASC LIMIT ?"
     )
-    return con.execute(sql, [phenotype, collection, *params, limit]).fetchall()
+    return con.execute(sql, [*keys, collection, *params, limit]).fetchall()
 
 
 def _set_assoc_rows(con, phenotype, collection, where, order_by, limit):
     where_sql, params = _where_sql(where, SET_FILTER_COLS)
     field = (order_by or {}).get("field", "BETA_UNCORRECTED")
     direction = "DESC" if (order_by or {}).get("dir", "DESC") == "DESC" else "ASC"
+    keys = _phenotype_keys(con, phenotype)
     sql = (
-        "SELECT * FROM pigean_gene_set_associations WHERE phenotype = ? AND collection = ? "
+        f"SELECT * FROM pigean_gene_set_associations WHERE phenotype {_in(keys)} AND collection = ? "
         f"{where_sql} ORDER BY {SET_ORDER_COLS[field]} {direction}, gene_set ASC LIMIT ?"
     )
-    return con.execute(sql, [phenotype, collection, *params, limit]).fetchall()
+    return con.execute(sql, [*keys, collection, *params, limit]).fetchall()
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +628,19 @@ json_scalar = ScalarType("JSON")
 
 def _con(info):
     return info.context["con"]
+
+
+# Argument bounds: one read request must not be able to mint / assert an
+# unbounded number of claims (each served row asserts its claim).
+MAX_ROWS = 500
+MAX_TOP_GENES = 200
+MAX_SETS_PER_GENE = 50
+
+
+def _bounded(name, value, upper, lower=0):
+    if value is None or not (lower <= value <= upper):
+        raise ValueError(f"{name} must be between {lower} and {upper}, got {value}")
+    return value
 
 
 @query.field("health")
@@ -401,24 +670,57 @@ def resolve_methods(*_):
 
 @query.field("phenotype")
 def resolve_phenotype(_, info, id):
-    row = info.context["con"].execute(
-        "SELECT phenotype, trait_group FROM pigean_gene_associations WHERE phenotype = ? "
-        "UNION SELECT phenotype, trait_group FROM pigean_gene_set_associations WHERE phenotype = ? "
+    """Accepts a KPN.TRAIT ID, a legacy portal key (IBD), or a PIGEAN key."""
+    con = _con(info)
+    keys = _phenotype_keys(con, id)
+    row = con.execute(
+        f"SELECT phenotype, trait_group FROM pigean_gene_associations WHERE phenotype {_in(keys)} "
+        f"UNION SELECT phenotype, trait_group FROM pigean_gene_set_associations WHERE phenotype {_in(keys)} "
         "LIMIT 1",
-        (id, id),
+        (*keys, *keys),
     ).fetchone()
-    return _phenotype_view(row["phenotype"], row["trait_group"]) if row else None
+    if row is not None:
+        return _phenotype_view(con, row["phenotype"], row["trait_group"])
+    if _trait(con, id) is not None:  # registered trait without loaded results
+        return _phenotype_view(con, id, None)
+    return None
 
 
 @query.field("phenotypes")
 def resolve_phenotypes(_, info, search=None, first=20):
-    like = f"%{search}%" if search else "%"
-    rows = info.context["con"].execute(
-        "SELECT DISTINCT phenotype, trait_group FROM pigean_gene_associations "
-        "WHERE phenotype LIKE ? ORDER BY phenotype LIMIT ?",
-        (like, first),
+    """Phenotypes with loaded results; `search` matches the trait ID, legacy
+    key, or name (case-insensitive)."""
+    _bounded("first", first, MAX_ROWS)
+    con = _con(info)
+    rows = con.execute(
+        "SELECT DISTINCT phenotype, trait_group FROM pigean_gene_associations ORDER BY phenotype"
     ).fetchall()
-    return [_phenotype_view(r["phenotype"], r["trait_group"]) for r in rows]
+    views, seen = [], set()
+    needle = (search or "").lower()
+    for r in rows:
+        view = _phenotype_view(con, r["phenotype"], r["trait_group"])
+        if view["id"] in seen:
+            continue
+        haystack = " ".join(str(view.get(k) or "") for k in ("id", "legacyId", "name")).lower()
+        if needle in haystack:
+            seen.add(view["id"])
+            views.append(view)
+    return views[:first]
+
+
+@phenotype_type.field("mappings")
+def resolve_trait_mappings(obj, info, ontology=None):
+    sql = ("SELECT target_id, ontology, predicate, label, confidence, justification, source "
+           "FROM kpn_trait_mappings WHERE trait_id = ?")
+    params = [obj["id"]]
+    if ontology:
+        sql += " AND ontology = ?"
+        params.append(ontology)
+    return [
+        {"targetId": r["target_id"], "ontology": r["ontology"], "predicate": r["predicate"], "label": r["label"],
+         "confidence": r["confidence"], "justification": r["justification"], "source": r["source"]}
+        for r in _con(info).execute(sql + " ORDER BY confidence DESC, target_id", params).fetchall()
+    ]
 
 
 @query.field("gene")
@@ -430,14 +732,27 @@ def resolve_gene(_, info, symbol):
 
 
 @query.field("geneSet")
-def resolve_gene_set(_, info, name, collection=None):
+def resolve_gene_set(_, info, name, collection=None, phenotype=None):
+    """With `phenotype`, the set as that phenotype's PIGEAN run observed it
+    (its GeneSet entity, and members default to that phenotype); without it,
+    the first observation in (collection, phenotype) order."""
+    con = _con(info)
     sql = "SELECT * FROM pigean_gene_set_associations WHERE gene_set = ?"
     params = [name]
     if collection:
         sql += " AND collection = ?"
         params.append(collection)
-    row = info.context["con"].execute(sql + " LIMIT 1", params).fetchone()
-    return _set_view(info.context["con"], row) if row else None
+    if phenotype:
+        keys = _phenotype_keys(con, phenotype)
+        sql += f" AND phenotype {_in(keys)}"
+        params.extend(keys)
+    row = con.execute(sql + " ORDER BY collection, phenotype LIMIT 1", params).fetchone()
+    if row is None:
+        return None
+    view = _set_view(con, row)
+    if phenotype:
+        view["_phenotype"] = phenotype
+    return view
 
 
 @query.field("claim")
@@ -462,13 +777,17 @@ def resolve_proposition(_, info, id):
     payload = _fetch_payload(con, id)
     if payload is None or payload.get("class_name") != "Proposition":
         return None
-    claim_ids = [
-        r["claim_id"]
+    # Every claim assessing it: deposited/minted ones from the registry, plus
+    # the claims its index rows imply (served here, so asserted and minted).
+    sources = {r["claim_id"]: None for r in con.execute(
+        "SELECT claim_id FROM claims WHERE proposition_id = ?", (id,))}
+    for family, table in CLAIM_SOURCES:
         for r in con.execute(
-            "SELECT claim_id FROM claims WHERE proposition_id = ? ORDER BY claim_id", (id,)
-        )
-    ]
-    envelopes = [e for e in (envelope(con, cid) for cid in claim_ids) if e]
+            f"SELECT * FROM {table} t WHERE proposition_id = ? AND synthesis_inputs IS NOT NULL{_live_roster(family)}",
+            (id,),
+        ).fetchall():
+            sources[r["claim_id"]] = (family, r)
+    envelopes = [e for e in (envelope(con, cid, source=src) for cid, src in sorted(sources.items())) if e]
     return {
         "id": id,
         "proposition": payload,
@@ -479,12 +798,14 @@ def resolve_proposition(_, info, id):
 
 @phenotype_type.field("pigeanGeneAssociations")
 def resolve_pheno_gene_assocs(obj, info, collection=DEFAULT_COLLECTION, where=None, orderBy=None, first=20):
+    _bounded("first", first, MAX_ROWS)
     con = _con(info)
     return [_gene_assoc_view(con, r) for r in _gene_assoc_rows(con, obj["id"], collection, where, orderBy, first)]
 
 
 @phenotype_type.field("pigeanGeneSetAssociations")
 def resolve_pheno_set_assocs(obj, info, collection=DEFAULT_COLLECTION, where=None, orderBy=None, first=20):
+    _bounded("first", first, MAX_ROWS)
     con = _con(info)
     return [_set_assoc_view(con, r) for r in _set_assoc_rows(con, obj["id"], collection, where, orderBy, first)]
 
@@ -492,9 +813,10 @@ def resolve_pheno_set_assocs(obj, info, collection=DEFAULT_COLLECTION, where=Non
 @gene_type.field("pigeanAssociation")
 def resolve_gene_assoc(obj, info, phenotype, collection=DEFAULT_COLLECTION):
     con = _con(info)
+    keys = _phenotype_keys(con, phenotype)
     row = con.execute(
-        "SELECT * FROM pigean_gene_associations WHERE phenotype = ? AND collection = ? AND gene = ?",
-        (phenotype, collection, obj["symbol"]),
+        f"SELECT * FROM pigean_gene_associations WHERE phenotype {_in(keys)} AND collection = ? AND gene = ? LIMIT 1",
+        (*keys, collection, obj["symbol"]),
     ).fetchone()
     return _gene_assoc_view(con, row) if row else None
 
@@ -502,51 +824,72 @@ def resolve_gene_assoc(obj, info, phenotype, collection=DEFAULT_COLLECTION):
 @gene_set_type.field("pigeanAssociation")
 def resolve_set_assoc(obj, info, phenotype, collection=DEFAULT_COLLECTION):
     con = _con(info)
+    keys = _phenotype_keys(con, phenotype)
     row = con.execute(
-        "SELECT * FROM pigean_gene_set_associations WHERE phenotype = ? AND collection = ? AND gene_set = ?",
-        (phenotype, collection, obj["name"]),
+        f"SELECT * FROM pigean_gene_set_associations WHERE phenotype {_in(keys)} AND collection = ? AND gene_set = ? LIMIT 1",
+        (*keys, collection, obj["name"]),
     ).fetchone()
     return _set_assoc_view(con, row) if row else None
 
 
 def _membership_view(con, membership_row, set_row=None):
-    gene_set = (
-        _set_view(con, set_row)
-        if set_row is not None
-        else {
+    source = _index_source(con, membership_row["claim_id"], families=("roster",))
+    if set_row is not None:
+        gene_set = _set_view(con, set_row)
+    else:
+        # The GeneSet this edge's roster claim was built against (pinned in
+        # its synthesis inputs), not the latest entity for the name.
+        roster_entity = (_inputs_of(source[1]) or {}).get("gene_set_entity") if source else None
+        gene_set = {
             "name": membership_row["gene_set"],
             "source": "",
             "collection": membership_row["collection"],
-            "dapperGeneSetId": _dapper_gene_set_id(
+            "dapperGeneSetId": roster_entity or _dapper_gene_set_id(
                 con, membership_row["collection"], membership_row["gene_set"]
             ),
         }
-    )
     return {
         "gene": {"symbol": membership_row["gene"]},
         "geneSet": gene_set,
-        "claim": envelope(con, membership_row["claim_id"]),
+        # One roster claim per gene set backs every (gene, set) pair in it.
+        "claim": envelope(con, membership_row["claim_id"], source=source),
     }
 
 
+def _membership_scope(con, phenotype):
+    """SQL + params restricting memberships to one phenotype's observation
+    (plus collection-wide edges), or none."""
+    if not phenotype:
+        return "", []
+    keys = [*_phenotype_keys(con, phenotype), ""]
+    return f" AND phenotype {_in(keys)}", keys
+
+
 @gene_type.field("memberships")
-def resolve_gene_memberships(obj, info, collection=None, first=100):
+def resolve_gene_memberships(obj, info, collection=None, phenotype=None, first=100):
+    _bounded("first", first, MAX_ROWS)
     con = _con(info)
     sql = "SELECT * FROM claim_memberships WHERE gene = ?"
     params = [obj["symbol"]]
     if collection:
         sql += " AND collection = ?"
         params.append(collection)
-    rows = con.execute(sql + " ORDER BY gene_set LIMIT ?", [*params, first]).fetchall()
+    scope, scope_params = _membership_scope(con, phenotype)
+    rows = con.execute(sql + scope + " ORDER BY gene_set, collection, phenotype LIMIT ?",
+                       [*params, *scope_params, first]).fetchall()
     return [_membership_view(con, r) for r in rows]
 
 
 @gene_set_type.field("members")
-def resolve_set_members(obj, info, first=100):
+def resolve_set_members(obj, info, phenotype=None, first=100):
+    _bounded("first", first, MAX_ROWS)
     con = _con(info)
+    phenotype = phenotype or obj.get("_phenotype")
+    scope, scope_params = _membership_scope(con, phenotype)
     rows = con.execute(
-        "SELECT * FROM claim_memberships WHERE gene_set = ? AND collection = ? ORDER BY gene LIMIT ?",
-        (obj["name"], obj["collection"], first),
+        "SELECT * FROM claim_memberships WHERE gene_set = ? AND collection = ?" + scope
+        + " ORDER BY gene, phenotype LIMIT ?",
+        (obj["name"], obj["collection"], *scope_params, first),
     ).fetchall()
     return [_membership_view(con, r) for r in rows]
 
@@ -564,40 +907,60 @@ def resolve_challenge(
     setOrder=None,
     first=100,
 ):
+    _bounded("topGenes", topGenes, MAX_TOP_GENES)
+    _bounded("setsPerGene", setsPerGene, MAX_SETS_PER_GENE)
+    _bounded("first", first, MAX_ROWS)
     con = _con(info)
     warnings = [PROVISIONAL_WARNING]
     anchors = _gene_assoc_rows(con, phenotype, collection, where, orderBy, topGenes)
 
+    # Membership observed in this phenotype's PIGEAN run (under any of its
+    # keys), plus collection-wide memberships ('' = e.g. REST deposit hints).
+    keys = _phenotype_keys(con, phenotype)
+    member_keys = [*keys, ""]
     membership_count = con.execute(
-        "SELECT COUNT(*) AS c FROM claim_memberships WHERE collection = ?", (collection,)
+        f"SELECT COUNT(*) AS c FROM claim_memberships WHERE collection = ? AND phenotype {_in(member_keys)}",
+        (collection, *member_keys),
     ).fetchone()["c"]
-    if membership_count == 0:
-        warnings.append(
-            f"No gene-set membership claims are deposited for collection '{collection}', so the "
-            "(gene)-[member_of]->(gene_set) join produced no rows. This reflects a missing data "
-            "source (membership ingest pending for this collection), not an empty scientific result."
-        )
-        return {"rows": [], "truncated": False, "warnings": warnings}
 
-    truncated = len(anchors) > first
-    kept = anchors[:first]
+    unique, seen_genes = [], set()
+    for r in anchors:  # one row per gene even if a trait's rows sit under several keys
+        if r["gene"] not in seen_genes:
+            seen_genes.add(r["gene"])
+            unique.append(r)
+    truncated = len(unique) > first
+    kept = unique[:first]
     sets_by_gene = {r["gene"]: [] for r in kept}
-    if kept:
+    if membership_count == 0:
+        # A missing data source is not an empty result: the anchors are still
+        # returned (with no sets), and the gap is stated.
+        warnings.append(
+            f"No gene-set memberships are loaded for phenotype '{phenotype}' in collection "
+            f"'{collection}', so the (gene)-[member_of]->(gene_set) edge could not be joined; anchor "
+            "genes are returned with empty sets. This reflects a missing data source (membership "
+            "ingest pending), not an empty scientific result."
+        )
+    elif kept:
         rfield = SET_ORDER_COLS[(setOrder or {}).get("field", "BETA_UNCORRECTED")]
         rdir = "DESC" if (setOrder or {}).get("dir", "DESC") == "DESC" else "ASC"
-        placeholders = ",".join("?" * len(kept))
+        placeholders = ",".join("?" * len(sets_by_gene))
         # Per-gene window: each anchor gene keeps its own top-N sets, so one
         # gene's strong sets can never crowd another gene out of the result.
+        # A (gene, set) pair present both phenotype-scoped and collection-wide
+        # counts once, preferring the phenotype's own observation.
         joined = con.execute(
             "SELECT * FROM ("
             "SELECT m.gene AS m_gene, m.claim_id AS m_claim_id, m.collection AS m_collection, s.*, "
             f"ROW_NUMBER() OVER (PARTITION BY m.gene ORDER BY s.{rfield} {rdir}, m.gene_set ASC) AS set_rank "
-            "FROM claim_memberships m "
+            "FROM (SELECT gene, gene_set, collection, claim_id, "
+            "        ROW_NUMBER() OVER (PARTITION BY gene, gene_set ORDER BY phenotype DESC) AS pick "
+            "      FROM claim_memberships "
+            f"      WHERE collection = ? AND phenotype {_in(member_keys)} AND gene IN ({placeholders})) AS m "
             "JOIN pigean_gene_set_associations s "
-            "  ON s.gene_set = m.gene_set AND s.collection = m.collection AND s.phenotype = ? "
-            f"WHERE m.collection = ? AND m.gene IN ({placeholders})"
+            f"  ON s.gene_set = m.gene_set AND s.collection = m.collection AND s.phenotype {_in(keys)} "
+            "WHERE m.pick = 1"
             ") AS ranked WHERE set_rank <= ? ORDER BY m_gene ASC, set_rank ASC",
-            [phenotype, collection, *sets_by_gene.keys(), setsPerGene],
+            [collection, *member_keys, *sets_by_gene.keys(), *keys, setsPerGene],
         ).fetchall()
         for r in joined:
             membership_row = {
@@ -717,12 +1080,17 @@ def health():
 def vocabulary():
     con = db.connect()
     try:
-        phenotypes = [
-            {"id": r["phenotype"], "name": None, "trait_group": r["trait_group"], "concept_id": None}
-            for r in con.execute(
-                "SELECT DISTINCT phenotype, trait_group FROM pigean_gene_associations ORDER BY phenotype"
-            ).fetchall()
-        ]
+        phenotypes, seen = [], set()
+        for r in con.execute(
+            "SELECT DISTINCT phenotype, trait_group FROM pigean_gene_associations ORDER BY phenotype"
+        ).fetchall():
+            view = _phenotype_view(con, r["phenotype"], r["trait_group"])
+            if view["id"] not in seen:
+                seen.add(view["id"])
+                phenotypes.append({"id": view["id"], "legacy_id": view["legacyId"], "name": view["name"],
+                                   "trait_group": r["trait_group"], "category": view["category"],
+                                   "trait_type": view["traitType"], "concept_id": view["conceptId"]})
+        release = con.execute("SELECT * FROM kpn_trait_release WHERE release_key = 'current'").fetchone()
         collections = [
             r["collection"]
             for r in con.execute(
@@ -738,11 +1106,19 @@ def vocabulary():
         "predicates": [
             {"subject_category": "gene", "predicate": "associated_with", "object_category": "phenotype", "methods": ["pigean"]},
             {"subject_category": "gene_set", "predicate": "associated_with", "object_category": "phenotype", "methods": ["pigean"]},
-            {"subject_category": "gene", "predicate": "member_of", "object_category": "gene_set", "methods": ["pigean"]},
+            {"subject_category": "gene_set", "predicate": "has_members", "object_category": "gene_set_collection", "methods": ["pigean"]},
+            {"subject_category": "gene", "predicate": "member_of", "object_category": "gene_set", "methods": ["deposit"]},
         ],
         "methods": ["pigean"],
         "metrics": {f"pigean.{name}": sem for name, sem in PIGEAN_METRICS.items()},
         "phenotypes": phenotypes,
+        "trait_registry": (
+            {"source": "broadinstitute/kpn-data-models", "version": release["version"],
+             "published": not (release["source_url"] or "").startswith("unpublished:"),
+             "commit": release["commit_sha"], "url": release["source_url"], "sha256": release["file_sha256"],
+             "traits": release["trait_count"], "mappings": release["mapping_count"]}
+            if release is not None else None
+        ),
         "collections": collections,
     }
 
@@ -776,97 +1152,358 @@ def graphql_explorer():
     return EXPLORER_HTML
 
 
+GRAPHQL_DEBUG = os.environ.get("CLAIMS_DEBUG", "") == "1"
+MAX_QUERIES_PER_REQUEST = 25_000
+
+
+def _render(result) -> bytes:
+    """The response bytes — exactly how JSONResponse renders (UTF-8, no
+    NaN). Rendered BEFORE assertions are written, so a response that cannot
+    be sent (non-finite number, lone surrogate) asserts nothing."""
+    return json.dumps(result, ensure_ascii=False, allow_nan=False, indent=None,
+                      separators=(",", ":")).encode("utf-8")
+
+
+def _execute_graphql(data):
+    """One GraphQL request: resolve (reads only; assertions are recorded),
+    render, then — only if the WHOLE response succeeded — write the recorded
+    mints and assertion counts in one short sorted batch. A failure anywhere
+    writes nothing. Returns (success, rendered body)."""
+    con = db.connect()
+    con.query_limit = MAX_QUERIES_PER_REQUEST
+    try:
+        success, result = graphql_sync(schema, data, context_value={"con": con}, debug=GRAPHQL_DEBUG)
+        body = None
+        if success and not result.get("errors"):
+            try:
+                body = _render(result)
+            except ValueError as exc:  # includes UnicodeEncodeError
+                success, result = False, {"data": None, "errors": [{"message": f"unrenderable response: {exc}"}]}
+        if success and not result.get("errors"):
+            con.query_limit = None  # the write batch is not request work
+            error = _commit_assertions(con)
+            if error:
+                success, result = False, {"data": None, "errors": [{"message": error}]}
+        else:
+            # A failed response writes nothing — so it reports no data
+            # either (partial data would show mints that were rolled back).
+            con.rollback()
+            success, result = False, {"data": None, "errors": result.get("errors") or []}
+        if not success:
+            body = _render(_renderable_errors(result))
+    finally:
+        con.close()
+    return success, body
+
+
+def _renderable_errors(result):
+    """An error response that always renders (error text can carry the very
+    value that failed to render)."""
+    try:
+        _render(result)
+        return result
+    except ValueError:
+        return {"data": None, "errors": [{"message": json.dumps(e.get("message", ""), ensure_ascii=True)}
+                                          for e in result.get("errors") or []]}
+
+
 @app.post("/v1/graphql")
 async def graphql_endpoint(request: Request):
     try:
         data = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Request body must be JSON.")
-    con = db.connect()
-    try:
-        success, result = graphql_sync(schema, data, context_value={"con": con}, debug=True)
-    finally:
-        con.close()
-    return JSONResponse(result, status_code=200 if success else 400)
+    # graphql_sync blocks on the database; keep it off the event loop.
+    success, body = await run_in_threadpool(_execute_graphql, data)
+    return Response(body, status_code=200 if success else 400, media_type="application/json")
+
+
+def _hint_str(hint, key, required=False):
+    value = hint.get(key)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or (required and not value):
+        raise HTTPException(status_code=400, detail=f"index hint {key} must be a{' non-empty' if required else ''} string")
+    return value
 
 
 def _index_hint(con, hint, bundle_objects):
-    claim_id = hint.get("claim_id")
+    """Index an externally deposited claim's graph edge. Hint rows carry no
+    synthesis_inputs (their claims were deposited, not template-built) and may
+    never overwrite a loaded, template-backed row."""
+    if not isinstance(hint, dict):
+        raise HTTPException(status_code=400, detail="each index hint must be an object")
+    claim_id = _hint_str(hint, "claim_id", required=True)
     claim = bundle_objects.get(claim_id) or _fetch_payload(con, claim_id)
     if claim is None:
         raise HTTPException(status_code=400, detail=f"index hint references unknown claim {claim_id}")
+    if claim.get("class_name") != "Claim":
+        raise HTTPException(status_code=400, detail=f"index hint claim_id {claim_id} is not a Claim")
     scores = {}
     for sid in claim.get("has_score", []):
         s = bundle_objects.get(sid) or _fetch_payload(con, sid)
-        if s:
-            scores[s["metric"]] = s["value"]
+        if s is None:
+            continue
+        if not _well_formed_score(s):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{sid} (cited by indexed claim {claim_id}) is not a well-formed ClaimScore "
+                       "(score_kind a ScoreKind value, string metric/interpretation, and a finite "
+                       "numeric value; an integer value within +/-(2^53-1))",
+            )
+        scores[s["metric"]] = s["value"]
     subject, obj = hint.get("subject") or {}, hint.get("object") or {}
-    collection = hint.get("collection", DEFAULT_COLLECTION)
-    trait_group = hint.get("trait_group")
-    predicate = hint.get("predicate")
+    if not isinstance(subject, dict) or not isinstance(obj, dict):
+        raise HTTPException(status_code=400, detail="index hint subject/object must be objects")
+    for side in (subject, obj):
+        _hint_str(side, "id", required=True)
+        _hint_str(side, "category")
+        dapper_id = _hint_str(side, "dapper_id")
+        if dapper_id is not None and (not DAPPER_ID_RE.match(dapper_id) or len(dapper_id) > MAX_ID_LENGTH):
+            raise HTTPException(status_code=400, detail=f"index hint dapper_id {dapper_id[:140]!r} is not a dapper identifier")
+    collection = _hint_str(hint, "collection") or DEFAULT_COLLECTION
+    trait_group = _hint_str(hint, "trait_group")
+    predicate = _hint_str(hint, "predicate", required=True)
+    method = _hint_str(hint, "method") or ""
+    source = _hint_str(hint, "source")
+    proposition_id = claim.get("proposition")
     upsert = con.dialect.insert_or_replace
+
+    def refuse_if_loaded(table, key_col, key, phenotype_key):
+        """Under ANY key of the phenotype: a loaded result stored under a
+        legacy key must not be shadowed by a deposit under the canonical one."""
+        keys = _phenotype_keys(con, phenotype_key)
+        row = con.execute(
+            f"SELECT 1 FROM {table} WHERE phenotype {_in(keys)} AND collection = ? AND {key_col} = ? "
+            "AND synthesis_inputs IS NOT NULL LIMIT 1",
+            (*keys, collection, key),
+        ).fetchone()
+        if row is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"index hint would overwrite a loaded, template-backed {table} row; deposits cannot replace loaded results",
+            )
+
     con.execute(
         f"{upsert} claims (claim_id, proposition_id, method) VALUES (?, ?, ?)",
-        (claim_id, claim.get("proposition", ""), hint.get("method", "")),
+        (claim_id, proposition_id or "", method),
     )
     if predicate == "associated_with" and subject.get("category") == "gene":
         missing = [m for m in ("prior", "combined", "log_bf") if m not in scores]
         if missing:
             raise HTTPException(status_code=400, detail=f"claim {claim_id} missing scores {missing} for gene association index")
+        phenotype = _canonical_phenotype(con, obj["id"])
+        refuse_if_loaded("pigean_gene_associations", "gene", subject["id"], obj["id"])
         con.execute(
             f"{upsert} pigean_gene_associations "
-            "(phenotype, collection, gene, prior, combined, log_bf, n, trait_group, claim_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)",
-            (obj.get("id"), collection, subject.get("id"), scores["prior"], scores["combined"], scores["log_bf"], trait_group, claim_id),
+            "(phenotype, collection, gene, prior, combined, log_bf, n, trait_group, claim_id, proposition_id, synthesis_inputs) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL)",
+            (phenotype, collection, subject["id"], scores["prior"], scores["combined"],
+             scores["log_bf"], trait_group, claim_id, proposition_id),
         )
     elif predicate == "associated_with" and subject.get("category") == "gene_set":
         missing = [m for m in ("beta", "beta_uncorrected") if m not in scores]
         if missing:
             raise HTTPException(status_code=400, detail=f"claim {claim_id} missing scores {missing} for gene-set association index")
+        phenotype = _canonical_phenotype(con, obj["id"])
+        refuse_if_loaded("pigean_gene_set_associations", "gene_set", subject["id"], obj["id"])
         con.execute(
             f"{upsert} pigean_gene_set_associations "
-            "(phenotype, collection, gene_set, source, beta, beta_uncorrected, rs_score, n, trait_group, claim_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
-            (obj.get("id"), collection, subject.get("id"), hint.get("source"), scores["beta"], scores["beta_uncorrected"], trait_group, claim_id),
+            "(phenotype, collection, gene_set, source, beta, beta_uncorrected, rs_score, n, trait_group, claim_id, proposition_id, synthesis_inputs) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, NULL)",
+            (phenotype, collection, subject["id"], source, scores["beta"],
+             scores["beta_uncorrected"], trait_group, claim_id, proposition_id),
         )
-        if subject.get("dapper_id"):
-            con.execute(
-                f"{upsert} gene_set_entities (collection, name, dapper_id, n_genes) VALUES (?, ?, ?, NULL)",
-                (collection, subject.get("id"), subject.get("dapper_id")),
-            )
+        _hint_entity(con, collection, subject)
     elif predicate == "member_of":
-        con.execute(
-            f"{upsert} claim_memberships (collection, gene, gene_set, claim_id) VALUES (?, ?, ?, ?)",
-            (collection, subject.get("id"), obj.get("id"), claim_id),
-        )
-        if obj.get("dapper_id"):
-            con.execute(
-                f"{upsert} gene_set_entities (collection, name, dapper_id, n_genes) VALUES (?, ?, ?, NULL)",
-                (collection, obj.get("id"), obj.get("dapper_id")),
+        raw_phenotype = _hint_str(hint, "phenotype") or ""
+        phenotype = _canonical_phenotype(con, raw_phenotype) if raw_phenotype else ""
+        if con.execute("SELECT 1 FROM pigean_gene_set_rosters WHERE claim_id = ?", (claim_id,)).fetchone():
+            raise HTTPException(
+                status_code=400,
+                detail="index hint cites a loaded roster claim; roster edges are the loader's, not deposits'",
             )
+        keys = _phenotype_keys(con, raw_phenotype) if raw_phenotype else [""]
+        loaded = con.execute(
+            f"SELECT 1 FROM claim_memberships m JOIN pigean_gene_set_rosters r ON r.claim_id = m.claim_id "
+            f"WHERE m.phenotype {_in(keys)} AND m.collection = ? AND m.gene = ? AND m.gene_set = ? LIMIT 1",
+            (*keys, collection, subject["id"], obj["id"]),
+        ).fetchone()
+        if loaded is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="index hint would overwrite a loaded membership edge; deposits cannot replace loaded results",
+            )
+        con.execute(
+            f"{upsert} claim_memberships (phenotype, collection, gene, gene_set, claim_id) VALUES (?, ?, ?, ?, ?)",
+            (phenotype, collection, subject["id"], obj["id"], claim_id),
+        )
+        _hint_entity(con, collection, obj)
     else:
         raise HTTPException(status_code=400, detail=f"unsupported index hint predicate {predicate!r}")
 
 
+def _canonical_phenotype(con, key):
+    """A deposited phenotype key, normalized to its KPN.TRAIT ID when registered."""
+    rec = _trait(con, key)
+    return rec["trait_id"] if rec is not None else key
+
+
+def _hint_entity(con, collection, ref):
+    """Record a hinted gene-set entity only where none is known: a deposit
+    hint must never clobber a loaded entity (or its n_genes)."""
+    if ref.get("dapper_id"):
+        con.execute(
+            f"{con.dialect.insert_or_ignore} gene_set_entities (collection, name, dapper_id, n_genes) VALUES (?, ?, ?, NULL)",
+            (collection, ref.get("id"), ref.get("dapper_id")),
+        )
+
+
+_CLASS_RE = re.compile(r"^[A-Za-z]+\Z")
+
+
+def _reject_constant(name):
+    raise HTTPException(status_code=400, detail=f"numbers must be finite ({name} is not valid JSON)")
+
+
+def _check_interoperable(body) -> None:
+    """Refuse (400) a deposit body that is not interoperable JSON (I-JSON,
+    RFC 7493): nesting deeper than MAX_JSON_DEPTH, a non-finite number, an
+    integer beyond +/-(2^53-1), or a string (or key) that is not valid
+    Unicode (a lone surrogate cannot be stored or rendered as UTF-8).
+    Iterative, so no input can exhaust the stack here; the depth bound keeps
+    every later recursive walk (comparison, refs, canonical JSON) safe."""
+    stack = [(body, 0)]
+    while stack:
+        value, depth = stack.pop()
+        if depth > MAX_JSON_DEPTH:
+            raise HTTPException(status_code=400, detail=f"document nested deeper than {MAX_JSON_DEPTH} levels")
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, (int, float)):
+            if not _finite_number(value):
+                raise HTTPException(status_code=400,
+                                    detail="numbers must be finite, and integer literals within +/-(2^53-1) (I-JSON)")
+        elif isinstance(value, str):
+            _check_unicode(value)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                _check_unicode(key)
+                stack.append((item, depth + 1))
+        elif isinstance(value, list):
+            stack.extend((item, depth + 1) for item in value)
+
+
+def _check_unicode(text: str) -> None:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise HTTPException(status_code=400, detail="strings must be valid Unicode (no lone surrogates; I-JSON)")
+
+
+def _same_document(a, b) -> bool:
+    """Document identity: numbers compare by value (2 == 2.0, which JSON
+    round-trips may reformat), but booleans never equal numbers."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same_document(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_same_document(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
+
+
+def _validate_object(obj):
+    if not isinstance(obj, dict):
+        raise HTTPException(status_code=400, detail="every entry in objects must be a JSON object")
+    oid, cls = obj.get("id"), obj.get("class_name")
+    if not isinstance(cls, str) or not _CLASS_RE.match(cls):
+        raise HTTPException(status_code=400, detail=f"object has a missing or invalid class_name: {str(oid)[:140]!r}")
+    if (not isinstance(oid, str) or not DAPPER_ID_RE.match(oid) or len(oid) > MAX_ID_LENGTH
+            or not oid.startswith(f"dapper:{cls}.")):
+        raise HTTPException(
+            status_code=400,
+            detail=f"object id {str(oid)[:140]!r} is not a dapper:{cls}.<digest> identifier of at most {MAX_ID_LENGTH} characters",
+        )
+    long_refs = [r for r in dapper_refs(obj) if len(r) > MAX_ID_LENGTH]
+    if long_refs:
+        raise HTTPException(status_code=400, detail=f"{oid} references over-long ids: {long_refs[:3]}")
+    if "identity_profile" in obj and not isinstance(obj["identity_profile"], str):
+        raise HTTPException(status_code=400, detail=f"{oid}: identity_profile must be a string")
+    if cls == "Proposition":
+        for slot in ("subject_entity", "relation", "object_entity", "statement"):
+            if slot in obj and not isinstance(obj[slot], str):
+                raise HTTPException(status_code=400, detail=f"{oid}: {slot} must be a string")
+    if cls == "EvidenceItem" and "value_locators" in obj and not (
+            isinstance(obj["value_locators"], list) and all(isinstance(x, str) for x in obj["value_locators"])):
+        raise HTTPException(status_code=400, detail=f"{oid}: value_locators must be a list of id strings")
+    if cls == "Claim":
+        if not isinstance(obj.get("proposition", ""), str):
+            raise HTTPException(status_code=400, detail=f"{oid}: proposition must be a dapper id string")
+        for slot in ("has_score", "has_evidence", "was_derived_from"):
+            if slot in obj and not (isinstance(obj[slot], list) and all(isinstance(x, str) for x in obj[slot])):
+                raise HTTPException(status_code=400, detail=f"{oid}: {slot} must be a list of id strings")
+    # The local-dev identity profile is verifiable here: the id must be the
+    # digest of the content. Nothing can sit at an address it does not hash
+    # to (DAPPER-ID-1 verification is Task-5 hardening).
+    if LOCAL_DEV_ID_RE.match(oid) and not tpl.local_dev_address_ok(obj):
+        raise HTTPException(status_code=400, detail=f"{oid}: content does not hash to its local-dev address")
+    return oid, cls
+
+
 @app.post("/v1/claims")
 async def deposit(request: Request):
-    # v0: structural checks + idempotent storage. Full DAPPER-profile validation
-    # and content-address verification are Task 5 hardening (see openapi.yaml).
-    body = await request.json()
-    objects = body.get("objects") or []
-    if not objects:
-        raise HTTPException(status_code=400, detail="objects is required and must be non-empty")
+    """The only external write path. v0 checks structure and identifier shape
+    and stores idempotently; full DAPPER-profile validation and general
+    content-address verification are Task-5 hardening. Addresses that the
+    loaded data implies are RESERVED: a Claim deposited at one must equal the
+    claim the template synthesizes for it."""
+    try:
+        body = json.loads(await request.body(), parse_constant=_reject_constant)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body must be JSON.")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+    _check_interoperable(body)
+    objects = body.get("objects")
+    if not isinstance(objects, list) or not objects:
+        raise HTTPException(status_code=400, detail="objects is required and must be a non-empty list")
+    hints = body.get("index_hints") or []
+    if not isinstance(hints, list):
+        raise HTTPException(status_code=400, detail="index_hints must be a list")
     con = db.connect()
     try:
         deposited = []
         bundle_objects = {}
         with con:
             for obj in objects:
-                oid, cls = obj.get("id"), obj.get("class_name")
-                if not oid or not cls:
-                    raise HTTPException(status_code=400, detail=f"object missing id or class_name: {json.dumps(obj)[:200]}")
+                oid, cls = _validate_object(obj)
                 bundle_objects[oid] = obj
-                exists = con.execute("SELECT 1 FROM dapper_objects WHERE id = ?", (oid,)).fetchone()
+                if cls == "Claim":
+                    source = _index_source(con, oid)
+                    if source is not None:
+                        try:
+                            expected = synthesize_claim(*source)
+                        except ClaimSynthesisError as exc:
+                            raise HTTPException(status_code=400, detail=str(exc))
+                        if not _same_document(obj, expected):
+                            raise HTTPException(
+                                status_code=400,
+                                detail=(
+                                    f"{oid} is reserved: the loaded data implies this claim, and the "
+                                    "deposited document differs from it"
+                                ),
+                            )
+                exists = con.execute("SELECT payload FROM dapper_objects WHERE id = ?", (oid,)).fetchone()
+                if exists and not _same_document(json.loads(exists["payload"]), obj):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{oid} already holds a different document; a content address names one document",
+                    )
                 if exists:
                     # Idempotent re-deposit of the same content address: count
                     # how often this document keeps being minted (2026-11-09).
@@ -879,20 +1516,31 @@ async def deposit(request: Request):
                         "SELECT times_seen FROM dapper_objects WHERE id = ?", (oid,)
                     ).fetchone()["times_seen"]
                 else:
+                    # Upsert, not insert: a concurrent mint/deposit of the same
+                    # document is counted, not an error. Canonical storage
+                    # (sorted keys) so every object reads back consistently.
                     con.execute(
-                        "INSERT INTO dapper_objects (id, class_name, identity_profile, payload) VALUES (?, ?, ?, ?)",
-                        # Canonical storage (sorted keys) so every object reads
-                        # back consistently regardless of depositor key order.
+                        con.dialect.upsert_object,
                         (oid, cls, obj.get("identity_profile", "unverified"),
-                         json.dumps(obj, sort_keys=True, separators=(",", ":"))),
+                         json.dumps(obj, sort_keys=True, separators=(",", ":"), allow_nan=False)),
                     )
-                    times = 1
+                    stored = con.execute("SELECT payload, times_seen FROM dapper_objects WHERE id = ?", (oid,)).fetchone()
+                    if not _same_document(json.loads(stored["payload"]), obj):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"{oid} already holds a different document; a content address names one document",
+                        )
+                    times = stored["times_seen"]
+                refs = sorted(dapper_refs(obj))
+                if refs:
+                    con.executemany(con.dialect.insert_ref, [(oid, ref) for ref in refs])
                 if cls == "Claim":
                     # Register every deposited Claim with its proposition so
-                    # the fan-in (/v1/propositions/{id}, Query.proposition)
-                    # sees claims that carry no graph-edge index hint, e.g.
-                    # interpretive tier claims. A later index_hint overwrites
-                    # this row with the claim's method.
+                    # the GraphQL fan-in (Query.proposition) sees claims that
+                    # carry no graph-edge index hint, e.g. interpretive tier
+                    # claims. A later index_hint overwrites this row with the
+                    # claim's method. (External deposits are asserted by their
+                    # depositor, so they land immediately.)
                     con.execute(
                         f"{con.dialect.insert_or_ignore} claims (claim_id, proposition_id, method) VALUES (?, ?, ?)",
                         (oid, obj.get("proposition", ""), ""),
@@ -905,32 +1553,59 @@ async def deposit(request: Request):
                         "times_deposited": times,
                     }
                 )
-            for hint in body.get("index_hints") or []:
+            for hint in hints:
                 _index_hint(con, hint, bundle_objects)
         return {"deposited": deposited}
+    except HTTPException:
+        raise
+    except (TypeError, ValueError, KeyError, OverflowError) as exc:
+        raise HTTPException(status_code=400, detail=f"malformed deposit: {type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001 — driver binding errors from malformed values
+        if type(exc).__name__ in ("ProgrammingError", "InterfaceError", "DataError", "IntegrityError"):
+            raise HTTPException(status_code=400, detail=f"malformed deposit: {type(exc).__name__}: {exc}")
+        raise
     finally:
         con.close()
 
 
-_DAPPER_ID_RE = re.compile(r"dapper:[A-Za-z]+\.[A-Za-z0-9]+")
+_DAPPER_ID_RE = re.compile(r"dapper:[A-Za-z]+\.[A-Za-z0-9_-]+")
+
+
+def _href(path: str) -> str:
+    """An attribute-safe URL: dapper IDs are percent-encoded into the path
+    (':' kept readable) and the whole value is HTML-attribute escaped."""
+    return html.escape(path, quote=True)
+
+
+def _resolver_href(object_id: str) -> str:
+    return _href(_resolver_url(quote(object_id, safe=":")))
 
 
 def _object_landing_html(object_id: str, payload: dict) -> str:
     """Human landing page for a shared dapper ID: the document, with every
-    referenced dapper ID linked through this same resolver."""
+    referenced dapper ID linked through this same resolver, plus the reverse
+    direction (objects that reference this one). Every interpolated value is
+    escaped."""
     doc = json.dumps(payload, indent=2, sort_keys=True)
     refs = sorted({m for m in _DAPPER_ID_RE.findall(doc) if m != object_id})
     doc_html = html.escape(doc)
     for ref in refs:
-        doc_html = doc_html.replace(ref, f'<a href="{_resolver_url(ref)}">{ref}</a>')
+        doc_html = doc_html.replace(ref, f'<a href="{_resolver_href(ref)}">{html.escape(ref)}</a>')
     ref_list = "".join(
-        f'<li><a href="{_resolver_url(r)}">{html.escape(r)}</a></li>' for r in refs
+        f'<li><a href="{_resolver_href(r)}">{html.escape(r)}</a></li>' for r in refs
     ) or "<li>none</li>"
-    claim_links = ""
-    if payload.get("class_name") == "Claim":
-        claim_links = (
-            f'<p>Claim views: <a href="{PUBLIC_BASE}/v1/claims/{object_id}">envelope (scores, evidence, provenance)</a></p>'
+    qid = quote(object_id, safe=":")
+    referenced_by = _href(f"{PUBLIC_BASE}/v1/objects/search?references={qid}")
+    claim_hint = ""
+    if payload.get("class_name") == "Proposition":
+        claims_href = _href(f"{PUBLIC_BASE}/v1/objects/search?class_name=Claim&references={qid}")
+        claim_hint = f'<p><a href="{claims_href}">Claims assessing this proposition</a></p>'
+    elif payload.get("class_name") == "Claim":
+        claim_hint = (
+            "<p>Dereferenced envelope (scores, evidence + locators, provenance): GraphQL "
+            f'<code>claim(id: "{html.escape(object_id)}")</code></p>'
         )
+    base = html.escape(PUBLIC_BASE or "")
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>{html.escape(object_id)}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -938,39 +1613,157 @@ def _object_landing_html(object_id: str, payload: dict) -> str:
 pre{{background:#f6f8fa;padding:1rem;overflow-x:auto;border-radius:6px}}
 code{{background:#f6f8fa;padding:0.1rem 0.3rem;border-radius:4px}}</style></head>
 <body>
-<h1>{html.escape(payload.get("class_name", "DapperObject"))}</h1>
+<h1>{html.escape(str(payload.get("class_name", "DapperObject")))}</h1>
 <p><code>{html.escape(object_id)}</code> — a content-addressed DAPPER identifier; this page is its
-resolver view (<code>GET {html.escape(PUBLIC_BASE or "")}/v1/objects/{{id}}</code>, JSON by default).</p>
-{claim_links}
-<p>API: <a href="{PUBLIC_BASE}/v1/docs">REST docs</a> · <a href="{PUBLIC_BASE}/v1/graphql">GraphQL</a></p>
+resolver view (<code>GET {base}/v1/objects/{{id}}</code>, JSON by default).</p>
+{claim_hint}
+<p><a href="{referenced_by}">Objects that reference this one</a> ·
+API: <a href="{_href(PUBLIC_BASE + "/v1/docs")}">REST docs</a> · <a href="{_href(PUBLIC_BASE + "/v1/graphql")}">GraphQL</a></p>
 <h2>Referenced dapper objects</h2><ul>{ref_list}</ul>
 <h2>Document</h2><pre>{doc_html}</pre>
 </body></html>"""
 
 
+# ---------------------------------------------------------------------------
+# REST output: OBJECTS ONLY (2026-11-09, Chase). One resolver plus a general
+# list and search over every dapper object, not tied to claims or
+# propositions. Metric questions are GraphQL's (docs/inputs-and-outputs.md);
+# the dereferenced claim envelope and proposition fan-in live there too.
+
+_SLOT_RE = re.compile(r"^[a-z_][a-z0-9_]*\Z")
+_TEXT_SLOTS = ("statement", "name", "description")
+
+
+def _label(payload: dict) -> str | None:
+    """One human-readable line for any object class."""
+    for slot in _TEXT_SLOTS:
+        if payload.get(slot):
+            return payload[slot]
+    cls = payload.get("class_name")
+    if cls == "ClaimScore":
+        return f"{payload.get('metric')} = {payload.get('value')}"
+    if cls == "ValueLocator":
+        return f"{payload.get('selector')} -> {payload.get('value_text')!r}"
+    if cls == "File":
+        return payload.get("source_uri")
+    return None
+
+
+MAX_OFFSET = 10_000_000
+
+
+def _object_search(con, *, class_name=None, q=None, references=None, match=None,
+                   limit=50, offset=0):
+    """Shared engine for GET /v1/objects and /v1/objects/search: filters
+    ANDed, deterministic id order, total computed over the same filters.
+    Text matching is case-insensitive and literal (wildcards escaped) on both
+    backends."""
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, min(int(offset), MAX_OFFSET))
+    if class_name is not None and not _CLASS_RE.match(class_name):
+        raise HTTPException(status_code=400, detail=f"class_name must be letters only, got {class_name!r}")
+    if references is not None and (not DAPPER_ID_RE.match(references) or len(references) > MAX_ID_LENGTH):
+        raise HTTPException(status_code=400, detail=f"references must be a dapper identifier, got {references[:140]!r}")
+    je = con.dialect.je
+    joins, where, params = "", [], []
+    if references:
+        joins = " JOIN object_refs r ON r.from_id = o.id AND r.to_id = ?"
+        params.append(references)
+    if class_name:
+        where.append("o.class_name = ?")
+        params.append(class_name)
+    if q:
+        where.append("(" + " OR ".join(
+            f"({con.dialect.json_is_string('o.payload', s)} AND {con.dialect.like_ci(je('o.payload', s))})"
+            for s in _TEXT_SLOTS) + ")")
+        params.extend([f"%{db.like_escape(q)}%"] * len(_TEXT_SLOTS))
+    for clause in match or []:
+        slot, sep, value = clause.partition(":")
+        if not sep or not _SLOT_RE.match(slot):
+            raise HTTPException(
+                status_code=400,
+                detail=f"match must be 'slot:value' with a lowercase slot name, got {clause!r}",
+            )
+        where.append(f"({con.dialect.json_is_string('o.payload', slot)} AND {je('o.payload', slot)} = ?)")
+        params.append(value)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    base = f"FROM dapper_objects o{joins}{where_sql}"
+    total = con.execute(f"SELECT COUNT(*) AS c {base}", params).fetchone()["c"]
+    rows = con.execute(
+        f"SELECT o.id, o.class_name, o.payload, o.times_seen {base} ORDER BY o.id LIMIT ? OFFSET ?",
+        [*params, limit, offset],
+    ).fetchall()
+    objects = [
+        {
+            "id": r["id"],
+            "class_name": r["class_name"],
+            "label": _label(json.loads(r["payload"])),
+            "times_seen": r["times_seen"],
+            "resolver_url": _resolver_url(r["id"]),
+        }
+        for r in rows
+    ]
+    return {"total": total, "limit": limit, "offset": offset, "objects": objects}
+
+
+@app.get("/v1/objects")
+def list_objects(
+    class_name: str | None = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0, le=MAX_OFFSET),
+):
+    """Browse every stored dapper object, optionally one class (Claim,
+    Proposition, GeneSet, EvidenceItem, ...). Claims appear once asserted."""
+    con = db.connect()
+    try:
+        return _object_search(con, class_name=class_name, limit=limit, offset=offset)
+    finally:
+        con.close()
+
+
+@app.get("/v1/objects/search")
+def search_objects(
+    class_name: str | None = None,
+    q: str | None = None,
+    references: str | None = None,
+    match: list[str] | None = Query(default=None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0, le=MAX_OFFSET),
+):
+    """General search over every dapper object. `references` = objects whose
+    document points at that dapper ID (claims of a proposition, evidence for
+    a proposition, propositions about a GeneSet, ...); `q` substring-matches
+    the statement / name / description text; `match=slot:value` (repeatable)
+    is exact equality on a top-level string slot (e.g. relation:has_members,
+    subject_entity:NOD2). No numeric filters: metric questions are GraphQL's."""
+    con = db.connect()
+    try:
+        return _object_search(con, class_name=class_name, q=q, references=references,
+                              match=match, limit=limit, offset=offset)
+    finally:
+        con.close()
+
+
 @app.get("/v1/objects/{object_id}")
 def get_object(object_id: str, request: Request):
-    """Trace any deposited dapper object (GeneSet, GeneSetCollection, Activity,
-    File, ...) by its ID — companion to ClaimEnvelope.provenanceRefs.
+    """The resolver: dereference any dapper ID to its stored document.
     Content-negotiated: browsers (Accept: text/html) get a landing page with
-    referenced IDs linked; everything else gets the verbatim JSON document."""
+    referenced IDs linked; everything else gets the JSON document."""
     con = db.connect()
     try:
         payload = _fetch_payload(con, object_id)
-        pending = None
-        if payload is None:
-            pending = con.execute(
-                "SELECT 1 FROM pending_claims WHERE claim_id = ?", (object_id,)
-            ).fetchone()
+        unasserted = payload is None and _index_source(con, object_id) is not None
     finally:
         con.close()
     if payload is None:
-        if pending:
+        if unasserted:
             raise HTTPException(
                 status_code=404,
                 detail=(
-                    f"{object_id} is precomputed but not yet asserted — it materializes "
-                    "when the scientific query surface (GraphQL) first serves it"
+                    f"{object_id} is a claim this repository's data implies but has not yet "
+                    "asserted — it is minted when the scientific query surface (GraphQL) first "
+                    "serves the result behind it (or stored when its identical document is deposited "
+                    "via POST /v1/claims)"
                 ),
             )
         raise HTTPException(status_code=404, detail=f"no deposited object with id {object_id}")
@@ -982,278 +1775,13 @@ def get_object(object_id: str, request: Request):
     return _present_object(payload)
 
 
-def _expand_entity_ids(con, value):
-    """A gene-set NAME also matches claims whose propositions reference the
-    set's dapper:GeneSet ID (how set propositions are encoded)."""
-    ids = [value]
-    for r in con.execute("SELECT dapper_id FROM gene_set_entities WHERE name = ?", (value,)):
-        ids.append(r["dapper_id"])
-    return ids
-
-
-def _proposition_filters(con, *, predicate=None, subject=None, object_=None,
-                         entity=None, q=None):
-    """WHERE fragments over a proposition payload aliased `p` — shared by the
-    claim and proposition search endpoints so both speak the same language."""
-    je = con.dialect.je
-    where, params = [], []
-    if predicate:
-        where.append(f"{je('p.payload', 'relation')} = ?")
-        params.append(predicate)
-    for field, value in (("subject_entity", subject), ("object_entity", object_)):
-        if value:
-            ids = _expand_entity_ids(con, value)
-            where.append(f"{je('p.payload', field)} IN ({','.join('?' * len(ids))})")
-            params.extend(ids)
-    if entity:
-        ids = _expand_entity_ids(con, entity)
-        marks = ",".join("?" * len(ids))
-        where.append(
-            f"({je('p.payload', 'subject_entity')} IN ({marks}) "
-            f"OR {je('p.payload', 'object_entity')} IN ({marks}))"
-        )
-        params.extend(ids * 2)
-    if q:
-        where.append(f"{je('p.payload', 'statement')} LIKE ?")
-        params.append(f"%{q}%")
-    return where, params
-
-
-def _triple_of(prop: dict):
-    if not prop.get("relation"):
+def _triple_of(prop) -> dict | None:
+    """(subject, predicate, object) of a Proposition document — only when
+    every part is a string (stored documents are not schema-validated, and
+    ClaimTriple's String! fields must never fail a whole response)."""
+    if not isinstance(prop, dict):
         return None
-    return {
-        "subject": prop.get("subject_entity", ""),
-        "predicate": prop["relation"],
-        "object": prop.get("object_entity", ""),
-    }
-
-
-def _claim_search(con, *, method=None, predicate=None, subject=None, object_=None,
-                  entity=None, q=None, limit=50, offset=0):
-    """Shared engine for the REST list/search endpoints: deterministic
-    claim_id order, filters ANDed, total computed over the same WHERE."""
-    limit = max(1, min(int(limit), 500))
-    offset = max(0, int(offset))
-    where, params = _proposition_filters(
-        con, predicate=predicate, subject=subject, object_=object_, entity=entity, q=q
-    )
-    if method:
-        where.append("c.method = ?")
-        params.append(method)
-    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
-    base = (
-        "FROM claims c "
-        "JOIN dapper_objects p ON p.id = c.proposition_id "
-        "JOIN dapper_objects d ON d.id = c.claim_id" + where_sql
-    )
-    total = con.execute(f"SELECT COUNT(*) AS c {base}", params).fetchone()["c"]
-    rows = con.execute(
-        f"SELECT c.claim_id, c.method, p.payload AS proposition, d.times_seen, d.created_at "
-        f"{base} ORDER BY c.claim_id ASC LIMIT ? OFFSET ?",
-        [*params, limit, offset],
-    ).fetchall()
-    claims = []
-    for r in rows:
-        prop = json.loads(r["proposition"])
-        claims.append(
-            {
-                "claim_id": r["claim_id"],
-                "method": r["method"],
-                "triple": {
-                    "subject": prop.get("subject_entity"),
-                    "predicate": prop.get("relation"),
-                    "object": prop.get("object_entity"),
-                },
-                "statement": prop.get("statement"),
-                "times_deposited": r["times_seen"],
-                "deposited_at": _ts(r["created_at"]),
-                "url": f"/v1/claims/{r['claim_id']}",
-                "resolver_url": _resolver_url(r["claim_id"]),
-            }
-        )
-    return {"total": total, "limit": limit, "offset": offset, "claims": claims}
-
-
-@app.get("/v1/claims")
-def list_claims(method: str | None = None, predicate: str | None = None,
-                limit: int = 50, offset: int = 0):
-    """Browse deposited claims: compact summaries (triple, statement, mint
-    count), deterministic claim_id order, limit/offset pagination."""
-    con = db.connect()
-    try:
-        return _claim_search(con, method=method, predicate=predicate, limit=limit, offset=offset)
-    finally:
-        con.close()
-
-
-@app.get("/v1/claims/search")
-def search_claims(q: str | None = None, subject: str | None = None,
-                  object: str | None = None, entity: str | None = None,
-                  predicate: str | None = None, method: str | None = None,
-                  limit: int = 50, offset: int = 0):
-    """Search claims by proposition content: `entity` matches subject or
-    object (a gene-set name also matches its dapper:GeneSet ID), `subject` /
-    `object` pin one side, `q` substring-matches the proposition statement.
-    Filters are ANDed; same response shape as the list endpoint."""
-    con = db.connect()
-    try:
-        return _claim_search(
-            con, method=method, predicate=predicate, subject=subject,
-            object_=object, entity=entity, q=q, limit=limit, offset=offset,
-        )
-    finally:
-        con.close()
-
-
-def _proposition_search(con, *, predicate=None, subject=None, object_=None,
-                        entity=None, q=None, limit=50, offset=0):
-    """Same search language as _claim_search, over propositions; each summary
-    carries n_claims, the fan-in of assessments on that statement."""
-    limit = max(1, min(int(limit), 500))
-    offset = max(0, int(offset))
-    where, params = _proposition_filters(
-        con, predicate=predicate, subject=subject, object_=object_, entity=entity, q=q
-    )
-    where_sql = " AND ".join(["p.class_name = 'Proposition'", *where])
-    total = con.execute(
-        f"SELECT COUNT(*) AS c FROM dapper_objects p WHERE {where_sql}", params
-    ).fetchone()["c"]
-    rows = con.execute(
-        "SELECT p.id, p.payload, p.times_seen, "
-        "(SELECT COUNT(*) FROM claims c WHERE c.proposition_id = p.id) AS n_claims "
-        f"FROM dapper_objects p WHERE {where_sql} ORDER BY p.id ASC LIMIT ? OFFSET ?",
-        [*params, limit, offset],
-    ).fetchall()
-    propositions = []
-    for r in rows:
-        prop = json.loads(r["payload"])
-        propositions.append(
-            {
-                "proposition_id": r["id"],
-                "triple": _triple_of(prop),
-                "statement": prop.get("statement"),
-                "proposition_kind": prop.get("proposition_kind"),
-                "n_claims": r["n_claims"],
-                "times_deposited": r["times_seen"],
-                "url": f"/v1/propositions/{r['id']}",
-                "resolver_url": _resolver_url(r["id"]),
-            }
-        )
-    return {"total": total, "limit": limit, "offset": offset, "propositions": propositions}
-
-
-def _claim_brief(con, claim_id, method=None):
-    """Compact claim view for a proposition's fan-in: what distinguishes the
-    claims of one proposition is the assessment, not the triple."""
-    row = con.execute(
-        "SELECT payload, times_seen FROM dapper_objects WHERE id = ?", (claim_id,)
-    ).fetchone()
-    if row is None:
+    parts = (prop.get("subject_entity", ""), prop.get("relation"), prop.get("object_entity", ""))
+    if not parts[1] or not all(isinstance(p, str) for p in parts):
         return None
-    claim = json.loads(row["payload"])
-    scores = []
-    for sid in claim.get("has_score", []):
-        s = _fetch_payload(con, sid)
-        if s:
-            scores.append({"metric": s["metric"], "value": s["value"]})
-    return {
-        "claim_id": claim_id,
-        "method": method or None,
-        "statement": claim.get("statement"),
-        "direction": claim.get("direction"),
-        "scores": scores,
-        "times_deposited": row["times_seen"],
-        "url": f"/v1/claims/{claim_id}",
-    }
-
-
-@app.get("/v1/propositions")
-def list_propositions(predicate: str | None = None, limit: int = 50, offset: int = 0):
-    """Browse deposited propositions: compact summaries with the structured
-    triple and n_claims (how many claims assess each statement)."""
-    con = db.connect()
-    try:
-        return _proposition_search(con, predicate=predicate, limit=limit, offset=offset)
-    finally:
-        con.close()
-
-
-@app.get("/v1/propositions/search")
-def search_propositions(q: str | None = None, subject: str | None = None,
-                        object: str | None = None, entity: str | None = None,
-                        predicate: str | None = None, limit: int = 50, offset: int = 0):
-    """Search propositions in the same fashion as /v1/claims/search: `entity`
-    matches either side of the triple (gene-set names expand to their
-    dapper:GeneSet IDs), `q` substring-matches the statement."""
-    con = db.connect()
-    try:
-        return _proposition_search(
-            con, predicate=predicate, subject=subject, object_=object,
-            entity=entity, q=q, limit=limit, offset=offset,
-        )
-    finally:
-        con.close()
-
-
-@app.get("/v1/propositions/{proposition_id}")
-def get_proposition(proposition_id: str):
-    """One proposition with EVERY claim that assesses it — the fan-in the
-    proposition/claim split exists for (measurement, tiers, other methods)."""
-    con = db.connect()
-    try:
-        payload = _fetch_payload(con, proposition_id)
-        if payload is None or payload.get("class_name") != "Proposition":
-            raise HTTPException(status_code=404, detail=f"no deposited Proposition with id {proposition_id}")
-        rows = con.execute(
-            "SELECT claim_id, method FROM claims WHERE proposition_id = ? ORDER BY claim_id",
-            (proposition_id,),
-        ).fetchall()
-        briefs = [b for b in (_claim_brief(con, r["claim_id"], r["method"]) for r in rows) if b]
-        return {"proposition": payload, "triple": _triple_of(payload), "claims": briefs}
-    finally:
-        con.close()
-
-
-@app.get("/v1/claims/{claim_id}")
-def get_claim(claim_id: str):
-    con = db.connect()
-    try:
-        # REST dereference reads asserted claims; it does not assert.
-        env = envelope(con, claim_id, assert_claim=False)
-        pending = None
-        if env is None:
-            pending = con.execute(
-                "SELECT 1 FROM pending_claims WHERE claim_id = ?", (claim_id,)
-            ).fetchone()
-    finally:
-        con.close()
-    if env is None:
-        if pending:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"claim {claim_id} is precomputed but not yet asserted — it "
-                    "materializes when the scientific query surface (GraphQL) first serves it"
-                ),
-            )
-        raise HTTPException(status_code=404, detail=f"no deposited object with id {claim_id}")
-    return {
-        "resolver_url": env["resolverUrl"],
-        "claim": env["claim"],
-        "proposition": env["proposition"],
-        "triple": env["triple"],
-        "scores": env["scores"],
-        "evidence": env["evidence"],
-        "deposits": {
-            "times": env["timesDeposited"],
-            "first_at": env["firstDepositedAt"],
-            "last_at": env["lastDepositedAt"],
-        },
-        "provenance_refs": {
-            "derived_from_files": env["provenanceRefs"]["derivedFromFiles"],
-            "gene_set_refs": env["provenanceRefs"]["geneSetRefs"],
-            "resolve_via": "provenance-indexer",
-            "resolution": env["provenanceRefs"]["resolution"].lower(),
-        },
-    }
+    return {"subject": parts[0], "predicate": parts[1], "object": parts[2]}

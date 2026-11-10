@@ -15,20 +15,36 @@ schema {
 type Query {
   health: Health!
 
-  "Trait autocomplete and concept resolution."
+  """
+  A phenotype by any of its keys: a canonical KPN trait ID
+  (KPN.TRAIT:0000505), a legacy portal key (IBD), or a PIGEAN phenotype key —
+  resolved through the KPN trait registry (broadinstitute/kpn-data-models).
+  """
   phenotype(id: ID!): Phenotype
   phenotypes(search: String, first: Int = 20): [Phenotype!]!
 
   gene(symbol: ID!): Gene
-  geneSet(name: ID!, collection: String): GeneSet
+  """
+  A gene set by name. With `phenotype` (any key), the set as that phenotype's
+  PIGEAN run observed it — its GeneSet entity, and members default to that
+  phenotype; without it, the first observation in (collection, phenotype)
+  order.
+  """
+  geneSet(name: ID!, collection: String, phenotype: ID): GeneSet
 
-  "Retrieve any deposited claim by dapper:Claim ID."
+  """
+  A claim by dapper:Claim ID: a deposited claim, or one the loaded data
+  implies — synthesized from its index row, verified, and minted on first
+  serve. Every call is an assertion (counted once per request).
+  """
   claim(id: ID!): ClaimEnvelope
 
   """
   A proposition with every claim that assesses it — the fan-in view the
   proposition/claim split exists for: one statement, many assessments
-  (measurement, interpretive tiers, other methods).
+  (measurement, interpretive tiers, other methods). Includes the claims the
+  loaded data implies but nothing has served yet: serving them here asserts
+  (and on first serve, unless already deposited, mints) them.
   """
   proposition(id: ID!): PropositionEnvelope
 
@@ -119,19 +135,51 @@ input IntFilter {
 }
 
 type Phenotype {
-  "Portal trait key, e.g. IBD."
+  """
+  Canonical KPN trait ID (KPN.TRAIT:…, from broadinstitute/kpn-data-models)
+  when the phenotype is registered; otherwise the key as loaded.
+  """
   id: ID!
+  "Legacy portal trait key the result files use, e.g. IBD."
+  legacyId: String
+  "KPN trait name, e.g. Inflammatory bowel disease (IBD)."
   name: String
+  "Trait group of the loaded result rows, e.g. portal."
   traitGroup: String
-  "Resolved public ontology CURIE (EFO/MONDO) once the Day-2 concept decision lands; null until then."
+  "KPN trait category (registry trait_group), e.g. digestive."
+  category: String
+  "KPN trait type, e.g. disease, measurement."
+  traitType: String
+  "Primary ontology concept from the KPN registry, e.g. EFO:0003767."
   conceptId: String
+  conceptLabel: String
+  "Cross-ontology mappings from the KPN registry (SSSOM), optionally for one ontology (EFO, MONDO, MESH, DOID, HP, ORPHANET, ...)."
+  mappings(ontology: String): [TraitMapping!]!
+}
+
+"One SSSOM mapping of a KPN trait to an ontology term."
+type TraitMapping {
+  targetId: ID!
+  ontology: String!
+  "SKOS / SSSOM predicate, e.g. skos:exactMatch."
+  predicate: String!
+  label: String
+  confidence: Float
+  justification: String
+  "Where the mapping came from (curated table, EFO cross-reference, ...)."
+  source: String
 }
 
 type Gene {
   "HGNC symbol as it appears in the result files."
   symbol: ID!
-  "Gene-set memberships, backed by membership claims (method-agnostic; sourced from GMTs)."
-  memberships(collection: String, first: Int = 100): [GeneSetMembership!]!
+  """
+  Gene-set memberships, each backed by its set's roster claim (one claim per
+  gene set, from the PIGEAN run's gene_gene_set_stats). Observations are
+  phenotype-scoped: pass `phenotype` for one run's (plus collection-wide
+  deposited) memberships; without it every observation is listed.
+  """
+  memberships(collection: String, phenotype: ID, first: Int = 100): [GeneSetMembership!]!
 }
 
 type GeneSet {
@@ -143,10 +191,11 @@ type GeneSet {
   collection: String!
   "dapper:GeneSet ID when known; resolves via provenance-indexer."
   dapperGeneSetId: String
-  members(first: Int = 100): [GeneSetMembership!]!
+  "Member genes, each backed by its set's roster claim; `phenotype` as on Gene.memberships."
+  members(phenotype: ID, first: Int = 100): [GeneSetMembership!]!
 }
 
-"A gene's membership in a gene set, backed by a membership claim. No scores in v0; if a method later emits per-membership weights they arrive as LOADING scores on the claim."
+"A gene's membership in a gene set, backed by the set's roster claim (gene_set has_members, pinning the exact roster) or by a deposited membership claim. No scores in v0; if a method later emits per-membership weights they arrive as LOADING scores on the claim."
 type GeneSetMembership {
   gene: Gene!
   geneSet: GeneSet!
@@ -183,7 +232,7 @@ type ClaimEnvelope {
   id: ID!
   "Shareable URL form of the ID: this service's resolver (/v1/objects/{id}); the CURIE stays canonical."
   resolverUrl: String!
-  "Verbatim DAPPER Claim document, validated against the pinned profile."
+  "Verbatim DAPPER Claim document. A claim served from a live index row is re-synthesized and verified against its content address on every serve. An external deposit is checked for structure and identifier shape; a local-dev id (dapper:{Class}.local<hex>) must hash to its content, a different document at an existing address is refused, and a Claim at an address the loaded data implies must equal the template's synthesis. Full DAPPER-profile validation and DAPPER-ID-1 address verification are Task-5 hardening."
   claim: JSON!
   "Verbatim DAPPER Proposition document."
   proposition: JSON!
@@ -199,13 +248,17 @@ type ClaimEnvelope {
   """
   evidence: [ClaimEvidence!]!
   """
-  Mint counter: content addressing makes re-deposits idempotent, so this
-  records how often this exact document keeps being minted from the
-  underlying data — 1 on first deposit, +1 for every re-deposit (including
-  loader re-runs).
+  Assertion counter: how many times the repository has stood behind this
+  claim — +1 for each successful GraphQL response that serves it (a result
+  row implying it counts whether or not its envelope is selected; at most
+  once per request; the first serve mints it unless a deposit already
+  stored it), and +1 per external deposit or re-deposit of the same
+  document. Plain document reads (dapperObject, the
+  REST resolver) never count. Writes happen only when the whole response
+  succeeds; the value shown is as of this response.
   """
   timesDeposited: Int!
-  "UTC timestamps of the first deposit and the most recent (re-)deposit."
+  "UTC timestamps of the first mint/deposit and the most recent assertion."
   firstDepositedAt: String
   lastDepositedAt: String
   provenanceRefs: ProvenanceRefs!
@@ -224,15 +277,17 @@ type PropositionEnvelope {
   "Verbatim DAPPER Proposition document."
   proposition: JSON!
   triple: ClaimTriple
-  "Every deposited claim whose `proposition` is this document, claim_id order."
+  "Every claim assessing this proposition — stored or implied by the loaded data — in claim_id order."
   claims: [ClaimEnvelope!]!
 }
 
 """
 The claim's statement as a structured triple, from its Proposition's
 subject_entity / relation / object_entity. Subject and object are canonical
-IDs: gene symbol, phenotype key, or a dereferenceable dapper:GeneSet ID
-(follow it via Query.dapperObject).
+IDs: a gene symbol, a phenotype's KPN.TRAIT ID (or its key as loaded when
+unregistered), or a dereferenceable dapper ID (dapper:GeneSet for set
+associations; dapper:GeneSet has_members dapper:GeneSetCollection for
+roster claims) — follow dapper IDs via Query.dapperObject.
 """
 type ClaimTriple {
   subject: String!
