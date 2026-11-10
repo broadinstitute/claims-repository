@@ -1681,3 +1681,133 @@ def test_audit_checks_edges_citing_rosters_about_member_less_loaded_sets():
                                capture_output=True, text=True, env={**os.environ, "CLAIMS_DB": service_db.DB_PATH})
         out = audit.stdout + audit.stderr
         assert audit.returncode != 0 and "dapper:Claim.ABOUTB for a different gene set (aud3-v1/FIXSET_B)" in out, out
+
+
+# --- admin API (consumed by the admin console in admin/) ---------------------
+
+import time as _time  # noqa: E402
+import uuid as _uuid  # noqa: E402
+
+import jwt as _jwt  # noqa: E402
+
+from service import admin_gateway  # noqa: E402
+from service import telemetry  # noqa: E402
+
+GATEWAY_SECRET = "test-gateway-secret-at-least-32-characters"
+
+
+def _gateway(monkeypatch, admins=("admin@example.org",)):
+    monkeypatch.setattr(admin_gateway, "SECRET", GATEWAY_SECRET)
+    monkeypatch.setattr(admin_gateway, "ADMIN_EMAILS", set(admins))
+
+
+def _assertion(purpose="admin_read", secret=GATEWAY_SECRET, lifetime=120, **overrides):
+    now = int(_time.time())
+    claims = {"iss": "claims-admin", "aud": "claims-api", "iat": now, "exp": now + lifetime,
+              "jti": str(_uuid.uuid4()), "sub": "admin@example.org", "purpose": purpose,
+              "email": "admin@example.org", "email_verified": True}
+    claims.update(overrides)
+    return _jwt.encode({k: v for k, v in claims.items() if v is not None}, secret, algorithm="HS256")
+
+
+def _admin_get(path, token=None, **params):
+    return client.get(f"/v1/admin/api/{path}", params=params,
+                      headers={"Authorization": f"Bearer {token or _assertion()}"})
+
+
+def test_admin_api_accepts_only_the_consoles_signed_assertion(monkeypatch):
+    monkeypatch.setattr(admin_gateway, "SECRET", "")
+    assert _admin_get("me").status_code == 503  # unconfigured: closed
+    _gateway(monkeypatch)
+    ok = _admin_get("me")
+    assert ok.status_code == 200 and ok.json()["email"] == "admin@example.org"
+    assert ok.headers["cache-control"] == "no-store"
+    assert client.get("/v1/admin/api/me").status_code == 401
+    refused = {
+        "wrong secret": _assertion(secret="another-secret-that-is-at-least-32-chars"),
+        "expired": _assertion(iat=int(_time.time()) - 400, exp=int(_time.time()) - 200),
+        "too long-lived": _assertion(lifetime=3600),
+        "wrong audience": _assertion(aud="reveal-api"),
+        "wrong issuer": _assertion(iss="someone-else"),
+        "no jti": _assertion(jti=None),
+    }
+    for label, token in refused.items():
+        assert _admin_get("me", token).status_code == 401, label
+    unsigned = _jwt.encode({"iss": "claims-admin", "aud": "claims-api", "iat": 1, "exp": 9999999999, "jti": "x",
+                            "sub": "a", "purpose": "admin_read", "email": "admin@example.org", "email_verified": True},
+                           None, algorithm="none")
+    assert _admin_get("me", unsigned).status_code == 401
+    # The API's own allowlist and Google's verification both apply.
+    assert _admin_get("me", _assertion(email="intruder@example.org")).status_code == 403
+    assert _admin_get("me", _assertion(email_verified=False)).status_code == 403
+    # A sign-in audit assertion cannot read, and a read assertion cannot write the audit.
+    assert _admin_get("me", _assertion(purpose="auth_event")).status_code == 403
+    post = lambda token, body: client.post("/v1/admin/api/auth-events", json=body, headers={"Authorization": f"Bearer {token}"})
+    assert post(_assertion(), {"event": "login", "email": "x@example.org"}).status_code == 403
+    assert post(_assertion(purpose="auth_event"), {"event": "rm -rf", "email": "x@example.org"}).status_code == 422
+    assert post(_assertion(purpose="auth_event"), {"event": "login_denied", "email": "Intruder@Example.org",
+                                                    "detail": "not an approved admin"}).status_code == 204
+    events = _admin_get("activity").json()["authEvents"]
+    assert events[0]["event"] == "login_denied" and events[0]["email"] == "intruder@example.org"
+    assert "admin@example.org" in _admin_get("activity").json()["approvedAdmins"]
+
+
+def test_admin_api_reports_claims_templates_tables_and_activity(monkeypatch):
+    _gateway(monkeypatch)
+    _load_fixtures()
+    gene_claim = _index_claim_id("pigean_gene_associations", "gene", "FIXG1")
+    client.get("/v1/health")
+    client.get(f"/v1/objects/{gene_claim}")
+
+    ov = _admin_get("overview").json()
+    fams = {f["family"]: f for f in ov["families"]}
+    assert set(fams) == {"gene", "gene_set", "roster"}
+    assert ov["claims"]["implied"] == sum(f["implied"] for f in ov["families"]) > 0
+    assert len(ov["mintTimeline"]) == 30 and ov["database"]["backend"] == "sqlite"
+
+    listed = _admin_get("claims", family="gene", page_size=100).json()
+    assert listed["total"] == fams["gene"]["implied"]
+    assert gene_claim in {r["claimId"] for r in listed["rows"]}
+    fixg1 = _admin_get("claims", q="fixg1").json()
+    assert {r["subject"] for r in fixg1["rows"]} == {"FIXG1"}
+    everything = _admin_get("claims", page_size=1).json()
+    assert everything["total"] == ov["claims"]["implied"] + ov["claims"]["deposited"]
+    assert _admin_get("claims", family="nope").status_code == 422
+
+    before = _times_seen(gene_claim)
+    detail = _admin_get(f"claims/{gene_claim}").json()
+    assert detail["verification"]["templateBacked"] and detail["verification"]["synthesizes"]
+    assert detail["indexRow"]["family"] == "gene" and detail["triple"]["subject"] == "FIXG1"
+    assert _times_seen(gene_claim) == before  # inspecting never asserts
+    assert _admin_get("claims/dapper:Claim.nonexistent").status_code == 404
+
+    templates = _admin_get("templates").json()
+    method = templates["methods"][0]
+    assert method["name"] == "pigean" and len(method["template"]["sha256"]) == 64
+    assert {m["metric"] for m in method["metrics"]} == {"combined", "log_bf", "prior", "beta", "beta_uncorrected"}
+    assert all(m["kindAgrees"] for m in method["metrics"])
+    assert any(q["name"] == "ibd-validation-challenge" for q in templates["queryTemplates"])
+
+    tables = _admin_get("tables", fresh="true").json()
+    names = {t["name"]: t for t in tables["tables"]}
+    assert names["dapper_objects"]["rows"] > 0 and "admin_auth_events" in names
+    rows = _admin_get("tables/pigean_gene_associations/rows", column="gene", op="equals", value="FIXG1").json()
+    assert rows["total"] >= 1 and all(r["gene"] == "FIXG1" for r in rows["rows"])
+    assert _admin_get("tables/sqlite_master/rows").status_code == 404
+    assert _admin_get("tables/dapper_objects/rows", column="id; DROP", value="x").status_code == 400
+
+    activity = _admin_get("activity").json()
+    routes = {(r["method"], r["route"]) for r in activity["telemetry"]["routes"]}
+    assert ("GET", "/v1/health") in routes and ("GET", "/v1/objects/{object_id}") in routes
+    assert not any(r.startswith("/v1/admin") for _, r in routes)
+
+
+def test_graphql_telemetry_counts_mints_and_root_fields():
+    _load_fixtures()
+    before = telemetry.snapshot()["graphql"]
+    _gql('{ health { status } }')
+    _gql('{ nope }')
+    after = telemetry.snapshot()["graphql"]
+    assert after["requests"] == before["requests"] + 2 and after["failed"] == before["failed"] + 1
+    fields = {f["field"]: f["count"] for f in after["rootFields"]}
+    assert fields.get("health", 0) >= 1 and fields.get("nope", 0) >= 1

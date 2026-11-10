@@ -30,6 +30,7 @@ from starlette.requests import Request
 
 from . import db
 from . import pigean_template as tpl
+from . import telemetry
 from .refs import DAPPER_ID_RE, LOCAL_DEV_ID_RE, MAX_ID_LENGTH, dapper_refs
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1005,6 +1006,8 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+# Process-local request telemetry for the admin console (service/telemetry.py).
+app.add_middleware(telemetry.RequestTelemetry)
 
 SWAGGER_HTML = """<!doctype html>
 <html>
@@ -1169,6 +1172,7 @@ def _execute_graphql(data):
     writes nothing. Returns (success, rendered body)."""
     con = db.connect()
     con.query_limit = MAX_QUERIES_PER_REQUEST
+    minted = reasserted = 0
     try:
         success, result = graphql_sync(schema, data, context_value={"con": con}, debug=GRAPHQL_DEBUG)
         body = None
@@ -1179,6 +1183,9 @@ def _execute_graphql(data):
                 success, result = False, {"data": None, "errors": [{"message": f"unrenderable response: {exc}"}]}
         if success and not result.get("errors"):
             con.query_limit = None  # the write batch is not request work
+            recorded = getattr(con, "assertions", None) or {}
+            minted = sum(1 for a in recorded.values() if a["new"])
+            reasserted = len(recorded) - minted
             error = _commit_assertions(con)
             if error:
                 success, result = False, {"data": None, "errors": [{"message": error}]}
@@ -1191,7 +1198,21 @@ def _execute_graphql(data):
             body = _render(_renderable_errors(result))
     finally:
         con.close()
+    telemetry.record_graphql(success, minted, reasserted, _root_fields(data))
     return success, body
+
+
+def _root_fields(data) -> list[str]:
+    """Top-level field names a GraphQL request asked for (telemetry only;
+    an unparseable request counts as '(invalid)')."""
+    try:
+        from graphql import parse
+        doc = parse(data.get("query") or "") if isinstance(data, dict) else None
+        names = [sel.name.value for d in doc.definitions if getattr(d, "operation", None) is not None
+                 for sel in d.selection_set.selections if getattr(sel, "name", None) is not None]
+        return names or ["(empty)"]
+    except Exception:  # noqa: BLE001 — telemetry must never fail a request
+        return ["(invalid)"]
 
 
 def _renderable_errors(result):
@@ -1783,3 +1804,12 @@ def _triple_of(prop) -> dict | None:
     if not parts[1] or not all(isinstance(p, str) for p in parts):
         return None
     return {"subject": parts[0], "predicate": parts[1], "object": parts[2]}
+
+
+# Admin API (service/admin.py) for the admin console (/admin in frontend/): read-only
+# telemetry on claims, templates, tables and API traffic, callable only with
+# the console server's signed assertion. Imported last: it reads this
+# module's helpers at request time.
+from . import admin as _admin  # noqa: E402
+
+app.include_router(_admin.router)

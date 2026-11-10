@@ -47,6 +47,7 @@ REQUIRED_COLUMNS = {
     "kpn_traits": {"trait_id", "legacy_id", "pigean_id", "name", "primary_concept_id"},
     "kpn_trait_mappings": {"trait_id", "target_id", "ontology", "predicate"},
     "kpn_trait_release": {"version", "commit_sha", "file_sha256"},
+    "admin_auth_events": {"at", "event", "email", "detail"},
 }
 REQUIRED_PRIMARY_KEYS = {
     "claim_memberships": ["phenotype", "collection", "gene", "gene_set"],

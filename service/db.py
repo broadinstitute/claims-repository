@@ -178,6 +178,16 @@ CREATE TABLE IF NOT EXISTS kpn_trait_release (
   mapping_count INTEGER NOT NULL,
   loaded_at TEXT DEFAULT (datetime('now'))
 );
+-- Admin console sign-in audit (written by the console's server through
+-- POST /v1/admin/api/auth-events; service/admin.py).
+CREATE TABLE IF NOT EXISTS admin_auth_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  event TEXT NOT NULL,
+  email TEXT,
+  detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_aae_at ON admin_auth_events (at);
 """
 
 

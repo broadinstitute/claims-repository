@@ -1,0 +1,109 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Theme tokens from the akleao app (apps/research/frontend/src/app/theme.css):
+   the Collab Admin V2 panel's palette, radii and type. Dark follows the OS. */
+@custom-variant dark (@media (prefers-color-scheme: dark));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist);
+  --font-mono: var(--font-geist-mono);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-bar: var(--bar);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.5rem;
+  --background: #FAFAFA;
+  --foreground: #1a1a1a;
+  --card: #FFFFFF;
+  --card-foreground: #1a1a1a;
+  --popover: #FFFFFF;
+  --popover-foreground: #1a1a1a;
+  --primary: #1a1a1a;
+  --primary-foreground: #FAFAFA;
+  --secondary: #EDEDEF;
+  --secondary-foreground: #1a1a1a;
+  --muted: #E5E5E8;
+  --muted-foreground: #585860;
+  --accent: #E5E5E8;
+  --accent-foreground: #1a1a1a;
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: #D4D4D8;
+  --input: #D4D4D8;
+  --ring: #1a1a1a;
+  --sidebar: #F3F3F5;
+  --sidebar-foreground: #1a1a1a;
+  --sidebar-accent: #DDDDE0;
+  --sidebar-accent-foreground: #1a1a1a;
+  --sidebar-border: #D4D4D8;
+  /* Single-series bars: the ink ramp, one step off pure ink. */
+  --bar: #3f3f46;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0A0A0A;
+    --foreground: #E8E8E6;
+    --card: #1C1D1D;
+    --card-foreground: #E8E8E6;
+    --popover: #0A0A0A;
+    --popover-foreground: #E8E8E6;
+    --primary: #E8E8E6;
+    --primary-foreground: #191A1A;
+    --secondary: #1E1F1F;
+    --secondary-foreground: #E8E8E6;
+    --muted: #191A1A;
+    --muted-foreground: #9A9A98;
+    --accent: #232424;
+    --accent-foreground: #E8E8E6;
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: #2A2B2B;
+    --input: #2A2B2B;
+    --ring: #E8E8E6;
+    --sidebar: #141515;
+    --sidebar-foreground: #E8E8E6;
+    --sidebar-accent: #1E1F1F;
+    --sidebar-accent-foreground: #E8E8E6;
+    --sidebar-border: #262727;
+    --bar: #a1a1aa;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html, body {
+    @apply bg-background text-foreground;
+  }
+  body {
+    @apply font-sans antialiased;
+  }
+}

@@ -28,6 +28,9 @@ that composes `core + methods/*` at startup and knows nothing method-specific. S
   queried** (synthesized from index rows + the method template, verified on every serve from a live index row).
 - [docs/query-graph-design.md](docs/query-graph-design.md) — execution semantics, storage design
   (MySQL, reveal-style), QA deployment, and open Day-2 decisions.
+- [docs/admin-console.md](docs/admin-console.md) — the admin console (`/admin` in [frontend/](frontend/), the
+  repository's Next.js frontend on Vercel): claims, templates, tables and API activity, behind Google sign-in for approved admins,
+  reading this service's `/v1/admin/api/*` through signed server-to-server assertions.
 
 All fixtures are synthetic: `.SYNTH…` IDs are placeholders for computed DAPPER content addresses,
 and no example value is a scientific result.
