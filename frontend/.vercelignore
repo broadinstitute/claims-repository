@@ -1,0 +1,7 @@
+# Never upload local secrets or build output; Vercel env vars configure deploys.
+.env
+.env.*
+!.env.example
+node_modules
+.next
+*.tsbuildinfo

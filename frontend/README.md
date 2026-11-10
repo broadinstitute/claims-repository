@@ -44,4 +44,6 @@ npm run build
 
 ## Deploy (Vercel)
 
-Root directory `frontend`, framework Next.js (`vercel.json`). Set the production environment variables listed in [docs/admin-console.md](../docs/admin-console.md#configuration). Then add `<deployment URL>/api/auth/callback/google` to the Google client's authorized redirect URIs.
+Production: **https://claims-repository.vercel.app** (Vercel project `chase-yakaboskis-projects/claims-repository`, against the QA claims API). Deploy from this directory with `vercel deploy --prod` (CLI 47.2.2 or later); `.vercelignore` keeps local env files out of the upload.
+
+For a new deployment: framework Next.js (`vercel.json`). Set the production environment variables listed in [docs/admin-console.md](../docs/admin-console.md#configuration); `NEXTAUTH_URL` is not needed on Vercel, where NextAuth uses the request host. Then add `<production URL>/api/auth/callback/google` to the Google client's authorized redirect URIs.
