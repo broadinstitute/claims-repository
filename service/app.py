@@ -1131,10 +1131,12 @@ def openapi_contract(request: Request):
     """The hand-written contract, with THIS deployment injected as the first
     server entry — Swagger UI's try-it-out defaults to the first server, so
     requests stay same-origin whether the page is opened via localhost,
-    127.0.0.1, or the QA/prod prefix."""
+    127.0.0.1, or the QA/prod prefix. Deployed, CLAIMS_PUBLIC_BASE_URL wins:
+    TLS ends at the load balancer, so the request itself reads as http and
+    an https docs page would block try-it-out as mixed content."""
     text = (ROOT / "api" / "openapi.yaml").read_text()
     root_path = request.scope.get("root_path", "")
-    base = f"{request.url.scheme}://{request.url.netloc}{root_path}"
+    base = PUBLIC_BASE or f"{request.url.scheme}://{request.url.netloc}{root_path}"
     injected = (
         "servers:\n"
         f"  - url: {base}\n"

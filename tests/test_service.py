@@ -53,6 +53,17 @@ def test_swagger_docs_and_contract():
     # stays same-origin (the localhost vs 127.0.0.1 CORS trap).
     first_server = contract.text.split("servers:\n", 1)[1].splitlines()[0]
     assert "http://testserver" in first_server
+    # Deployed behind a TLS-terminating load balancer the request reads as
+    # http; the configured public base must win so an https docs page never
+    # defaults to an http server (mixed content: "Failed to fetch").
+    import service.app as service_app
+    saved = service_app.PUBLIC_BASE
+    service_app.PUBLIC_BASE = "https://api-qa.example.org/api/claims"
+    try:
+        deployed = client.get("/v1/openapi.yaml").text
+    finally:
+        service_app.PUBLIC_BASE = saved
+    assert deployed.split("servers:\n", 1)[1].splitlines()[0] == "  - url: https://api-qa.example.org/api/claims"
     for tag in ("[Meta]", "[Deposit]", "[Objects]", "[GraphQL]"):
         assert tag in contract.text
     # Cross-origin reads are allowed (browser UIs call this API directly).
