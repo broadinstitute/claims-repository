@@ -2,9 +2,7 @@
   "data": {
     "pigeanValidationChallenge": {
       "truncated": false,
-      "warnings": [
-        "Metric interpretations are provisional until confirmed by the method leads (Day-2 decision)."
-      ],
+      "warnings": [],
       "rows": [
         {
           "geneAssociation": {

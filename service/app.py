@@ -37,10 +37,6 @@ CONTRACT_VERSION = "0.2.0"
 DAPPER_PROFILE = "0.2.0-a1"
 DEFAULT_COLLECTION = "cfde-inc-v2"
 
-PROVISIONAL_WARNING = (
-    "Metric interpretations are provisional until confirmed by the method leads (Day-2 decision)."
-)
-
 # Identity vs location (design decision 2026-11-09, per Chase): the
 # content-addressed CURIE (dapper:{Class}.{digest}) is the canonical,
 # location-independent identifier; URLs are presentations of it and never
@@ -911,7 +907,7 @@ def resolve_challenge(
     _bounded("setsPerGene", setsPerGene, MAX_SETS_PER_GENE)
     _bounded("first", first, MAX_ROWS)
     con = _con(info)
-    warnings = [PROVISIONAL_WARNING]
+    warnings = []
     anchors = _gene_assoc_rows(con, phenotype, collection, where, orderBy, topGenes)
 
     # Membership observed in this phenotype's PIGEAN run (under any of its
