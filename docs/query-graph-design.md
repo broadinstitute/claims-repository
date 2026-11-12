@@ -28,7 +28,7 @@ The three question shapes Chase listed map directly:
 
 Single-edge queries are valid: Alex's "gene related to IBD?" is a one-node-pinned, one-edge query.
 The Day-10 validation challenge is the three-edge join
-([api/examples/ibd-validation-challenge.query.json](../api/examples/ibd-validation-challenge.query.json)).
+([api/examples/ibd-validation-challenge.query.json](https://github.com/broadinstitute/claims-repository/blob/main/api/examples/ibd-validation-challenge.query.json)).
 
 ## 2. Execution semantics (deterministic, documented)
 

@@ -1,6 +1,6 @@
 # Admin console
 
-The admin console is the `/admin` section of the claims repository frontend, a Next.js app in [`frontend/`](../frontend) deployed on Vercel. Only the admin routes are built so far. It reads this service's admin API (`/v1/admin/api/*`). Its layout and components follow the akleao Collab Admin V2 panel: shadcn/ui, TanStack Query and Table, and the akleao theme tokens. Dark mode follows the OS.
+The admin console is the `/admin` section of the claims repository frontend, a Next.js app in [`frontend/`](https://github.com/broadinstitute/claims-repository/tree/main/frontend) deployed on Vercel. Only the admin routes are built so far. It reads this service's admin API (`/v1/admin/api/*`). Its layout and components follow the akleao Collab Admin V2 panel: shadcn/ui, TanStack Query and Table, and the akleao theme tokens. Dark mode follows the OS.
 
 | Page | What it shows |
 | --- | --- |
@@ -21,7 +21,7 @@ browser ──session cookie──▶ Next.js on Vercel ──signed assertion�
 
 1. **Sign-in.** NextAuth uses Google only, with the claims repository's own OAuth client. Sessions are JWTs with no database and last 12 hours. Sign-in requires a Google-verified email on the console's `ADMIN_EMAILS` list. The list is checked again on every page and every API call, so removing an address ends that admin's access at once.
 2. **Proxy.** The browser only calls `/api/admin/*` on the console's own origin. That route checks the session, accepts only the read paths, and calls the API with a fresh assertion. The assertion is HS256, signed with `CLAIMS_ADMIN_GATEWAY_SECRET`, and carries `iss` `claims-admin`, `aud` `claims-api`, a two-minute `exp`, `jti`, `purpose` `admin_read` and the verified email. Browsers never see the secret or an assertion.
-3. **API.** [`service/admin_gateway.py`](../service/admin_gateway.py) verifies the signature, issuer, audience, expiry, lifetime (at most 10 minutes) and purpose. It also checks the email against its own `CLAIMS_ADMIN_EMAILS`. Without a configured secret the admin API is closed (503).
+3. **API.** [`service/admin_gateway.py`](https://github.com/broadinstitute/claims-repository/blob/main/service/admin_gateway.py) verifies the signature, issuer, audience, expiry, lifetime (at most 10 minutes) and purpose. It also checks the email against its own `CLAIMS_ADMIN_EMAILS`. Without a configured secret the admin API is closed (503).
 4. **Audit.** Sign-ins, denials and sign-outs are posted by the console server with a separate `auth_event` assertion to `POST /v1/admin/api/auth-events`. They are stored in `admin_auth_events` (migration `005_admin_console.sql`). That assertion cannot read, and a read assertion cannot write.
 
 ## Configuration
@@ -38,7 +38,7 @@ browser ──session cookie──▶ Next.js on Vercel ──signed assertion�
 | | `CLAIMS_ADMIN_EMAILS` | Approved admins, in `service.yaml` |
 | Google client | Authorized redirect URI | `<NEXTAUTH_URL>/api/auth/callback/google` |
 
-Register `http://localhost:3000/api/auth/callback/google` on the client as well, so local sign-in works on port 3000. For local work without Google, `ADMIN_DEV_BYPASS=true` skips sign-in. It is honored only under `next dev` and never on Vercel; the API still requires the signed assertion. See [`frontend/README.md`](../frontend/README.md).
+Register `http://localhost:3000/api/auth/callback/google` on the client as well, so local sign-in works on port 3000. For local work without Google, `ADMIN_DEV_BYPASS=true` skips sign-in. It is honored only under `next dev` and never on Vercel; the API still requires the signed assertion. See [`frontend/README.md`](https://github.com/broadinstitute/claims-repository/blob/main/frontend/README.md).
 
 ## Limits
 
