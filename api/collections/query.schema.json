@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://broadinstitute.github.io/claims-repository/api/collections/query.schema.json",
+  "title": "Query template",
+  "description": "A bounded, declarative plan over one collection: an anchor step, then joins. Variables are $name.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "query",
+    "description",
+    "params",
+    "plan",
+    "example"
+  ],
+  "properties": {
+    "query": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "params": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "enum": [
+              "string",
+              "number",
+              "integer",
+              "boolean"
+            ]
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "default": {},
+          "min": {
+            "type": "number"
+          },
+          "max": {
+            "type": "number"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "plan": {
+      "type": "array",
+      "minItems": 1,
+      "prefixItems": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "anchor"
+          ],
+          "properties": {
+            "anchor": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "order",
+                "limit"
+              ],
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$"
+                },
+                "dimensions": {
+                  "type": "object"
+                },
+                "where": {
+                  "type": "object"
+                },
+                "order": {
+                  "$ref": "#/$defs/order"
+                },
+                "limit": {}
+              }
+            }
+          }
+        }
+      ],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "join"
+        ],
+        "properties": {
+          "join": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "as",
+              "via",
+              "kind",
+              "order",
+              "limit_per_anchor"
+            ],
+            "properties": {
+              "as": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "via": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "kind": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "where": {
+                "type": "object"
+              },
+              "order": {
+                "$ref": "#/$defs/order"
+              },
+              "limit_per_anchor": {}
+            }
+          }
+        }
+      }
+    },
+    "example": {
+      "type": "object"
+    }
+  },
+  "$defs": {
+    "order": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric"
+      ],
+      "properties": {
+        "metric": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "dir": {
+          "enum": [
+            "asc",
+            "desc"
+          ]
+        }
+      }
+    }
+  }
+}

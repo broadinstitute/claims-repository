@@ -11,7 +11,7 @@ easy misreading of the architecture up front:
 
 > **GraphQL never accepts writes.** The GraphQL schema has no `Mutation`
 > type (see `api/graphql/core.graphql`): clients cannot put content into the
-> store through it — the only external write path is REST `POST /v1/claims`.
+> store through it — the only external write path is REST `POST /v1/deposits`.
 > GraphQL does have one *internal* side effect, by design (2026-11-09, §3.5):
 > serving a result MINTS its claim — the service synthesizes the claim from
 > the result's index row plus the method's claim template, verifies it, and
@@ -29,7 +29,7 @@ bulk load (scripts/load_pigean.py)          external depositors (toolkit
   DATA PLANE ONLY: index rows (each          tier claims, other methods)
   naming its claim's precomputed address),         │
   Propositions, ClaimScores, Evidence +            ▼  INPUT (the only external
-  ValueLocators, GeneSet entities, Files,      POST /v1/claims    write path)
+  ValueLocators, GeneSet entities, Files,      POST /v1/deposits  write path)
   Activities — NO claims                           │
         │                                          │
         ▼                                          ▼
@@ -49,15 +49,52 @@ STORAGE: dapper_objects (authoritative, verbatim, times_seen-counted)
 
 ## 2. Input: deposit is REST-only, on purpose
 
-`POST /v1/claims` takes a bundle of DAPPER objects plus `index_hints` and
-stores idempotently by content address (re-deposit of identical content →
+`POST /v1/deposits` takes DAPPER objects of any class and stores them
+idempotently by content address (re-deposit of identical content →
 `exists`, `times_seen` +1). External deposits are asserted by their
 depositor, so deposited claims land immediately.
+
+The body is either a DAPPER **document** — the shape dapper's tooling mints,
+lists of nodes and edges under dapper's group names, so a whole
+ScientificAccount with its claims, propositions, evidence, files, activities
+and `used_edges` deposits in one request — or a flat list of **objects**.
+Every node is validated (`service/dapper_validation.py`):
+
+- its class is one dapper lets a document hold (a mixin such as Agent is not);
+- it has only that class's slots, every required slot, lists and single
+  values where the schema says, a string, number or boolean as each slot's
+  type says (dates and URIs are checked only to be strings) or a value of its
+  enum, and references to a class the slot's range allows, written
+  `dapper:{Class}.{digest}`;
+- its id is the DAPPER-ID-1 address of its content, computed with dapper's
+  own identity module (`vendor/dapper`).
+
+Not checked: the schema's conditional rules and dapper's provenance lint
+profiles, which are not vendored, and the inside of an inlined object (it is
+hashed and stored as given). A deposit is at most 1,000 objects, 5,000 edges
+and 16 MB. A reference that resolves neither in the
+bundle nor in the store is reported in `unresolved_references`, not refused.
+Edges have no ids, so they are stored with the deposit that carried them
+(`GET /v1/deposits/{id}`).
+
+Identity ignores some slots (a File's location, an Activity's timestamp), so
+two honest minters can hold different documents at one address. The first one
+stored stands; a later deposit reports `exists` with `stored_differs: true`,
+and the deposit record keeps that this depositor held a different copy.
+Nothing stored is ever rewritten, and there is no delete. A stored document
+that does not itself hash to the address is never taken for the object: the
+deposit is refused, and an operator has to resolve it.
+
+`POST /v1/claims`, the earlier route, was removed on 2026-11-12. It checked
+structure and identifier shape only. With it went deposits at local-dev and
+hand-written ids: the loader still writes local-dev objects straight to
+storage, and they are served as before, but nothing enters through the API
+that is not valid DAPPER at its DAPPER-ID-1 address.
 
 Why the write path is REST and not GraphQL:
 
 - **One auditable door.** Writes are the security- and integrity-sensitive
-  path (planned `X-API-Key` guards deposit only; reads stay open on QA). One
+  path (`X-API-Key` guards deposit only; reads stay open). One
   endpoint with one request shape is easy to log, gate, and reason about.
 - **Deposit is a transfer, not a query.** A bundle is a document upload with
   all-or-nothing semantics. GraphQL mutations would add nothing but a second
@@ -136,9 +173,9 @@ Rules that keep this sound:
   row.** Such a claim is served only if its synthesis matches the row's precomputed address and — once
   stored — the stored document exactly. Template drift, a stale vendored copy,
   a tampered index row, or a forged document at the row's address is refused
-  loudly (a GraphQL error), never served. Deposit verifies local-dev content
-  addresses (the id must be the digest of the content), refuses a different
-  document at an existing id, reserves implied addresses, and may never
+  loudly (a GraphQL error), never served. Deposit verifies DAPPER-ID-1 content
+  addresses (the id must be the address of the content), never rewrites a
+  stored document, reserves implied addresses, and may never
   overwrite a loaded, template-backed index row; the loader refuses to load
   over a stored document that differs from what it addresses identically.
   `scripts/audit_objects.py` re-verifies every claim the data implies across
@@ -197,7 +234,7 @@ Rules that keep this sound:
 - GET never mints. Dereferencing an implied claim that nothing has served
   or deposited returns 404 "not yet asserted". A claim exists in the
   repository only because a GraphQL response served it or a depositor
-  asserted it via `POST /v1/claims`. At an implied address, a deposit is
+  asserted it via `POST /v1/deposits`. At an implied address, a deposit is
   accepted only if it equals the template's document.
 - **Membership claims are one roster claim per gene set** (not one per
   (gene, set) pair): proposition `(dapper:GeneSet, has_members,
@@ -240,7 +277,7 @@ the queries that produce them; GraphQL also mirrors the resolver
 
 ## 5. The rule of thumb
 
-- **Writing?** REST `POST /v1/claims`, always.
+- **Writing?** REST `POST /v1/deposits`, always.
 - **Asking with a metric?** (filter, sort, top-N, join) GraphQL, always.
 - **Asking with an ID, a reference, or text?** REST objects (`/v1/objects`,
   `/search`, `/{id}`) — general across every class, shareable URLs; GraphQL
@@ -251,13 +288,12 @@ the queries that produce them; GraphQL also mirrors the resolver
 ## 6. Known deviations and futures
 
 - The loader writes the data plane straight to storage, bypassing
-  `POST /v1/claims` — it deposits no claims (they are minted on serve), so
+  `POST /v1/deposits` — it deposits no claims (they are minted on serve), so
   the deposit door stays the only path for *claims* entering from outside.
   Once toolkit minting moves to DAPPER-ID-1 content addresses, the template
   should vendor from the toolkit (pinned), with the digest check as the
   contract between them.
-- Deposit auth (`X-API-Key`) is declared in the contract but not yet
-  enforced — acceptable for QA, required before prod.
+- Deposit auth (`X-API-Key`) is enforced; see [Deposit keys](#deposit-keys).
 - If a UI someday genuinely needs REST-shaped scientific results (e.g. CSV
   export of a challenge run), the shape that preserves the guarantee is a
   **persisted-query execution endpoint** (`GET /v1/queries/{name}?var=…`,
@@ -270,8 +306,8 @@ decision or belongs to later hardening, and none can corrupt a stored
 document. Every claim served from a live index row is re-synthesized and
 checked against its content address. External deposits, and minted claims
 whose rows a reload replaced or superseded, are served from the stored
-document as stored (a local-dev address was verified when it was deposited
-or minted).
+document as stored (its address was verified when it was deposited or
+minted).
 
 - **`geneSet` without `phenotype` mixes observations.** A gene set observed
   under several phenotypes resolves to whichever observation the lookup
@@ -330,3 +366,39 @@ or minted).
 - **Envelope reads are not batched.** Each served row costs about six
   SELECTs. A request is bounded at 25,000 queries and 2,000 assertions;
   batching is a performance follow-up, not a correctness gap.
+
+## Deposit keys
+
+`POST /v1/deposits` needs a depositor's key in the `X-API-Key` header.
+Reads, GraphQL and collection queries need none.
+
+- **One key per depositor.** A key names an agent, a pipeline or a client. Its name is what readers see.
+- **Issue, list, revoke** in the admin console's **Keys** page ([admin-console.md](admin-console.md)), which
+  records who did it, or with `scripts/api_key.py`:
+
+  ```bash
+  .venv/bin/python scripts/api_key.py issue "REVEAL agent service (QA)" --by you@example.org
+  .venv/bin/python scripts/api_key.py list
+  .venv/bin/python scripts/api_key.py revoke key_0123456789abcdef --by you@example.org
+  ```
+
+  `issue` prints the key once. The service stores only its SHA-256, so a lost key is replaced, not
+  recovered. The script writes to whichever database the `CLAIMS_*` environment selects; for MySQL it also
+  requires `--database <name>`, because QA and prod share one database and a key issued there works in both.
+- **A missing, unknown or revoked key gets 401**, with one message for all three, before the body is read.
+  Until a key has been issued, every deposit is refused.
+- **Every accepted bundle is a deposit record**: the key, the time, and each object with whether this
+  deposit created it or it already existed, plus the document's edges. It is written in the same transaction as the objects, so a
+  rejected bundle leaves no record. The response carries `deposit_id` and `depositor`.
+- **Anyone can read who deposited what**: `GET /v1/deposits?object=<dapper id>`,
+  `GET /v1/deposits?deposited_by=<key id>`, `GET /v1/deposits/{deposit_id}`, and the `deposited_by` and
+  `deposit` filters on `GET /v1/objects/search`. A depositor is shown as its key id and name; the key and
+  its hash are never served, and the admin table browser hides the hash column.
+- **Not a deposit**: a claim the service mints when a query is served, and anything a loader or
+  `publish_collection.py` writes. Those have no depositor.
+- **Revoking** stops new deposits at once and keeps the key's past deposits attributed to it. Nothing can be
+  un-deposited: the store is content-addressed and has no delete.
+
+To deploy: apply `schema/migrations/007_deposit_keys.sql` with `scripts/migrate.py`, then deploy the code,
+then issue keys. The enforcing code reads `api_keys` on every deposit, so the migration comes first.
+

@@ -1,16 +1,31 @@
-"""Admin API: telemetry on claims, templates, tables and API traffic.
+"""Admin API: collections, claims, tables, API traffic and collection
+registration, for the admin console.
 
 JSON at /v1/admin/api/*, consumed by the admin console (/admin in frontend/,
-the repository's Next.js app). Every call must carry the console server's short-lived signed
-assertion (service/admin_gateway.py); responses are no-store. Admin reads
-never assert claims: the claim detail re-synthesizes a template-backed claim
-to show whether it still matches its content address, but writes nothing.
-Tables are read-only and allowlisted; there is no SQL editor and no write
-action beyond the console's sign-in audit events.
+the repository's Next.js app). Every call must carry the console server's
+short-lived signed assertion (service/admin_gateway.py); responses are
+no-store. The API knows collections only through their registered releases
+(service/collections/); no method is special here.
+
+Reads never assert or mint: the claim detail re-renders a collection claim to
+show whether it still matches its recorded id, and the example query runs a
+query template without serving claims. Tables are read-only and allowlisted;
+there is no SQL editor.
+
+What writes: the console's sign-in audit (POST /auth-events, purpose
+auth_event), and collection registration (POST /registration/jobs, purpose
+admin_write), which publishes a release from files on this machine's disk and
+audits the job's start and finish in admin_auth_events. Registration routes
+answer 403 unless the API process sets CLAIMS_COLLECTION_ROOTS, and every path
+they read must resolve inside those roots (service/collections/registration.py).
+POST /registration/check also needs admin_write but writes nothing.
+Deposit keys (service/api_keys.py) are issued and revoked here too: POST /keys
+and POST /keys/{key_id}/revoke, purpose admin_write, audited in
+admin_auth_events with the admin's email. A key is returned once, by the
+issue response, and is never stored, logged or listed.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -23,9 +38,14 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from . import admin_gateway as gateway
+from . import api_keys
 from . import db
-from . import pigean_template as tpl
 from . import telemetry
+from .collections import engine as cengine
+from .collections import identity as cidn
+from .collections import registration as reg
+from .collections import serve as cserve
+from .collections.manifest import ManifestError
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -74,6 +94,10 @@ def _cutoff(hours=0, days=0) -> str:
     return (datetime.now(timezone.utc) - timedelta(hours=hours, days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _loads(value):
+    return value if isinstance(value, (dict, list)) else json.loads(value)
+
+
 async def _read(fn, *args):
     """Run a database read off the event loop on its own connection."""
     def run():
@@ -87,38 +111,58 @@ async def _read(fn, *args):
 
 # --- shared reads -----------------------------------------------------------
 
-def _live(core, family):
-    return core._live_roster(family)
+# Each mint context (activity) belongs to one collection; several releases of
+# that collection may list it, hence DISTINCT.
+ACTIVITY_COLLECTION = (
+    "SELECT DISTINCT rm.activity_id AS activity_id, r.collection_key AS collection_key "
+    "FROM release_mint_contexts rm JOIN collection_releases r ON r.release_id = rm.release_id"
+)
+UNCOLLECTED = "NOT EXISTS (SELECT 1 FROM result_claims x WHERE x.claim_id = c.claim_id)"
 
 
-def _family_stats(con) -> list[dict]:
-    core = _core()
+def _release_claims(con, release_id) -> dict:
+    r = con.execute(
+        "SELECT COUNT(*) AS n, COUNT(o.id) AS minted FROM result_claims rc JOIN release_mint_contexts rm "
+        "ON rm.activity_id = rc.activity_id AND rm.release_id = ? LEFT JOIN dapper_objects o ON o.id = rc.claim_id",
+        (release_id,)).fetchone()
+    return {"mintable": int(r["n"]), "minted": int(r["minted"])}
+
+
+def _summaries(con, key=None) -> list[dict]:
+    """CollectionSummary for every collection (or one), from its current release."""
     out = []
-    for family, table in core.CLAIM_SOURCES:
-        r = con.execute(
-            "SELECT COUNT(*) AS implied, COUNT(o.id) AS minted, COALESCE(SUM(o.times_seen), 0) AS assertions, "
-            "MAX(COALESCE(o.last_seen_at, o.created_at)) AS last_at "
-            f"FROM {table} t LEFT JOIN dapper_objects o ON o.id = t.claim_id "
-            f"WHERE t.synthesis_inputs IS NOT NULL{_live(core, family)}"
-        ).fetchone()
-        out.append({"family": family, "table": table, "implied": int(r["implied"]), "minted": int(r["minted"]),
-                    "assertions": int(r["assertions"]), "lastAssertedAt": _ts(r["last_at"])})
+    sql = ("SELECT c.collection_key, c.title, c.description, c.current_release_id, c.updated_at, r.version, "
+           "r.published_at, r.git_commit, r.manifest FROM collections c LEFT JOIN collection_releases r "
+           "ON r.release_id = c.current_release_id")
+    rows = con.execute(sql + (" WHERE c.collection_key = ?" if key else "") + " ORDER BY c.collection_key",
+                       (key,) if key else ()).fetchall()
+    for c in rows:
+        manifest = _loads(c["manifest"])["manifest"] if c["manifest"] is not None else {}
+        rid = c["current_release_id"]
+        out.append({
+            "key": c["collection_key"], "title": c["title"], "description": c["description"],
+            "methods": manifest.get("methods", []), "owners": manifest.get("owners", []),
+            "currentRelease": None if c["version"] is None else {
+                "id": rid, "version": c["version"], "publishedAt": _ts(c["published_at"]), "gitCommit": c["git_commit"]},
+            "releases": int(con.execute("SELECT COUNT(*) AS n FROM collection_releases WHERE collection_key = ?",
+                                        (c["collection_key"],)).fetchone()["n"]),
+            "datasets": int(con.execute("SELECT COUNT(*) AS n FROM release_datasets WHERE release_id = ?",
+                                        (rid,)).fetchone()["n"]),
+            "claims": _release_claims(con, rid),
+            "updatedAt": _ts(c["updated_at"]),
+        })
     return out
 
 
-_NOT_TEMPLATE = (
-    " AND NOT EXISTS (SELECT 1 FROM pigean_gene_associations x WHERE x.claim_id = c.claim_id AND x.synthesis_inputs IS NOT NULL)"
-    " AND NOT EXISTS (SELECT 1 FROM pigean_gene_set_associations x WHERE x.claim_id = c.claim_id AND x.synthesis_inputs IS NOT NULL)"
-    " AND NOT EXISTS (SELECT 1 FROM pigean_gene_set_rosters x WHERE x.claim_id = c.claim_id AND x.synthesis_inputs IS NOT NULL)"
-)
+def _registration_info() -> dict:
+    allowed = reg.roots()
+    return {"enabled": bool(allowed), "roots": [str(r) for r in allowed]}
 
 
 def _overview(con) -> dict:
-    core = _core()
     started = time.perf_counter()
     con.execute("SELECT 1").fetchone()
     db_ms = round((time.perf_counter() - started) * 1000, 1)
-    families = _family_stats(con)
     stored = con.execute(
         "SELECT COUNT(*) AS n, COALESCE(SUM(times_seen), 0) AS s, MAX(COALESCE(last_seen_at, created_at)) AS last_at "
         "FROM dapper_objects WHERE class_name = 'Claim'"
@@ -131,8 +175,11 @@ def _overview(con) -> dict:
         "SELECT COUNT(*) AS n FROM dapper_objects WHERE class_name = 'Claim' AND COALESCE(last_seen_at, created_at) >= ?",
         (day,),
     ).fetchone()["n"]
-    deposited = con.execute(
-        "SELECT COUNT(*) AS n FROM claims c JOIN dapper_objects o ON o.id = c.claim_id WHERE 1 = 1" + _NOT_TEMPLATE
+    mintable = con.execute(
+        "SELECT COUNT(*) AS n FROM result_claims WHERE activity_id IN (SELECT activity_id FROM release_mint_contexts)"
+    ).fetchone()["n"]
+    uncollected = con.execute(
+        f"SELECT COUNT(*) AS n FROM claims c JOIN dapper_objects o ON o.id = c.claim_id WHERE {UNCOLLECTED}"
     ).fetchone()["n"]
     by_class = [
         {"className": r["class_name"], "count": int(r["n"])}
@@ -151,19 +198,6 @@ def _overview(con) -> dict:
     }
     timeline = [{"date": (since + timedelta(days=i)).isoformat(),
                  "minted": per_day.get((since + timedelta(days=i)).isoformat(), 0)} for i in range(30)]
-    phenotypes = []
-    for r in con.execute(
-        "SELECT t.phenotype, MIN(t.trait_group) AS trait_group, COUNT(*) AS genes, COUNT(o.id) AS minted "
-        "FROM pigean_gene_associations t LEFT JOIN dapper_objects o ON o.id = t.claim_id "
-        "WHERE t.synthesis_inputs IS NOT NULL GROUP BY t.phenotype ORDER BY genes DESC LIMIT 50"
-    ).fetchall():
-        view = core._phenotype_view(con, r["phenotype"], r["trait_group"])
-        sets = con.execute(
-            "SELECT COUNT(*) AS n FROM pigean_gene_set_associations WHERE phenotype = ? AND synthesis_inputs IS NOT NULL",
-            (r["phenotype"],),
-        ).fetchone()["n"]
-        phenotypes.append({"id": view["id"], "legacyId": view["legacyId"], "name": view["name"],
-                           "geneRows": int(r["genes"]), "setRows": int(sets), "mintedGeneClaims": int(r["minted"])})
     release = con.execute("SELECT * FROM kpn_trait_release WHERE release_key = 'current'").fetchone()
     trait_count = con.execute("SELECT COUNT(*) AS n FROM kpn_traits").fetchone()["n"]
     tele = telemetry.snapshot()
@@ -173,15 +207,13 @@ def _overview(con) -> dict:
                      "name": db.MYSQL_DATABASE if not con.dialect.sqlite else Path(db.DB_PATH).name,
                      "pingMs": db_ms},
         "claims": {
-            "implied": sum(f["implied"] for f in families),
-            "minted": int(stored["n"]), "deposited": int(deposited),
+            "mintable": int(mintable), "minted": int(stored["n"]), "uncollected": int(uncollected),
             "assertions": int(stored["s"]), "lastAssertedAt": _ts(stored["last_at"]),
             "minted24h": int(minted_24h), "asserted24h": int(asserted_24h),
         },
-        "families": families,
+        "collections": _summaries(con),
         "objectsByClass": by_class,
         "mintTimeline": timeline,
-        "phenotypes": phenotypes,
         "traitRegistry": None if release is None else {
             "version": release["version"], "commit": release["commit_sha"],
             "published": not (release["source_url"] or "").startswith("unpublished:"),
@@ -192,79 +224,287 @@ def _overview(con) -> dict:
                 "requests": sum(r["count"] for r in tele["routes"]),
                 "errors5xx": sum(r["errors5xx"] for r in tele["routes"]),
                 "graphql": {k: tele["graphql"][k] for k in ("requests", "ok", "failed", "minted", "reasserted")}},
+        "registration": _registration_info(),
     }
+
+
+# --- collections ------------------------------------------------------------
+
+def _file_facts(con, document: dict):
+    """File id -> {filename, sha256, sizeBytes, location} from the release's
+    DAPPER document, falling back to the stored File object."""
+    files = {f["id"]: f for f in document.get("files", [])}
+
+    def facts(file_id):
+        doc = files.get(file_id)
+        if doc is None and file_id:
+            row = con.execute("SELECT payload FROM dapper_objects WHERE id = ?", (file_id,)).fetchone()
+            doc = json.loads(row["payload"]) if row else {}
+        doc = doc or {}
+        return {"filename": doc.get("filename"), "sha256": doc.get("sha256"), "sizeBytes": doc.get("size_in_bytes"),
+                "location": doc.get("location")}
+    return facts
+
+
+def _dimension_views(con, dataset_ids) -> dict:
+    out: dict[str, dict] = {d: {} for d in dataset_ids}
+    ids = sorted(out)
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        for r in con.execute("SELECT dataset_id, dimension, value, label FROM dataset_dimensions WHERE dataset_id IN "
+                             f"({','.join('?' * len(chunk))}) ORDER BY dataset_id, dimension", chunk).fetchall():
+            out[r["dataset_id"]][r["dimension"]] = {"value": r["value"], "label": r["label"]}
+    return out
+
+
+def _collection(con, key, release) -> dict:
+    rel = cserve.release_row(con, key, release)
+    record = _loads(rel["manifest"])
+    m = record["manifest"]
+    document = _loads(rel["document"])
+    facts = _file_facts(con, document)
+    rid = rel["release_id"]
+    summary = _summaries(con, key)
+    if not summary:
+        raise cserve.CollectionNotFound(f"no collection {key!r}")
+    current = summary[0]["currentRelease"]["id"] if summary[0]["currentRelease"] else None
+    history = [{"id": r["release_id"], "version": r["version"], "publishedAt": _ts(r["published_at"]),
+                "gitCommit": r["git_commit"], "isCurrent": r["release_id"] == current}
+               for r in con.execute("SELECT release_id, version, published_at, git_commit FROM collection_releases "
+                                    "WHERE collection_key = ? ORDER BY published_at DESC, version DESC", (key,))]
+
+    # Datasets: dimensions, files, row/edge counts, claims, each in one grouped query.
+    ids = [r["dataset_id"] for r in con.execute(
+        "SELECT dataset_id FROM release_datasets WHERE release_id = ? ORDER BY dataset_id", (rid,)).fetchall()]
+    in_release = "dataset_id IN (SELECT dataset_id FROM release_datasets WHERE release_id = ?)"
+    dims = _dimension_views(con, ids)
+    files: dict[str, list] = {d: [] for d in ids}
+    for r in con.execute(f"SELECT dataset_id, role, file_id FROM dataset_files WHERE {in_release} "
+                         "ORDER BY dataset_id, role", (rid,)).fetchall():
+        files[r["dataset_id"]].append({"role": r["role"], "fileId": r["file_id"], **facts(r["file_id"])})
+    counts: dict[str, dict] = {d: {} for d in ids}
+    for table in ("result_rows", "result_edges"):
+        for r in con.execute(f"SELECT dataset_id, kind, COUNT(*) AS n FROM {table} WHERE {in_release} "
+                             "GROUP BY dataset_id, kind", (rid,)).fetchall():
+            counts[r["dataset_id"]][r["kind"]] = int(r["n"])
+    ds_claims = {r["dataset_id"]: {"mintable": int(r["n"]), "minted": int(r["minted"])} for r in con.execute(
+        "SELECT rc.dataset_id, COUNT(*) AS n, COUNT(o.id) AS minted FROM result_claims rc JOIN release_mint_contexts rm "
+        "ON rm.activity_id = rc.activity_id AND rm.release_id = ? LEFT JOIN dapper_objects o ON o.id = rc.claim_id "
+        "GROUP BY rc.dataset_id", (rid,)).fetchall()}
+    datasets = [{"id": d, "dimensions": dims[d], "files": files[d], "counts": counts[d],
+                 "claims": ds_claims.get(d, {"mintable": 0, "minted": 0})} for d in ids]
+
+    # Templates: per claim key, counts over this release's mint contexts.
+    activities: dict[str, list[str]] = {}
+    for r in con.execute("SELECT rm.activity_id, mc.template_file_id FROM release_mint_contexts rm JOIN mint_contexts "
+                         "mc ON mc.activity_id = rm.activity_id WHERE rm.release_id = ?", (rid,)).fetchall():
+        activities.setdefault(r["template_file_id"], []).append(r["activity_id"])
+    by_key: dict[tuple, dict] = {}
+    for r in con.execute(
+            "SELECT mc.template_file_id AS tf, rc.claim_key, COUNT(*) AS n, COUNT(o.id) AS minted, "
+            "COALESCE(SUM(o.times_seen), 0) AS assertions FROM result_claims rc JOIN release_mint_contexts rm "
+            "ON rm.activity_id = rc.activity_id AND rm.release_id = ? JOIN mint_contexts mc "
+            "ON mc.activity_id = rc.activity_id LEFT JOIN dapper_objects o ON o.id = rc.claim_id "
+            "GROUP BY mc.template_file_id, rc.claim_key", (rid,)).fetchall():
+        by_key[(r["tf"], r["claim_key"])] = {"mintable": int(r["n"]), "minted": int(r["minted"]),
+                                             "assertions": int(r["assertions"])}
+    templates = []
+    for t in record["templates"]:
+        doc, fid = t["doc"], t["file_id"]
+        claims = []
+        for c in doc["claims"]:
+            n = by_key.get((fid, c["key"]), {"mintable": 0, "minted": 0, "assertions": 0})
+            example = None
+            if n["minted"] and activities.get(fid):
+                acts = activities[fid]
+                row = con.execute(
+                    "SELECT o.payload FROM result_claims rc JOIN dapper_objects o ON o.id = rc.claim_id "
+                    f"WHERE rc.activity_id IN ({','.join('?' * len(acts))}) AND rc.claim_key = ? "
+                    "ORDER BY COALESCE(o.last_seen_at, o.created_at) DESC, o.id LIMIT 1", [*acts, c["key"]]).fetchone()
+                if row is not None:
+                    payload = json.loads(row["payload"])
+                    example = {"claimId": payload.get("id"), "statement": payload.get("statement")}
+            p = c["proposition"]
+            claims.append({"key": c["key"], "statement": c["statement"],
+                           "proposition": {"statement": p["statement"], "subject": p["subject"],
+                                           "relation": p["relation"], "object": p["object"], "kind": p["kind"]},
+                           "classify": c.get("classify"), "scores": c.get("scores", []), **n, "example": example})
+        templates.append({"name": doc["template"], "version": doc["version"], "for": doc["for"],
+                          "groupBy": doc.get("group_by"), "fileId": fid, "path": t["path"],
+                          "sha256": facts(fid)["sha256"], "claims": claims})
+
+    queries = []
+    for q in cserve.list_queries(con, key, rid):
+        path = record["queries"][q["name"]]["path"]
+        queries.append({"name": q["name"], "description": q["description"], "params": q["params"],
+                        "plan": q["plan"], "example": q["example"], "fileId": q["file_id"], "path": path,
+                        "sha256": facts(q["file_id"])["sha256"]})
+    manifest_id = (document.get("result_collections") or [{}])[0].get("has_manifest_file")
+    sources = [("manifest", key, "collection.yaml", manifest_id)] \
+        + [("template", t["doc"]["template"], t["path"], t["file_id"]) for t in record["templates"]] \
+        + [("query", name, q["path"], q["file_id"]) for name, q in sorted(record["queries"].items())]
+    source_files = []
+    for kind, name, path, fid in sources:
+        f = facts(fid)
+        source_files.append({"kind": kind, "name": name, "path": path, "fileId": fid, "sha256": f["sha256"],
+                             "sizeBytes": f["sizeBytes"]})
+    return {
+        **summary[0],
+        "dapperProfile": m["dapper_profile"],
+        "release": {"id": rid, "version": rel["version"], "publishedAt": _ts(rel["published_at"]),
+                    "gitCommit": rel["git_commit"], "isCurrent": rid == current},
+        "releaseHistory": history,
+        **reg.manifest_facets(m),
+        "datasets": datasets,
+        "templates": templates,
+        "queries": queries,
+        "sourceFiles": source_files,
+        "dapperDocumentUrl": f"{_core().PUBLIC_BASE}/v1/collections/{key}/releases/{rel['version']}/document",
+        "manifest": m,
+    }
+
+
+def _query_example(con, key, name, release) -> dict:
+    rel = cserve.release_row(con, key, release)
+    queries = _loads(rel["manifest"])["queries"]
+    if name not in queries:
+        raise cserve.CollectionNotFound(f"collection {key!r} has no query {name!r}")
+    # envelope=None: rows only; nothing is served, minted or asserted.
+    return cserve.run_query(con, key, name, queries[name]["doc"]["example"], release=rel["release_id"],
+                            envelope=None)
 
 
 # --- claims -----------------------------------------------------------------
 
 CLAIM_SORTS = {
-    "recent": "u.last_asserted_at DESC, u.claim_id",
-    "asserted": "u.times_seen DESC, u.claim_id",
-    "minted": "u.minted_at DESC, u.claim_id",
-    "subject": "COALESCE(u.subject, '~') ASC, u.claim_id",
+    "recent": ("last_asserted_at", "u.last_asserted_at DESC, u.claim_id"),
+    "asserted": ("times_seen", "u.times_seen DESC, u.claim_id"),
+    "minted": ("minted_at", "u.minted_at DESC, u.claim_id"),
+    "subject": ("subject", "COALESCE(u.subject, '~') ASC, u.claim_id"),
 }
-FAMILY_SUBJECT = {"gene": "t.gene", "gene_set": "t.gene_set", "roster": "t.gene_set"}
+# A group claim's subject is its group's label (the edges' to_value).
+GROUP_LABEL = ("(SELECT e.to_value FROM result_edges e WHERE e.dataset_id = rc.dataset_id "
+               "AND e.kind = rc.edge_kind AND e.to_id = rc.group_id LIMIT 1)")
+COLLECTED_COLUMNS = {
+    "claim_id": "rc.claim_id", "collection": "ac.collection_key", "claim_key": "rc.claim_key",
+    "kind": "COALESCE(rr.kind, rc.edge_kind)",
+    "subject": f"CASE WHEN rc.row_id IS NULL THEN {GROUP_LABEL} ELSE rr.subject_value END",
+    "dataset_id": "rc.dataset_id", "times_seen": "o.times_seen", "minted_at": "o.created_at",
+    "last_asserted_at": "COALESCE(o.last_seen_at, o.created_at)",
+}
+UNCOLLECTED_COLUMNS = {**{k: "NULL" for k in COLLECTED_COLUMNS}, "claim_id": "c.claim_id", "times_seen": "o.times_seen",
+                       "minted_at": "o.created_at", "last_asserted_at": "COALESCE(o.last_seen_at, o.created_at)"}
 
 
-def _claims(con, q, family, status, phenotype, sort, page, page_size) -> dict:
-    core = _core()
+def _claim_parts(con, columns, f, *, ids=None) -> tuple[str, list]:
+    """The UNION of collection claims and uncollected claims matching the
+    filters `f` (or exactly `ids`), selecting only `columns` and joining only
+    what those columns and filters need: 92k rows stay cheap to count and
+    sort, and the page's details are read for its rows alone."""
     parts, params = [], []
-    keys = core._phenotype_keys(con, phenotype) if phenotype else None
-    for fam, table in core.CLAIM_SOURCES:
-        if family and family != fam:
-            continue
-        where = ["t.synthesis_inputs IS NOT NULL"]
-        sub_params = []
-        if status == "minted":
-            where.append("o.id IS NOT NULL")
-        elif status == "unminted":
-            where.append("o.id IS NULL")
-        if keys:
-            where.append(f"t.phenotype {core._in(keys)}")
-            sub_params += keys
-        if q:
-            pattern = f"%{db.like_escape(q)}%"
-            where.append(f"({con.dialect.like_ci(FAMILY_SUBJECT[fam])} OR {con.dialect.like_ci('t.claim_id')})")
-            sub_params += [pattern, pattern]
+    marks = ",".join("?" * len(ids)) if ids else ""
+    if f["origin"] != "uncollected":
+        need_row = ids is not None or "subject" in columns or "kind" in columns
+        need_obj = ids is not None or f["status"] or {"times_seen", "minted_at", "last_asserted_at"} & set(columns)
+        where, sub = [], []
+        if ids is not None:
+            where.append(f"rc.claim_id IN ({marks})")
+            sub += ids
+        else:
+            for col, value in (("ac.collection_key", f["collection"]), ("rc.claim_key", f["claim_key"]),
+                               ("rc.dataset_id", f["dataset"])):
+                if value:
+                    where.append(f"{col} = ?")
+                    sub.append(value)
+            if f["status"]:
+                where.append("o.id IS NOT NULL" if f["status"] == "minted" else "o.id IS NULL")
+            if f["q"]:
+                # Rows first, then their claims: cheaper than matching every claim's joined subject.
+                where.append(f"(rc.row_id IN (SELECT row_id FROM result_rows WHERE {con.dialect.like_ci('subject_value')}) "
+                             "OR (rc.row_id IS NULL AND (rc.dataset_id, rc.edge_kind, rc.group_id) IN (SELECT "
+                             f"dataset_id, kind, to_id FROM result_edges WHERE {con.dialect.like_ci('to_value')})) "
+                             f"OR {con.dialect.like_ci('rc.claim_id')})")
+                sub += [f["pattern"]] * 3
         parts.append(
-            f"SELECT '{fam}' AS family, t.claim_id AS claim_id, {FAMILY_SUBJECT[fam]} AS subject, "
-            "t.phenotype AS phenotype, t.collection AS collection, o.times_seen AS times_seen, "
-            "o.created_at AS minted_at, COALESCE(o.last_seen_at, o.created_at) AS last_asserted_at "
-            f"FROM {table} t LEFT JOIN dapper_objects o ON o.id = t.claim_id "
-            f"WHERE {' AND '.join(where)}{core._live_roster(fam)}"
-        )
-        params += sub_params
-    if (not family or family == "deposited") and status != "unminted" and not keys:
-        where = "WHERE 1 = 1" + _NOT_TEMPLATE
-        sub_params = []
-        if q:
-            where += f" AND {con.dialect.like_ci('c.claim_id')}"
-            sub_params.append(f"%{db.like_escape(q)}%")
+            f"SELECT {', '.join(f'{COLLECTED_COLUMNS[c]} AS {c}' for c in columns)} "
+            f"FROM result_claims rc JOIN ({ACTIVITY_COLLECTION}) ac ON ac.activity_id = rc.activity_id"
+            + (" LEFT JOIN result_rows rr ON rr.row_id = rc.row_id" if need_row else "")
+            + (" LEFT JOIN dapper_objects o ON o.id = rc.claim_id" if need_obj else "")
+            + (f" WHERE {' AND '.join(where)}" if where else ""))
+        params += sub
+    only_collected = f["collection"] or f["claim_key"] or f["dataset"] or f["origin"] == "collection" \
+        or f["status"] == "unminted"
+    if not only_collected:
+        where, sub = [UNCOLLECTED], []
+        if ids is not None:
+            where.append(f"c.claim_id IN ({marks})")
+            sub += ids
+        elif f["q"]:
+            where.append(con.dialect.like_ci("c.claim_id"))
+            sub.append(f["pattern"])
         parts.append(
-            "SELECT 'deposited' AS family, c.claim_id AS claim_id, NULL AS subject, NULL AS phenotype, "
-            "NULL AS collection, o.times_seen AS times_seen, o.created_at AS minted_at, "
-            "COALESCE(o.last_seen_at, o.created_at) AS last_asserted_at "
-            f"FROM claims c JOIN dapper_objects o ON o.id = c.claim_id {where}"
-        )
-        params += sub_params
-    if not parts:
-        return {"total": 0, "page": page, "pageSize": page_size, "rows": []}
-    union = " UNION ALL ".join(parts)
+            f"SELECT {', '.join(f'{UNCOLLECTED_COLUMNS[c]} AS {c}' for c in columns)} "
+            f"FROM claims c JOIN dapper_objects o ON o.id = c.claim_id WHERE {' AND '.join(where)}")
+        params += sub
+    return " UNION ALL ".join(parts), params
+
+
+def _claims(con, q, collection, claim_key, dataset, origin, status, sort, page, page_size) -> dict:
+    f = {"q": q, "pattern": f"%{db.like_escape(q)}%" if q else None, "collection": collection,
+         "claim_key": claim_key, "dataset": dataset, "origin": origin, "status": status}
+    union, params = _claim_parts(con, ["claim_id"], f)
     total = con.execute(f"SELECT COUNT(*) AS n FROM ({union}) u", params).fetchone()["n"]
-    rows = con.execute(
-        f"SELECT * FROM ({union}) u ORDER BY {CLAIM_SORTS[sort]} LIMIT ? OFFSET ?",
-        params + [page_size, (page - 1) * page_size],
-    ).fetchall()
-    out = []
-    for r in rows:
-        r = _row(r)
-        out.append({
-            "claimId": r["claim_id"], "family": r["family"], "subject": r["subject"],
-            "phenotype": r["phenotype"], "collection": r["collection"],
-            "minted": r["times_seen"] is not None, "timesAsserted": int(r["times_seen"] or 0),
-            "mintedAt": _ts(r["minted_at"]), "lastAssertedAt": _ts(r["last_asserted_at"]),
-        })
+    key, order = CLAIM_SORTS[sort]
+    union, params = _claim_parts(con, ["claim_id", key], f)
+    ids = [r["claim_id"] for r in con.execute(
+        f"SELECT u.claim_id FROM ({union}) u ORDER BY {order} LIMIT ? OFFSET ?",
+        params + [page_size, (page - 1) * page_size]).fetchall()]
+    found = {}
+    if ids:
+        union, params = _claim_parts(con, list(COLLECTED_COLUMNS), f, ids=ids)
+        found = {r["claim_id"]: _row(r) for r in con.execute(f"SELECT * FROM ({union}) u", params).fetchall()}
+    rows = [found[i] for i in ids if i in found]
+    dims = _dimension_views(con, {r["dataset_id"] for r in rows if r["dataset_id"]})
+    out = [{
+        "claimId": r["claim_id"], "collection": r["collection"], "claimKey": r["claim_key"], "kind": r["kind"],
+        "subject": r["subject"], "datasetId": r["dataset_id"],
+        "dimensions": dims.get(r["dataset_id"]) if r["dataset_id"] else None,
+        "minted": r["times_seen"] is not None, "timesAsserted": int(r["times_seen"] or 0),
+        "mintedAt": _ts(r["minted_at"]), "lastAssertedAt": _ts(r["last_asserted_at"]),
+    } for r in rows]
     return {"total": int(total), "page": page, "pageSize": page_size, "rows": out}
+
+
+def _claim_source(con, rc) -> dict:
+    """Where a collection claim comes from: template, releases, dataset, row or group."""
+    ctx_row = con.execute("SELECT template_file_id, context FROM mint_contexts WHERE activity_id = ?",
+                          (rc["activity_id"],)).fetchone()
+    template = None
+    if ctx_row is not None:
+        t = _loads(ctx_row["context"])["template"]
+        template = {"name": t["template"], "version": t["version"], "fileId": ctx_row["template_file_id"]}
+    releases = con.execute(
+        "SELECT r.collection_key, r.version FROM release_mint_contexts rm JOIN collection_releases r "
+        "ON r.release_id = rm.release_id WHERE rm.activity_id = ? ORDER BY r.published_at, r.version",
+        (rc["activity_id"],)).fetchall()
+    row = group = None
+    if rc["row_id"] is not None:
+        r = con.execute("SELECT * FROM result_rows WHERE row_id = ?", (rc["row_id"],)).fetchone()
+        if r is not None:
+            row = {"rowId": r["row_id"], "kind": r["kind"],
+                   "subject": {"id": r["subject_id"], "value": r["subject_value"], "label": r["subject_label"]},
+                   "object": {"id": r["object_id"], "label": r["object_label"]},
+                   "columns": json.loads(r["row_json"]), "fileId": r["file_id"]}
+    else:
+        g = con.execute("SELECT MIN(to_value) AS label, COUNT(*) AS n FROM result_edges WHERE dataset_id = ? "
+                        "AND kind = ? AND to_id = ?", (rc["dataset_id"], rc["edge_kind"], rc["group_id"])).fetchone()
+        group = {"edgeKind": rc["edge_kind"], "id": rc["group_id"], "label": g["label"], "count": int(g["n"])}
+    return {
+        "collection": releases[0]["collection_key"] if releases else None,
+        "claimKey": rc["claim_key"], "template": template, "releases": [r["version"] for r in releases],
+        "dataset": {"id": rc["dataset_id"], "dimensions": _dimension_views(con, [rc["dataset_id"]])[rc["dataset_id"]]},
+        "row": row, "group": group,
+    }
 
 
 def _claim_detail(con, claim_id) -> dict | None:
@@ -275,112 +515,57 @@ def _claim_detail(con, claim_id) -> dict | None:
     ).fetchone()
     if stored is not None and stored["class_name"] != "Claim":
         return None
-    source = core._index_source(con, claim_id)
-    verification = {"templateBacked": source is not None, "synthesizes": None, "storedMatches": None, "error": None}
-    synthesized = None
-    if source is not None:
-        try:
-            synthesized = core.synthesize_claim(*source)
-            verification["synthesizes"] = True
-        except core.ClaimSynthesisError as exc:
-            verification.update(synthesizes=False, error=str(exc))
-    stored_doc = json.loads(stored["payload"]) if stored is not None else None
-    if stored_doc is not None and synthesized is not None:
-        verification["storedMatches"] = stored_doc == synthesized
-        if not verification["storedMatches"]:
-            verification["error"] = "the stored document differs from the claim its index row implies"
-    claim = stored_doc or synthesized
-    if claim is None:
+    rc = con.execute("SELECT * FROM result_claims WHERE claim_id = ?", (claim_id,)).fetchone()
+    if stored is None and rc is None:
         return None
+    verification = {"collectionBacked": rc is not None, "renders": None, "storedMatches": None, "error": None}
+    rendered = None
+    if rc is not None:
+        # serve.render_claim is pure: inspecting a claim never mints or asserts it.
+        try:
+            rendered = cserve.render_claim(con, rc)
+            verification["renders"] = True
+        except (cserve.ClaimRenderError, cengine.TemplateError, cidn.MintError) as exc:
+            verification.update(renders=False, error=str(exc))
+    stored_doc = json.loads(stored["payload"]) if stored is not None else None
+    if stored_doc is not None and rendered is not None:
+        verification["storedMatches"] = stored_doc == rendered
+        if not verification["storedMatches"]:
+            verification["error"] = "the stored document differs from the claim its row re-renders"
+    claim = stored_doc or rendered or {}
+    source = _claim_source(con, rc) if rc is not None else None
     prop_id = claim.get("proposition") if isinstance(claim.get("proposition"), str) else None
     proposition = core._fetch_payload(con, prop_id) if prop_id else None
     score_ids = core._id_list(claim.get("has_score"))
     score_docs = core._fetch_payloads(con, score_ids)
     evidence_ids = core._id_list(claim.get("has_evidence"))
     evidence_docs = core._fetch_payloads(con, evidence_ids)
-    index_row = None
-    if source is not None:
-        row = _row(source[1])
-        inputs = row.pop("synthesis_inputs", None)
-        index_row = {"family": source[0], "columns": row,
-                     "synthesisInputs": inputs if isinstance(inputs, dict) else json.loads(inputs) if inputs else None}
-    registered = con.execute("SELECT method, deposited_at FROM claims WHERE claim_id = ?", (claim_id,)).fetchone()
+    registered = con.execute("SELECT method FROM claims WHERE claim_id = ?", (claim_id,)).fetchone()
     assessing = 0
     if prop_id:
         assessing = con.execute("SELECT COUNT(*) AS n FROM claims WHERE proposition_id = ?", (prop_id,)).fetchone()["n"]
+    collection = source["collection"] if source else None
     return {
         "claimId": claim_id,
         "minted": stored is not None,
-        "identityProfile": stored["identity_profile"] if stored is not None else tpl.IDENTITY_PROFILE,
+        "identityProfile": stored["identity_profile"] if stored is not None else cidn.PROFILE,
         "timesAsserted": int(stored["times_seen"]) if stored is not None else 0,
         "mintedAt": _ts(stored["created_at"]) if stored is not None else None,
         "lastAssertedAt": _ts(stored["last_seen_at"] or stored["created_at"]) if stored is not None else None,
-        "method": registered["method"] if registered is not None else (tpl.METHOD if source else None),
+        # Serving records a collection claim's method as its collection key.
+        "method": registered["method"] if registered is not None else collection,
+        "collection": collection,
+        "claimKey": rc["claim_key"] if rc is not None else None,
         "triple": core._triple_of(proposition) if proposition else None,
         "statement": claim.get("statement"),
         "verification": verification,
-        "claim": claim,
+        "claim": claim or None,
         "proposition": proposition,
         "scores": [score_docs.get(s) or {"id": s, "missing": True} for s in score_ids],
         "evidence": [evidence_docs.get(e) or {"id": e, "missing": True} for e in evidence_ids],
-        "indexRow": index_row,
+        "source": source,
         "claimsAssessingProposition": int(assessing),
         "resolverUrl": core._resolver_url(claim_id),
-    }
-
-
-# --- templates ----------------------------------------------------------------
-
-def _file_info(path: Path) -> dict:
-    data = path.read_bytes()
-    return {"path": str(path.relative_to(ROOT)), "sha256": hashlib.sha256(data).hexdigest(),
-            "lines": data.count(b"\n"), "bytes": len(data)}
-
-
-FAMILY_METRICS = {"gene": list(tpl.GENE_METRICS), "gene_set": list(tpl.SET_METRICS), "roster": []}
-FAMILY_RELATION = {"gene": "associated_with", "gene_set": "associated_with", "roster": "has_members"}
-
-
-def _templates(con) -> dict:
-    core = _core()
-    stats = {f["family"]: f for f in _family_stats(con)}
-    families = []
-    for family, table in core.CLAIM_SOURCES:
-        example = con.execute(
-            f"SELECT o.payload FROM {table} t JOIN dapper_objects o ON o.id = t.claim_id "
-            f"WHERE t.synthesis_inputs IS NOT NULL{core._live_roster(family)} "
-            "ORDER BY COALESCE(o.last_seen_at, o.created_at) DESC LIMIT 1"
-        ).fetchone()
-        doc = json.loads(example["payload"]) if example else None
-        families.append({**stats[family], "relation": FAMILY_RELATION[family], "metrics": FAMILY_METRICS[family],
-                         "example": {"claimId": doc["id"], "statement": doc.get("statement")} if doc else None})
-    metrics = []
-    for name, sem in core.PIGEAN_METRICS.items():
-        kind, interpretation = tpl.INTERP.get(name, (None, None))
-        metrics.append({"metric": name, "scoreKind": sem["score_kind"], "scale": sem["scale"], "better": sem["better"],
-                        "confirmed": sem["confirmed"], "description": sem["description"],
-                        "claimInterpretation": interpretation,
-                        "families": [f for f, ms in FAMILY_METRICS.items() if name in ms],
-                        "kindAgrees": kind == sem["score_kind"]})
-    queries = []
-    qdir = ROOT / "api" / "graphql" / "queries"
-    for path in sorted(qdir.glob("*.graphql")):
-        variables = path.with_suffix(".variables.json")
-        fixture = path.with_name(path.stem + ".fixture-response.json")
-        text = path.read_text()
-        queries.append({**_file_info(path), "name": path.stem, "document": text,
-                        "variables": json.loads(variables.read_text()) if variables.exists() else None,
-                        "hasFixture": fixture.exists()})
-    return {
-        "methods": [{
-            "name": tpl.METHOD, "identityProfile": tpl.IDENTITY_PROFILE, "dapperProfile": core.DAPPER_PROFILE,
-            "contractVersion": core.CONTRACT_VERSION,
-            "template": _file_info(Path(tpl.__file__)),
-            "graphqlModule": _file_info(ROOT / "api" / "graphql" / "methods" / f"{tpl.METHOD}.graphql"),
-            "families": families, "metrics": metrics,
-        }],
-        "coreSchema": _file_info(ROOT / "api" / "graphql" / "core.graphql"),
-        "queryTemplates": queries,
     }
 
 
@@ -391,7 +576,8 @@ def _tables_known() -> list[str]:
     return re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", db.SQLITE_DDL)
 
 
-HIDDEN_COLUMNS: dict[str, set[str]] = {}
+# Never served by the table browser. A deposit key's hash is not the key, but it is what authenticates one.
+HIDDEN_COLUMNS: dict[str, set[str]] = {"api_keys": {"key_sha256"}}
 _table_cache: dict = {"at": 0.0, "data": None}
 TABLE_CACHE_SECONDS = 30
 
@@ -523,6 +709,7 @@ def _activity(con) -> dict:
             "approvedAdmins": sorted(gateway.ADMIN_EMAILS)}
 
 
+
 # --- API routes -----------------------------------------------------------------
 
 @router.get("/me")
@@ -535,18 +722,50 @@ async def overview(_: dict = Depends(gateway.require_admin)):
     return _json(await _read(_overview))
 
 
+@router.get("/collections")
+async def collections(_: dict = Depends(gateway.require_admin)):
+    return _json({"collections": await _read(_summaries)})
+
+
+def _not_found(fn, *args):
+    def run(con):
+        try:
+            return fn(con, *args)
+        except cserve.CollectionNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ManifestError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    return run
+
+
+@router.get("/collections/{key}")
+async def collection(key: str, _: dict = Depends(gateway.require_admin),
+                     release: str | None = Query(None, max_length=128)):
+    return _json(await _read(_not_found(_collection, key, release)))
+
+
+@router.get("/collections/{key}/queries/{name}/example")
+async def query_example(key: str, name: str, _: dict = Depends(gateway.require_admin),
+                        release: str | None = Query(None, max_length=128)):
+    return _json(await _read(_not_found(_query_example, key, name, release)))
+
+
 @router.get("/claims")
 async def claims(
     _: dict = Depends(gateway.require_admin),
     q: str | None = Query(None, max_length=200),
-    family: str | None = Query(None, pattern="^(gene|gene_set|roster|deposited)$"),
+    collection: str | None = Query(None, max_length=128),
+    claim_key: str | None = Query(None, max_length=64),
+    dataset: str | None = Query(None, max_length=128),
+    origin: str | None = Query(None, pattern="^(collection|uncollected)$"),
     status: str | None = Query(None, pattern="^(minted|unminted)$"),
-    phenotype: str | None = Query(None, max_length=128),
     sort: str = Query("recent", pattern="^(recent|asserted|minted|subject)$"),
     page: int = Query(1, ge=1, le=100_000),
     page_size: int = Query(25, ge=1, le=100),
 ):
-    return _json(await _read(_claims, (q or "").strip() or None, family, status, (phenotype or "").strip() or None,
+    def clean(v):
+        return (v or "").strip() or None
+    return _json(await _read(_claims, clean(q), clean(collection), clean(claim_key), clean(dataset), origin, status,
                              sort, page, page_size))
 
 
@@ -554,13 +773,8 @@ async def claims(
 async def claim_detail(claim_id: str, _: dict = Depends(gateway.require_admin)):
     detail = await _read(_claim_detail, claim_id)
     if detail is None:
-        raise HTTPException(status_code=404, detail="No claim with this ID is stored or implied.")
+        raise HTTPException(status_code=404, detail="No claim with this ID is stored or mintable.")
     return _json(detail)
-
-
-@router.get("/templates")
-async def templates(_: dict = Depends(gateway.require_admin)):
-    return _json(await _read(_templates))
 
 
 @router.get("/tables")
@@ -610,3 +824,132 @@ async def auth_event(event: AuthEvent, _: dict = Depends(gateway.require_auth_ev
     """The console's sign-in audit: approved sign-ins, denials, sign-outs."""
     await run_in_threadpool(_record_event, event)
     return Response(status_code=204, headers=NO_STORE)
+
+
+# --- deposit keys ------------------------------------------------------------------
+
+class KeyRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=api_keys.MAX_NAME)
+
+
+def _key_event(con, event: str, email: str, key_id: str, name: str) -> None:
+    """Audit row in the same transaction as the key change. The key itself is never written anywhere."""
+    con.execute(
+        "INSERT INTO admin_auth_events (at, event, email, detail) VALUES (?, ?, ?, ?)",
+        (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), event, email, f"{key_id} {name}"[:255]),
+    )
+
+
+def _key_row(row: dict) -> dict:
+    return {"keyId": row["key_id"], "name": row["name"], "createdAt": _ts(row["created_at"]), "createdBy": row["created_by"],
+            "revokedAt": _ts(row["revoked_at"]), "revokedBy": row["revoked_by"], "deposits": int(row["deposits"]),
+            "lastDepositAt": _ts(row["last_deposit_at"])}
+
+
+@router.get("/keys")
+async def keys_list(_: dict = Depends(gateway.require_admin)):
+    """Deposit keys with how much each has deposited. Never the key or its hash."""
+    rows = await _read(api_keys.list_keys)
+    return _json({"asOf": _ts(datetime.now(timezone.utc)), "keys": [_key_row(row) for row in rows]})
+
+
+@router.post("/keys")
+async def keys_issue(body: KeyRequest, admin: dict = Depends(gateway.require_admin_write)):
+    """Issue a deposit key. This response is the only time the key is shown; the service keeps its SHA-256."""
+    def run():
+        con = db.connect()
+        try:
+            with con:
+                issued = api_keys.issue(con, body.name, admin["email"])
+                _key_event(con, "api_key_issued", admin["email"], issued["key_id"], issued["name"])
+            return issued
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        finally:
+            con.close()
+    issued = await run_in_threadpool(run)
+    return _json({"keyId": issued["key_id"], "name": issued["name"], "key": issued["key"]}, status=201)
+
+
+@router.post("/keys/{key_id}/revoke")
+async def keys_revoke(key_id: str, admin: dict = Depends(gateway.require_admin_write)):
+    """Stop a key depositing. Its past deposits stay attributed to it."""
+    if not api_keys.KEY_ID_RE.match(key_id):
+        raise HTTPException(status_code=404, detail="Unknown key.")
+    def run():
+        con = db.connect()
+        try:
+            with con:
+                row = con.execute("SELECT name, revoked_at FROM api_keys WHERE key_id = ?", (key_id,)).fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Unknown key.")
+                if row["revoked_at"] is not None or not api_keys.revoke(con, key_id, admin["email"]):
+                    raise HTTPException(status_code=409, detail="This key is already revoked.")
+                _key_event(con, "api_key_revoked", admin["email"], key_id, row["name"])
+        finally:
+            con.close()
+    await run_in_threadpool(run)
+    return _json({"keyId": key_id, "revoked": True})
+
+
+# --- registration (the Add collection flow) --------------------------------------
+
+def _registration_enabled() -> None:
+    """Runs after the gateway dependency: off unless CLAIMS_COLLECTION_ROOTS is set."""
+    if not reg.roots():
+        raise HTTPException(status_code=403, detail=reg.DISABLED)
+
+
+class CheckRequest(BaseModel):
+    collectionDir: str = Field(min_length=1, max_length=4096)
+    releaseFile: str = Field(min_length=1, max_length=4096)
+    sample: int = Field(3, ge=0, le=10)
+
+
+class JobRequest(BaseModel):
+    collectionDir: str = Field(min_length=1, max_length=4096)
+    releaseFile: str = Field(min_length=1, max_length=4096)
+    requireClean: bool = False
+
+
+@router.get("/registration/sources")
+async def registration_sources(_: dict = Depends(gateway.require_admin)):
+    return _json(await run_in_threadpool(reg.sources))
+
+
+@router.post("/registration/check")
+async def registration_check(body: CheckRequest, _: dict = Depends(gateway.require_admin_write),
+                             __: None = Depends(_registration_enabled)):
+    def run(con):
+        try:
+            return reg.check(con, body.collectionDir, body.releaseFile, body.sample)
+        except reg.OutsideRoots as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    return _json(await _read(run))
+
+
+@router.post("/registration/jobs")
+async def registration_start(body: JobRequest, admin: dict = Depends(gateway.require_admin_write),
+                             __: None = Depends(_registration_enabled)):
+    def run():
+        try:
+            return reg.start_job(body.collectionDir, body.releaseFile, body.requireClean, admin["email"])
+        except reg.OutsideRoots as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except reg.JobRunning as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+    return _json(await run_in_threadpool(run), status=202)
+
+
+@router.get("/registration/jobs")
+async def registration_jobs(_: dict = Depends(gateway.require_admin), __: None = Depends(_registration_enabled)):
+    return _json({"jobs": reg.jobs()})
+
+
+@router.get("/registration/jobs/{job_id}")
+async def registration_job(job_id: str, _: dict = Depends(gateway.require_admin),
+                           __: None = Depends(_registration_enabled)):
+    found = reg.job(job_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="No such job (jobs are kept in memory and lost on restart).")
+    return _json(found)

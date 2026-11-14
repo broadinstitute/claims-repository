@@ -1,0 +1,94 @@
+# Claims minted from each gene_phenotype row: one measurement claim carrying
+# the raw scores, and one evidence-tier claim per gene metric under the
+# declared gene-evidence-tiers rule.
+template: gene
+version: 1.0.0
+for: gene_phenotype
+
+claims:
+  - key: measurement
+    proposition:
+      statement: "The gene {subject.label} is associated with {object.label}."
+      subject: "{subject.id}"
+      relation: associated_with
+      object: "{object.id}"
+      scope: "PIGEAN gene-level assessment; trait_group={row.trait_group}; gene-set library {dataset.library}."
+      kind: RESULT
+    name: "PIGEAN measurement: {subject.label} - {object.label}"
+    statement: >-
+      PIGEAN assessed the association of {subject.label} with {object.label}
+      (combined {metric.combined.text}; log BF {metric.log_bf.text}; prior
+      {metric.prior.text}) over the {dataset.library} gene-set library.
+    scores: [combined, log_bf, prior]
+    evidence:
+      per_metric: [combined, log_bf, prior]
+      name: "PIGEAN {metric.name} evidence: {subject.label} - {object.label}"
+      explanation: >-
+        PIGEAN reported {metric.name} = {metric.text} for this association in
+        {file.name}; the value locator pins the serialized number's byte span,
+        so the measurement is re-verifiable against the file's sha256.
+      evidence_source: "PIGEAN result file {file.name}"
+    source_locator: "{file.name}#gene={subject.label}"
+
+  - key: tier-combined
+    focus: combined
+    classify: gene-evidence-tiers
+    proposition:
+      statement: "The gene {subject.label} is relevant to {object.label}."
+      subject: "{subject.id}"
+      relation: relevant_to
+      object: "{object.id}"
+      kind: BIOLOGICAL_INTERPRETATION
+    name: "PIGEAN combined tier: {subject.label} - {object.label}"
+    statement: >-
+      {subject.label} is relevant to {object.label} with {tier.label} evidence
+      based on the PIGEAN {dataset.library} model because its combined score
+      is {metric.text}.
+    scores: [combined]
+    evidence: &tier_evidence
+      per_metric: [focus]
+      source_claims: [measurement]
+      name: "{claim.key} evidence: {subject.label} - {object.label}"
+      explanation: >-
+        The {metric.name} score {metric.text} falls in the '{tier.label}' tier
+        of rule {rule.name} v{rule.version}.
+      context: "PIGEAN {dataset.library} run for {object.label} (trait_group {row.trait_group})."
+      assumptions: true
+      evidence_source: "PIGEAN result file {file.name}"
+    source_locator: "{file.name}#gene={subject.label}"
+
+  - key: tier-direct
+    focus: log_bf
+    classify: gene-evidence-tiers
+    proposition:
+      statement: "The gene {subject.label} is genetically associated with {object.label}."
+      subject: "{subject.id}"
+      relation: genetically_associated_with
+      object: "{object.id}"
+      kind: BIOLOGICAL_INTERPRETATION
+    name: "PIGEAN direct tier: {subject.label} - {object.label}"
+    statement: >-
+      {subject.label} is genetically relevant to {object.label} with
+      {tier.label} evidence based on the PIGEAN {dataset.library} model because
+      its direct (log Bayes factor) score is {metric.text}.
+    scores: [log_bf]
+    evidence: *tier_evidence
+    source_locator: "{file.name}#gene={subject.label}"
+
+  - key: tier-indirect
+    focus: prior
+    classify: gene-evidence-tiers
+    proposition:
+      statement: "The gene {subject.label} is functionally relevant to {object.label}."
+      subject: "{subject.id}"
+      relation: functionally_relevant_to
+      object: "{object.id}"
+      kind: BIOLOGICAL_INTERPRETATION
+    name: "PIGEAN indirect tier: {subject.label} - {object.label}"
+    statement: >-
+      {subject.label} is functionally relevant to {object.label} with
+      {tier.label} evidence based on the PIGEAN {dataset.library} model because
+      its indirect (gene-set prior) score is {metric.text}.
+    scores: [prior]
+    evidence: *tier_evidence
+    source_locator: "{file.name}#gene={subject.label}"

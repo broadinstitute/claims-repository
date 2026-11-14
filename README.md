@@ -19,7 +19,7 @@ that composes `core + methods/*` at startup and knows nothing method-specific. S
   typed metrics, filters, order enums, and the `pigeanValidationChallenge` root field.
 - [api/graphql/queries/](api/graphql/queries/) — the persisted Day-10 IBD validation-challenge
   query, its researcher-editable variables, and a synthetic fixture response for UI mocks.
-- [api/openapi.yaml](api/openapi.yaml) — REST: health, vocabulary, deposit (`POST /v1/claims`),
+- [api/openapi.yaml](api/openapi.yaml) — REST: health, vocabulary, deposit (`POST /v1/deposits`: any DAPPER class, validated; needs a key),
   and objects only — the `/v1/objects/{id}` resolver, `/v1/objects` list, `/v1/objects/search`
   — plus the `/v1/graphql` endpoint shell. Browsable at `/v1/docs`. Deposit example:
   [api/examples/](api/examples/).
@@ -28,8 +28,10 @@ that composes `core + methods/*` at startup and knows nothing method-specific. S
   queried** (synthesized from index rows + the method template, verified on every serve from a live index row).
 - [docs/query-graph-design.md](docs/query-graph-design.md) — execution semantics, storage design
   (MySQL, reveal-style), QA deployment, and open Day-2 decisions.
+- [docs/collections.md](docs/collections.md) — collections as the general unit, so any method
+  can register files, claim templates and queries without service code (phases 1–4 built; §12)
 - [docs/admin-console.md](docs/admin-console.md) — the admin console (`/admin` in [frontend/](frontend/), the
-  repository's Next.js frontend on Vercel): claims, templates, tables and API activity, behind Google sign-in for approved admins,
+  repository's Next.js frontend on Vercel): collections, claims, tables and API activity, plus a local-only flow to register a collection, behind Google sign-in for approved admins,
   reading this service's `/v1/admin/api/*` through signed server-to-server assertions.
 
 All fixtures are synthetic: `.SYNTH…` IDs are placeholders for computed DAPPER content addresses,
@@ -51,6 +53,34 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 ```bash
 .venv/bin/python -m uvicorn service.app:app --port 8100
+```
+
+Deposits need a key ([docs/inputs-and-outputs.md](docs/inputs-and-outputs.md#deposit-keys)); issue one into the
+local database and send it as `X-API-Key`:
+
+```bash
+.venv/bin/python scripts/api_key.py issue "local development"
+```
+
+Collections (the general path, [docs/collections.md](docs/collections.md)): publish the PIGEAN
+collection from the toolkit, then ask it about itself and run its query.
+
+```bash
+.venv/bin/python scripts/publish_collection.py ../kpn-dapper-toolkit/collections/pigean \
+  --release ../kpn-dapper-toolkit/collections/pigean/releases/2026.11.0.yaml
+```
+
+A collection is identified by the UUID in its manifest. The short name in these URLs (`pigean`) is its
+handle, and it resolves to the UUID. Responses identify the collection by that UUID (`id`), with the
+handle as `key`.
+
+```bash
+curl -s localhost:8100/v1/collections/pigean
+```
+
+```bash
+curl -s -X POST localhost:8100/v1/collections/pigean/queries/top-genes-with-sets:run \
+  -H 'content-type: application/json' -d '{"variables": {"trait": "IBD", "priorMax": 0.5, "topGenes": 5}}'
 ```
 
 `load_kpn_traits.py` loads the KPN trait registry from a pinned release of

@@ -1,0 +1,71 @@
+# Claims minted from each gene_set_phenotype row. The joint (beta) and
+# marginal (beta_uncorrected) tier claims are two assessments of ONE
+# proposition.
+template: gene_set
+version: 1.0.0
+for: gene_set_phenotype
+
+claims:
+  - key: measurement
+    proposition:
+      statement: "The gene set {subject.label} is associated with {object.label}."
+      subject: "{subject.id}"
+      relation: associated_with
+      object: "{object.id}"
+      scope: "PIGEAN gene-set-level assessment; trait_group={row.trait_group}; gene-set library {dataset.library}."
+      kind: RESULT
+    name: "PIGEAN measurement: {subject.label} - {object.label}"
+    statement: >-
+      PIGEAN assessed the association of gene set {subject.label} with
+      {object.label} (beta {metric.beta.text}; beta_uncorrected
+      {metric.beta_uncorrected.text}).
+    scores: [beta, beta_uncorrected]
+    evidence:
+      per_metric: [beta, beta_uncorrected]
+      name: "PIGEAN {metric.name} evidence: {subject.label} - {object.label}"
+      explanation: >-
+        PIGEAN reported {metric.name} = {metric.text} for this association in
+        {file.name}; the value locator pins the serialized number's byte span,
+        so the measurement is re-verifiable against the file's sha256.
+      evidence_source: "PIGEAN result file {file.name}"
+    source_locator: "{file.name}#gene_set={subject.label}"
+
+  - key: tier-joint
+    focus: beta
+    classify: gene-set-effect-tiers
+    proposition: &relevance
+      statement: "The gene set {subject.label} is relevant to {object.label}."
+      subject: "{subject.id}"
+      relation: relevant_to
+      object: "{object.id}"
+      kind: BIOLOGICAL_INTERPRETATION
+    name: "PIGEAN joint tier: {subject.label} - {object.label}"
+    statement: >-
+      The gene set {subject.label} is relevant to {object.label} with
+      {tier.label} evidence based on the PIGEAN {dataset.library} model because
+      its joint effect (beta) is {metric.text}.
+    scores: [beta]
+    evidence: &tier_evidence
+      per_metric: [focus]
+      source_claims: [measurement]
+      name: "{claim.key} evidence: {subject.label} - {object.label}"
+      explanation: >-
+        The {metric.name} effect {metric.text} falls in the '{tier.label}' tier
+        of rule {rule.name} v{rule.version}.
+      context: "PIGEAN {dataset.library} run for {object.label} (trait_group {row.trait_group})."
+      assumptions: true
+      evidence_source: "PIGEAN result file {file.name}"
+    source_locator: "{file.name}#gene_set={subject.label}"
+
+  - key: tier-marginal
+    focus: beta_uncorrected
+    classify: gene-set-effect-tiers
+    proposition: *relevance
+    name: "PIGEAN marginal tier: {subject.label} - {object.label}"
+    statement: >-
+      The gene set {subject.label} is relevant to {object.label} with
+      {tier.label} evidence based on the PIGEAN {dataset.library} model because
+      its marginal effect (beta_uncorrected) is {metric.text}.
+    scores: [beta_uncorrected]
+    evidence: *tier_evidence
+    source_locator: "{file.name}#gene_set={subject.label}"

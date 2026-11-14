@@ -178,6 +178,42 @@ CREATE TABLE IF NOT EXISTS kpn_trait_release (
   mapping_count INTEGER NOT NULL,
   loaded_at TEXT DEFAULT (datetime('now'))
 );
+-- Deposit keys (007_deposit_keys.sql, service/api_keys.py): who may write, and
+-- which key sent which bundle. Only a key's SHA-256 is stored.
+CREATE TABLE IF NOT EXISTS api_keys (
+  key_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  key_sha256 TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  created_by TEXT,
+  revoked_at TEXT,
+  revoked_by TEXT
+);
+CREATE TABLE IF NOT EXISTS deposits (
+  deposit_id TEXT PRIMARY KEY,
+  key_id TEXT NOT NULL,
+  received_at TEXT NOT NULL,
+  object_count INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deposits_key ON deposits (key_id, received_at);
+CREATE TABLE IF NOT EXISTS deposit_objects (
+  deposit_id TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  PRIMARY KEY (deposit_id, object_id)
+);
+CREATE INDEX IF NOT EXISTS idx_dobj_object ON deposit_objects (object_id);
+CREATE TABLE IF NOT EXISTS deposit_edges (
+  deposit_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  class_name TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (deposit_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_dedge_subject ON deposit_edges (subject_id);
+CREATE INDEX IF NOT EXISTS idx_dedge_object ON deposit_edges (object_id);
 -- Admin console sign-in audit (written by the console's server through
 -- POST /v1/admin/api/auth-events; service/admin.py).
 CREATE TABLE IF NOT EXISTS admin_auth_events (
@@ -188,6 +224,104 @@ CREATE TABLE IF NOT EXISTS admin_auth_events (
   detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_aae_at ON admin_auth_events (at);
+-- Collections (006_collections.sql): any method's results, registered as data.
+CREATE TABLE IF NOT EXISTS collections (
+  collection_key TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT,
+  current_release_id TEXT,
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS collection_releases (
+  release_id TEXT PRIMARY KEY,
+  collection_key TEXT NOT NULL,
+  version TEXT NOT NULL,
+  manifest TEXT NOT NULL,
+  document TEXT NOT NULL,
+  git_commit TEXT,
+  published_at TEXT DEFAULT (datetime('now')),
+  UNIQUE (collection_key, version)
+);
+CREATE TABLE IF NOT EXISTS release_datasets (
+  release_id TEXT NOT NULL,
+  dataset_id TEXT NOT NULL,
+  PRIMARY KEY (release_id, dataset_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rd_dataset ON release_datasets (dataset_id);
+CREATE TABLE IF NOT EXISTS dataset_dimensions (
+  dataset_id TEXT NOT NULL,
+  dimension TEXT NOT NULL,
+  value TEXT NOT NULL,
+  label TEXT,
+  PRIMARY KEY (dataset_id, dimension)
+);
+CREATE INDEX IF NOT EXISTS idx_dd_value ON dataset_dimensions (dimension, value);
+CREATE TABLE IF NOT EXISTS dataset_files (
+  dataset_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  file_id TEXT NOT NULL,
+  PRIMARY KEY (dataset_id, role)
+);
+CREATE TABLE IF NOT EXISTS mint_contexts (
+  activity_id TEXT PRIMARY KEY,
+  template_file_id TEXT NOT NULL,
+  result_file_id TEXT NOT NULL,
+  context TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS release_mint_contexts (
+  release_id TEXT NOT NULL,
+  activity_id TEXT NOT NULL,
+  dataset_id TEXT NOT NULL,
+  PRIMARY KEY (release_id, activity_id)
+);
+CREATE TABLE IF NOT EXISTS result_rows (
+  row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  dataset_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  subject_value TEXT NOT NULL,
+  subject_label TEXT,
+  object_id TEXT NOT NULL,
+  object_label TEXT,
+  file_id TEXT NOT NULL,
+  row_json TEXT NOT NULL,
+  spans TEXT NOT NULL,
+  UNIQUE (dataset_id, kind, subject_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rr_value ON result_rows (kind, subject_value);
+CREATE TABLE IF NOT EXISTS result_metrics (
+  row_id INTEGER NOT NULL,
+  dataset_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  metric TEXT NOT NULL,
+  value REAL NOT NULL,
+  PRIMARY KEY (row_id, metric)
+);
+CREATE INDEX IF NOT EXISTS idx_rm_order ON result_metrics (dataset_id, kind, metric, value);
+CREATE TABLE IF NOT EXISTS result_edges (
+  dataset_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  from_id TEXT NOT NULL,
+  to_id TEXT NOT NULL,
+  from_value TEXT NOT NULL,
+  to_value TEXT NOT NULL,
+  PRIMARY KEY (dataset_id, kind, from_id, to_id)
+);
+CREATE INDEX IF NOT EXISTS idx_re_to ON result_edges (dataset_id, kind, to_id);
+CREATE TABLE IF NOT EXISTS result_claims (
+  claim_id TEXT PRIMARY KEY,
+  activity_id TEXT NOT NULL,
+  claim_key TEXT NOT NULL,
+  dataset_id TEXT NOT NULL,
+  row_id INTEGER,
+  edge_kind TEXT,
+  group_id TEXT,
+  proposition_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rc_row ON result_claims (row_id);
+CREATE INDEX IF NOT EXISTS idx_rc_group ON result_claims (dataset_id, edge_kind, group_id);
+CREATE INDEX IF NOT EXISTS idx_rc_prop ON result_claims (proposition_id);
+CREATE INDEX IF NOT EXISTS idx_rc_activity ON result_claims (activity_id, claim_key);
 """
 
 
@@ -204,6 +338,12 @@ class Dialect:
     @property
     def now(self) -> str:
         return "datetime('now')" if self.sqlite else "UTC_TIMESTAMP()"
+
+    @property
+    def lock_share(self) -> str:
+        """Suffix that makes a SELECT a locking read of the latest committed row. SQLite has no row locks: a
+        transaction that has written already holds the database's single write lock."""
+        return "" if self.sqlite else " FOR SHARE"
 
     @property
     def insert_or_replace(self) -> str:

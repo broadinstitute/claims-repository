@@ -1,0 +1,99 @@
+{
+  "fixture_notice": "SYNTHETIC FIXTURE with SYMBOLIC ids, for tests only. tests/dapper_fixtures.py mints the real DAPPER-ID-1 objects this describes; api/examples/deposit-bundle.request.json is the minted result.",
+  "objects": [
+    {
+      "class_name": "Proposition",
+      "id": "dapper:Proposition.SYNTHG01",
+      "statement": "The gene NOD2 is associated with inflammatory bowel disease (IBD).",
+      "subject_entity": "NOD2",
+      "relation": "associated_with",
+      "object_entity": "IBD",
+      "scope": "PIGEAN gene-level assessment; trait_group=portal; gene-set collection cfde-inc-v2.",
+      "proposition_kind": "RESULT"
+    },
+    {
+      "class_name": "ClaimScore",
+      "id": "dapper:ClaimScore.SYNTHG01combined",
+      "score_kind": "SCORE",
+      "metric": "combined",
+      "value": 9.8,
+      "interpretation": "PIGEAN combined log posterior odds of gene-phenotype association; log scale, larger is stronger. PROVISIONAL."
+    },
+    {
+      "class_name": "ClaimScore",
+      "id": "dapper:ClaimScore.SYNTHG01logbf",
+      "score_kind": "SCORE",
+      "metric": "log_bf",
+      "value": 7.1,
+      "interpretation": "PIGEAN log Bayes factor from direct GWAS evidence; log scale. PROVISIONAL."
+    },
+    {
+      "class_name": "ClaimScore",
+      "id": "dapper:ClaimScore.SYNTHG01prior",
+      "score_kind": "SCORE",
+      "metric": "prior",
+      "value": 0.42,
+      "interpretation": "PIGEAN log prior odds contributed by gene-set membership evidence; log scale. PROVISIONAL."
+    },
+    {
+      "class_name": "ValueLocator",
+      "id": "dapper:ValueLocator.SYNTHG01combined",
+      "file": "dapper:File.SYNTHGENESTATS",
+      "byte_start": 1042,
+      "byte_length": 3,
+      "value_text": "9.8",
+      "selector": "gene=NOD2; key=combined",
+      "media_type": "application/x-ndjson"
+    },
+    {
+      "class_name": "EvidenceItem",
+      "id": "dapper:EvidenceItem.SYNTHG01combined",
+      "name": "PIGEAN combined evidence: NOD2 - IBD",
+      "value_locators": [
+        "dapper:ValueLocator.SYNTHG01combined"
+      ],
+      "target_proposition": "dapper:Proposition.SYNTHG01",
+      "explanation": "PIGEAN reported combined = 9.8 for this association in combined_gene_stats.json; the value locator pins the serialized number's byte span, so the measurement is re-verifiable against the file's sha256 (file[byte_start : byte_start+byte_length] == value_text). SYNTHETIC.",
+      "evidence_source": "PIGEAN result file combined_gene_stats.json"
+    },
+    {
+      "class_name": "Claim",
+      "id": "dapper:Claim.SYNTHG01",
+      "proposition": "dapper:Proposition.SYNTHG01",
+      "statement": "PIGEAN assessed the association of NOD2 with IBD (combined log posterior odds 9.80; log BF 7.10; prior 0.42) over the cfde-inc-v2 gene-set collection.",
+      "has_score": [
+        "dapper:ClaimScore.SYNTHG01combined",
+        "dapper:ClaimScore.SYNTHG01logbf",
+        "dapper:ClaimScore.SYNTHG01prior"
+      ],
+      "has_evidence": [
+        "dapper:EvidenceItem.SYNTHG01combined"
+      ],
+      "was_generated_by": "dapper:Activity.SYNTHPIGEANRUN",
+      "was_attributed_to": [
+        "dapper:Agent.SYNTHAGGREGATOR"
+      ],
+      "was_derived_from": [
+        "dapper:File.SYNTHGENESTATS"
+      ],
+      "source_locator": "combined_gene_stats.json#gene=NOD2"
+    }
+  ],
+  "index_hints": [
+    {
+      "claim_id": "dapper:Claim.SYNTHG01",
+      "method": "pigean",
+      "predicate": "associated_with",
+      "subject": {
+        "category": "gene",
+        "id": "NOD2"
+      },
+      "object": {
+        "category": "phenotype",
+        "id": "IBD"
+      },
+      "collection": "cfde-inc-v2",
+      "trait_group": "portal"
+    }
+  ]
+}

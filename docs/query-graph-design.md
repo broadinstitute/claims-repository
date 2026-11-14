@@ -254,8 +254,8 @@ Status: implemented, awaiting merge (nothing committed/pushed yet).
    stays open for later.
 4. **Gene ID canon** — files carry symbols; do we join on symbol (v0) or re-key to HGNC CURIEs
    before the demo? Affects `claim_edges.subject_id` and UI linking.
-5. **Deposit auth** — `X-API-Key` for deposit only, reads open on QA (declared in contract);
-   confirm that's acceptable for the demo.
+5. **Deposit auth** — `X-API-Key` for deposit only, reads open. Enforced since 2026-11-12
+   (docs/inputs-and-outputs.md, Deposit keys).
 6. **EAGGL** — additive: a new `method` enum value plus its metric vocabulary; no structural change
    expected.
 

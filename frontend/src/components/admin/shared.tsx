@@ -6,7 +6,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { Family } from "@/lib/admin/api";
+import type { DimensionValues } from "@/lib/admin/api";
 
 // Formatting and building blocks modeled on akleao's Admin V2 shared.tsx.
 
@@ -110,7 +110,7 @@ export function Metric({ title, value, hint, href }: { title: string; value: str
     : <div className={style}>{content}</div>;
 }
 
-type Tone = "neutral" | "good" | "warn" | "bad" | "info";
+export type Tone = "neutral" | "good" | "warn" | "bad" | "info";
 const TONES: Record<Tone, string> = {
   neutral: "border-border/50 text-muted-foreground",
   good: "border-emerald-500/25 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300",
@@ -122,9 +122,47 @@ export function Status({ children, tone = "neutral" }: { children: ReactNode; to
   return <Badge variant="outline" className={`whitespace-nowrap rounded-md text-[11px] font-medium ${TONES[tone]}`}>{children}</Badge>;
 }
 
-export const FAMILY_LABEL: Record<Family, string> = { gene: "gene", gene_set: "gene set", roster: "roster", deposited: "deposited" };
-export const FamilyBadge = ({ family }: { family: Family }) => <Status tone={family === "deposited" ? "info" : "neutral"}>{FAMILY_LABEL[family]}</Status>;
-export const MintBadge = ({ minted }: { minted: boolean }) => minted ? <Status tone="good">minted</Status> : <Status tone="warn">implied</Status>;
+export const MintBadge = ({ minted }: { minted: boolean }) => minted ? <Status tone="good">minted</Status> : <Status>not minted</Status>;
+/** Marker for a stored claim that no collection produces; the console does not guess where it came from. */
+export const NoCollection = () => <Status>no collection</Status>;
+
+/** A block-level notice in one of the status tones. */
+export function Callout({ tone = "neutral", children, role }: { tone?: Tone; children: ReactNode; role?: "alert" | "status" }) {
+  return <div role={role} className={`rounded-lg border px-4 py-3 text-sm leading-6 ${TONES[tone]}`}>{children}</div>;
+}
+
+/** Preformatted text (multi-line API messages, templates, commands) that wraps instead of widening the page. */
+export function Pre({ children, className = "" }: { children: ReactNode; className?: string }) {
+  return <pre className={`max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border/50 bg-muted/30 p-3 font-mono text-[11.5px] leading-5 ${className}`}>{children}</pre>;
+}
+
+/** Dataset dimension values as a compact "name: label" list; the stored value shows on hover when a label replaces it. */
+export function Dimensions({ value, className = "" }: { value: DimensionValues | null | undefined; className?: string }) {
+  const entries = Object.entries(value ?? {});
+  if (!entries.length) return <span className="text-muted-foreground">—</span>;
+  return (
+    <span className={`inline-flex flex-wrap gap-x-3 gap-y-0.5 text-xs ${className}`}>
+      {entries.map(([name, v]) => (
+        <span key={name} title={v.label && v.label !== v.value ? v.value : undefined}>
+          <span className="text-muted-foreground">{name}</span> {v.label ?? v.value}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+/** Minted out of mintable, as a meter with the percentage. */
+export function Coverage({ minted, mintable }: { minted: number; mintable: number }) {
+  return <div className="flex items-center gap-2"><Meter part={minted} whole={mintable} /><span className="w-12 text-right text-xs tabular-nums text-muted-foreground">{percent(minted, mintable)}</span></div>;
+}
+
+export const Mono = ({ children, className = "" }: { children: ReactNode; className?: string }) => <span className={`break-all font-mono text-xs ${className}`}>{children}</span>;
+
+/** A sha256 shortened to 12 characters, with a copy button for the full value. */
+export function Hash({ value }: { value: string | null | undefined }) {
+  if (!value) return <span className="text-muted-foreground">—</span>;
+  return <span className="inline-flex flex-wrap items-center gap-2"><span className="font-mono text-xs" title={value}>{value.slice(0, 12)}</span><CopyButton text={value} /></span>;
+}
 
 export function Empty({ children }: { children: ReactNode }) {
   return <p className="px-4 py-8 text-sm text-muted-foreground">{children}</p>;

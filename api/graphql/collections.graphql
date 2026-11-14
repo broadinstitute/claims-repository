@@ -1,0 +1,31 @@
+# Collections (docs/collections.md): any method's results, registered as data.
+# A collection describes itself (what it holds, its metrics and their meaning,
+# its claim templates and queries); runQuery runs one of its query templates.
+# Rows and claim envelopes come back as JSON: their shape follows the
+# collection's own row kinds and metrics, not a fixed schema.
+
+extend type Query {
+  "Every registered collection, with its current release."
+  collections: [CollectionSummary!]!
+  "One collection described from its release manifest (current release unless `release` names a version or release id)."
+  collection(id: String!, release: String): JSON
+  "A collection's query templates: description, parameters, plan, and a runnable example."
+  collectionQueries(collection: String!, release: String): JSON
+  """
+  Run a collection's query template. `claims` limits which claim keys each row
+  serves (default: all; an empty list serves none). Serving a row asserts its
+  claims, minting each on first serve.
+  """
+  runQuery(collection: String!, query: String!, variables: JSON, release: String, claims: [String!]): JSON
+}
+
+type CollectionSummary {
+  id: String!
+  title: String!
+  description: String
+  methods: [String!]!
+  "The current release's DAPPER ResultCollection id."
+  currentRelease: String
+  version: String
+  datasets: Int!
+}

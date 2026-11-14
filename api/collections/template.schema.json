@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://broadinstitute.github.io/claims-repository/api/collections/template.schema.json",
+  "title": "Claim template",
+  "description": "How one row (or one group of edges) becomes Propositions, ClaimScores, EvidenceItems and Claims. Placeholders: row.*, subject.{id,label}, object.{id,label}, dataset.<dimension>, collection.{key,title}, file.name, metric.<name>.{value,text}, metric.{name,value,text} (focus metric), tier.label, rule.{name,version}, claim.key, group.{id,label,count,parent}.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "template",
+    "version",
+    "for",
+    "claims"
+  ],
+  "properties": {
+    "template": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "for": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "group_by": {
+      "enum": [
+        "to",
+        "from"
+      ]
+    },
+    "claims": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "proposition",
+          "statement"
+        ],
+        "properties": {
+          "key": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "focus": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "classify": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "proposition": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "statement",
+              "subject",
+              "relation",
+              "object",
+              "kind"
+            ],
+            "properties": {
+              "statement": {
+                "type": "string",
+                "minLength": 1
+              },
+              "subject": {
+                "type": "string",
+                "minLength": 1
+              },
+              "relation": {
+                "type": "string",
+                "minLength": 1
+              },
+              "object": {
+                "type": "string",
+                "minLength": 1
+              },
+              "scope": {
+                "type": "string",
+                "minLength": 1
+              },
+              "kind": {
+                "enum": [
+                  "RESULT",
+                  "BIOLOGICAL_INTERPRETATION",
+                  "UNSPECIFIED"
+                ]
+              }
+            }
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "statement": {
+            "type": "string",
+            "minLength": 1
+          },
+          "scores": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]*$"
+            }
+          },
+          "evidence": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "per_metric",
+              "name",
+              "explanation"
+            ],
+            "properties": {
+              "per_metric": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$"
+                },
+                "minItems": 1
+              },
+              "source_claims": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9._-]*$"
+                }
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "explanation": {
+                "type": "string",
+                "minLength": 1
+              },
+              "context": {
+                "type": "string",
+                "minLength": 1
+              },
+              "assumptions": {
+                "type": "boolean"
+              },
+              "evidence_source": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "source_locator": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

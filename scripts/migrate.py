@@ -36,6 +36,11 @@ ALREADY_APPLIED = {1050, 1060, 1061}
 
 # Post-condition: table -> columns the service requires.
 REQUIRED_COLUMNS = {
+    # 006_collections.sql
+    "collections": {"collection_key", "title", "current_release_id"},
+    "collection_releases": {"release_id", "collection_key", "version", "manifest", "document"},
+    "result_rows": {"row_id", "dataset_id", "kind", "subject_id", "subject_value", "row_json", "spans"},
+    "mint_contexts": {"activity_id", "context"},
     "dapper_objects": {"id", "class_name", "payload", "times_seen", "last_seen_at"},
     "claims": {"claim_id", "proposition_id", "method"},
     "pigean_gene_associations": {"phenotype", "collection", "gene", "claim_id", "proposition_id", "synthesis_inputs"},
@@ -48,9 +53,24 @@ REQUIRED_COLUMNS = {
     "kpn_trait_mappings": {"trait_id", "target_id", "ontology", "predicate"},
     "kpn_trait_release": {"version", "commit_sha", "file_sha256"},
     "admin_auth_events": {"at", "event", "email", "detail"},
+    # 007_deposit_keys.sql
+    "api_keys": {"key_id", "name", "key_sha256", "created_at", "created_by", "revoked_at", "revoked_by"},
+    "deposits": {"deposit_id", "key_id", "received_at", "object_count"},
+    "deposit_objects": {"deposit_id", "object_id", "status"},
+    "deposit_edges": {"deposit_id", "seq", "class_name", "subject_id", "object_id", "payload"},
 }
 REQUIRED_PRIMARY_KEYS = {
     "claim_memberships": ["phenotype", "collection", "gene", "gene_set"],
+    # 006_collections.sql
+    "collection_releases": ["release_id"],
+    "result_claims": ["claim_id"],
+    "result_edges": ["dataset_id", "kind", "from_id", "to_id"],
+    "result_metrics": ["row_id", "metric"],
+    # 007_deposit_keys.sql
+    "api_keys": ["key_id"],
+    "deposits": ["deposit_id"],
+    "deposit_objects": ["deposit_id", "object_id"],
+    "deposit_edges": ["deposit_id", "seq"],
 }
 
 

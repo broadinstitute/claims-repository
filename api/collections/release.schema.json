@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://broadinstitute.github.io/claims-repository/api/collections/release.schema.json",
+  "title": "Release specification",
+  "description": "Which datasets, and which file for each role, a collection release holds.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "datasets"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "datasets": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "dimensions",
+          "files"
+        ],
+        "properties": {
+          "dimensions": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "run": {
+            "type": "string",
+            "minLength": 1
+          },
+          "files": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "location": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

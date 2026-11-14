@@ -1,0 +1,179 @@
+# PIGEAN result collection: what the claims repository needs to ingest,
+# mint and query PIGEAN results with no PIGEAN-specific service code.
+# Schema: claims-repository api/collections/collection.schema.json.
+# Supersedes methods/pigean/template.yaml (metrics, tier rules and wording
+# moved here and into templates/).
+
+collection: pigean
+title: PIGEAN gene and gene-set associations
+description: >-
+  Gene- and gene-set-level association results from PIGEAN, one dataset per
+  trait and gene-set library, with templates that mint measurement claims,
+  evidence-tier claims and gene-set roster claims from each row.
+owners: [dig-aggregator-pipeline]
+methods: [PIGEAN]
+dapper_profile: 0.2.1-a1
+
+# Claims name this agent in was_attributed_to. Placeholder until agent
+# identities are agreed.
+attribution:
+  agent: urn:broad:dig-aggregator-pipeline
+
+prefixes:
+  hgnc.symbol: "https://identifiers.org/hgnc.symbol:"
+  biolink: "https://w3id.org/biolink/vocab/"
+  KPN.TRAIT: "https://broadinstitute.github.io/kpn-data-models/kpn.trait/"
+
+# Relation vocabulary the templates name by key. Values are never rewritten
+# into another scheme; a relation without an exact Biolink predicate keeps a
+# kpn URN until one is agreed.
+relations:
+  associated_with: biolink:associated_with
+  genetically_associated_with: biolink:genetically_associated_with
+  relevant_to: urn:kpn:relation:relevant_to
+  functionally_relevant_to: urn:kpn:relation:functionally_relevant_to
+  has_members: urn:kpn:relation:has_members
+
+# Each dataset is one (trait, library) slice.
+dataset_dimensions:
+  - name: trait
+    resolve: kpn-traits     # IBD -> KPN.TRAIT:0000505, labelled from the registry
+  - name: library           # gene-set library, e.g. cfde-inc-v2
+
+# How a file value becomes an identifier. Values are taken as the files give
+# them (gene symbols today); only the prefix is declared here.
+entities:
+  Gene:
+    id: "hgnc.symbol:{value}"
+  GeneSet:
+    mint: GeneSet           # a DAPPER GeneSet per set and dataset
+    members_from: member_of # members: the genes the dataset's membership file lists
+    library_dimension: library
+  Trait:
+    dimension: trait
+
+row_kinds:
+  gene_phenotype:
+    subject: {entity: Gene, column: gene}
+    object: {entity: Trait}
+    metrics: [combined, log_bf, prior]
+    keep: [trait_group]
+  gene_set_phenotype:
+    subject: {entity: GeneSet, column: gene_set}
+    object: {entity: Trait}
+    metrics: [beta, beta_uncorrected]
+    keep: [trait_group, source]
+
+edge_kinds:
+  member_of:
+    from: {entity: Gene, column: gene}
+    to: {entity: GeneSet, column: gene_set}
+
+file_roles:
+  gene_stats:
+    format: ndjson
+    media_type: application/x-ndjson
+    dimension_columns: {trait: phenotype, library: gene_set_size}
+    yields: gene_phenotype
+    description: PIGEAN combined gene statistics, one row per gene.
+  gene_set_stats:
+    format: ndjson
+    media_type: application/x-ndjson
+    dimension_columns: {trait: phenotype, library: gene_set_size}
+    yields: gene_set_phenotype
+    description: PIGEAN combined gene-set statistics, one row per gene set.
+  membership:
+    format: ndjson
+    media_type: application/x-ndjson
+    dimension_columns: {trait: phenotype, library: gene_set_size}
+    yields: member_of
+    description: PIGEAN gene_gene_set_stats; only the (gene, gene set) pairs are used.
+
+metrics:
+  combined:
+    score_kind: SCORE
+    scale: log posterior odds
+    better: higher
+    confirmed: false
+    description: Combined gene-phenotype support from direct GWAS evidence plus gene-set prior evidence. Not a probability.
+    interpretation: >-
+      PIGEAN combined log posterior odds of gene-phenotype association (direct
+      GWAS plus gene-set prior evidence); log scale, larger is stronger.
+      PROVISIONAL interpretation pending method-lead confirmation.
+  log_bf:
+    score_kind: SCORE
+    scale: log Bayes factor
+    better: higher
+    confirmed: false
+    description: Direct GWAS support for the gene-phenotype association. Not a probability.
+    interpretation: >-
+      PIGEAN log Bayes factor from direct GWAS evidence; log scale, larger is
+      stronger. PROVISIONAL.
+  prior:
+    score_kind: SCORE
+    scale: log prior odds
+    better: higher
+    confirmed: false
+    description: Indirect support contributed by gene-set membership evidence.
+    interpretation: >-
+      PIGEAN log prior odds contributed by gene-set membership evidence; log
+      scale. PROVISIONAL.
+  beta:
+    score_kind: EFFECT_ESTIMATE
+    scale: log-odds effect
+    better: higher
+    confirmed: false
+    description: Gene-set effect estimated jointly with the other selected gene sets (corrected).
+    interpretation: >-
+      PIGEAN gene-set effect estimated jointly with other selected gene sets
+      (corrected); log-odds scale. PROVISIONAL.
+  beta_uncorrected:
+    score_kind: EFFECT_ESTIMATE
+    scale: log-odds effect
+    better: higher
+    confirmed: false
+    description: Marginal gene-set effect, uncorrected for other gene sets.
+    interpretation: >-
+      PIGEAN marginal gene-set effect, not corrected for other gene sets;
+      log-odds scale. PROVISIONAL.
+
+# Declared threshold rules. Tiers evaluate top-down, first match wins; `min` is
+# inclusive and a tier without `min` is the catch-all. Provisional until the
+# PIGEAN method leads sign off on the boundaries and the scores' log base.
+tier_rules:
+  gene-evidence-tiers:
+    version: 0.1.0
+    status: provisional
+    description: Evidence tiers for PIGEAN gene-level scores (combined, log_bf, prior).
+    tiers:
+      - {label: very strong, min: 3}
+      - {label: strongly suggestive, min: 2}
+      - {label: nominally significant, min: 1}
+      - {label: not significant}
+    direction: {supports_min: 1, otherwise: NEUTRAL}
+  gene-set-effect-tiers:
+    version: 0.1.0
+    status: provisional
+    description: Effect-size tiers for PIGEAN gene-set scores (beta, beta_uncorrected).
+    tiers:
+      - {label: extremely significant, min: 1}
+      - {label: strongly significant, min: 0.1}
+      - {label: significant, min: 0.01}
+      - {label: not significant}
+    direction: {supports_min: 0.01, otherwise: NEUTRAL}
+
+assumptions:
+  - >-
+    Tier boundaries and the scores' log base are provisional until confirmed by
+    the PIGEAN method leads.
+  - >-
+    PIGEAN scores are method-specific log-scale quantities, not probabilities;
+    a tier classifies evidence strength under the named rule, not truth.
+
+templates:
+  - templates/gene.yaml
+  - templates/gene_set.yaml
+  - templates/roster.yaml
+
+queries:
+  - queries/top-genes-with-sets.yaml

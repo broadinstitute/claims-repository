@@ -22,16 +22,21 @@ from urllib.parse import quote
 
 from ariadne import ObjectType, QueryType, ScalarType, graphql_sync, make_executable_schema
 from ariadne.explorer import ExplorerGraphiQL
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
+from . import api_keys
+from . import dapper_validation as dval
 from . import db
 from . import pigean_template as tpl
 from . import telemetry
-from .refs import DAPPER_ID_RE, LOCAL_DEV_ID_RE, MAX_ID_LENGTH, dapper_refs
+from .collections import identity as cidn
+from .collections import serve as cserve
+from .collections.manifest import ManifestError
+from .refs import DAPPER_ID_RE, MAX_ID_LENGTH, dapper_refs
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_VERSION = "0.2.0"
@@ -122,7 +127,7 @@ FILTER_OPS = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">=", "eq": "=", "ne": "
 
 
 def _load_type_defs() -> str:
-    parts = [(ROOT / "api" / "graphql" / "core.graphql").read_text()]
+    parts = [(ROOT / "api" / "graphql" / name).read_text() for name in ("core.graphql", "collections.graphql")]
     for mod in sorted((ROOT / "api" / "graphql" / "methods").glob("*.graphql")):
         parts.append(mod.read_text())
     return "\n".join(parts)
@@ -137,12 +142,18 @@ def _fetch_payload(con, object_id):
     return json.loads(row["payload"]) if row else None
 
 
+def _class_of(payload: dict) -> str | None:
+    """A document's class: local-dev documents carry class_name; DAPPER-ID-1
+    documents are plain DAPPER nodes whose class is part of the id."""
+    return payload.get("class_name") or cidn.class_of(payload.get("id") or "")
+
+
 def _present_object(payload: dict) -> dict:
     """Uniform presentation for every resolved dapper object, whatever its
     class or depositor: id and class_name first, remaining keys sorted.
     Content is untouched — this is ordering only."""
     rest = {k: payload[k] for k in sorted(payload) if k not in ("id", "class_name")}
-    return {"id": payload.get("id"), "class_name": payload.get("class_name"), **rest}
+    return {"id": payload.get("id"), "class_name": _class_of(payload), **rest}
 
 
 def _fetch_payloads(con, object_ids):
@@ -204,6 +215,10 @@ CLAIM_SOURCES = (
 
 def _index_source(con, claim_id, families=None):
     """The template-backed index row that implies this claim, or None."""
+    if not families or "collection" in families:
+        rc = con.execute("SELECT * FROM result_claims WHERE claim_id = ?", (claim_id,)).fetchone()
+        if rc is not None:
+            return "collection", rc
     for family, table in CLAIM_SOURCES:
         if families and family not in families:
             continue
@@ -297,10 +312,17 @@ def envelope(con, claim_id, assert_claim=True, source=None):
         claim = json.loads(row["payload"])
         times, first, last = row["times_seen"], _ts(row["created_at"]), _ts(row["last_seen_at"] or row["created_at"])
     else:
-        if source is None or _inputs_of(source[1]) is None:
+        collection = source is not None and source[0] == "collection"
+        if source is None or (not collection and _inputs_of(source[1]) is None):
             source = _index_source(con, claim_id) or source
+            collection = source is not None and source[0] == "collection"
         synthesized = None
-        if source is not None and _inputs_of(source[1]) is not None:
+        if collection:
+            try:
+                synthesized = cserve.render_claim(con, source[1])
+            except (cserve.ClaimRenderError, cserve.engine.TemplateError, cidn.MintError) as exc:
+                raise ClaimSynthesisError(str(exc)) from exc
+        elif source is not None and _inputs_of(source[1]) is not None:
             synthesized = synthesize_claim(*source)
         if row is None and synthesized is None:
             return None
@@ -320,7 +342,9 @@ def envelope(con, claim_id, assert_claim=True, source=None):
                 )
             if row is None:
                 assertions[claim_id] = {
-                    "new": True, "payload": tpl.canonical(synthesized), "identity_profile": tpl.IDENTITY_PROFILE,
+                    "new": True, "payload": tpl.canonical(synthesized),
+                    "identity_profile": cidn.PROFILE if collection else tpl.IDENTITY_PROFILE,
+                    "method": cserve.collection_of(con, source[1]) if collection else tpl.METHOD,
                     "proposition": synthesized["proposition"], "refs": sorted(dapper_refs(synthesized)),
                 }
             else:
@@ -371,7 +395,7 @@ def envelope(con, claim_id, assert_claim=True, source=None):
         locators = [
             locator_docs[vid] for vid in _id_list(item.get("value_locators")) if vid in locator_docs
         ]
-        evidence.append({"item": item, "valueLocators": locators})
+        evidence.append({"item": _present_object(item), "valueLocators": [_present_object(loc) for loc in locators]})
     return {
         "id": claim.get("id", claim_id),
         "resolverUrl": _resolver_url(claim_id),
@@ -437,7 +461,7 @@ def _flush_assertions(con):
     if new:
         con.executemany(
             f"{con.dialect.insert_or_ignore} claims (claim_id, proposition_id, method) VALUES (?, ?, ?)",
-            [(cid, a["proposition"], tpl.METHOD) for cid, a in new],
+            [(cid, a["proposition"], a.get("method", tpl.METHOD)) for cid, a in new],
         )
         refs = [(cid, ref) for cid, a in new for ref in a["refs"]]
         if refs:
@@ -772,7 +796,7 @@ def resolve_identifier_resolution(*_):
 def resolve_proposition(_, info, id):
     con = _con(info)
     payload = _fetch_payload(con, id)
-    if payload is None or payload.get("class_name") != "Proposition":
+    if payload is None or _class_of(payload) != "Proposition":
         return None
     # Every claim assessing it: deposited/minted ones from the registry, plus
     # the claims its index rows imply (served here, so asserted and minted).
@@ -784,6 +808,8 @@ def resolve_proposition(_, info, id):
             (id,),
         ).fetchall():
             sources[r["claim_id"]] = (family, r)
+    for r in con.execute("SELECT * FROM result_claims WHERE proposition_id = ?", (id,)).fetchall():
+        sources[r["claim_id"]] = ("collection", r)
     envelopes = [e for e in (envelope(con, cid, source=src) for cid, src in sorted(sources.items())) if e]
     return {
         "id": id,
@@ -980,6 +1006,43 @@ def resolve_challenge(
     return {"rows": rows, "truncated": truncated, "warnings": warnings}
 
 
+# ---------------------------------------------------------------------------
+# Collections (docs/collections.md): discovery and the query plan executor.
+
+
+def _collection_envelope(con, claim_id, source):
+    return envelope(con, claim_id, source=source)
+
+
+@query.field("collections")
+def resolve_collections(_, info):
+    return [{"id": c["id"], "title": c["title"], "description": c["description"], "methods": c["methods"],
+             "currentRelease": c["current_release"], "version": c["version"], "datasets": c["datasets"]}
+            for c in cserve.list_collections(_con(info))]
+
+
+@query.field("collection")
+def resolve_collection(_, info, id, release=None):
+    try:
+        return cserve.describe(_con(info), id, release)
+    except cserve.CollectionNotFound:
+        return None
+
+
+@query.field("collectionQueries")
+def resolve_collection_queries(_, info, collection, release=None):
+    return cserve.list_queries(_con(info), collection, release)
+
+
+@query.field("runQuery")
+def resolve_run_query(_, info, collection, query, variables=None, release=None, claims=None):
+    try:
+        return cserve.run_query(_con(info), collection, query, variables, release=release, claims=claims,
+                                envelope=_collection_envelope)
+    except ManifestError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 schema = make_executable_schema(
     _load_type_defs(), query, phenotype_type, gene_type, gene_set_type, json_scalar
 )
@@ -1122,6 +1185,89 @@ def vocabulary():
     }
 
 
+@app.get("/v1/collections")
+def list_collections():
+    con = db.connect()
+    try:
+        return {"collections": cserve.list_collections(con)}
+    finally:
+        con.close()
+
+
+@app.get("/v1/collections/{collection}")
+def describe_collection(collection: str, release: str | None = None):
+    con = db.connect()
+    try:
+        return cserve.describe(con, collection, release)
+    except cserve.CollectionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    finally:
+        con.close()
+
+
+@app.get("/v1/collections/{collection}/queries")
+def collection_queries(collection: str, release: str | None = None):
+    con = db.connect()
+    try:
+        return {"collection": collection, "queries": cserve.list_queries(con, collection, release)}
+    except cserve.CollectionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    finally:
+        con.close()
+
+
+@app.get("/v1/collections/{collection}/releases/{version}/document")
+def collection_release_document(collection: str, version: str):
+    """The release as a DAPPER document (ResultCollection, Datasets, Files,
+    Activities), lintable with dapper's `result-collection` profile."""
+    con = db.connect()
+    try:
+        return cserve.release_document(con, collection, version)
+    except cserve.CollectionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    finally:
+        con.close()
+
+
+def _run_collection_query(collection, name, body):
+    """Same contract as a GraphQL request: resolve, render, and write the
+    recorded claim assertions only if the whole response succeeded."""
+    con = db.connect()
+    con.query_limit = MAX_QUERIES_PER_REQUEST
+    try:
+        try:
+            result = cserve.run_query(con, collection, name, body.get("variables"), release=body.get("release"),
+                                      claims=body.get("claims"), envelope=_collection_envelope)
+            rendered = _render(result)
+        except cserve.CollectionNotFound as exc:
+            con.rollback()
+            return 404, {"detail": str(exc)}
+        except (ManifestError, ValueError, ClaimSynthesisError) as exc:
+            con.rollback()
+            return 400, {"detail": str(exc)}
+        con.query_limit = None
+        error = _commit_assertions(con)
+        if error:
+            return 409, {"detail": error}
+        return 200, rendered
+    finally:
+        con.close()
+
+
+@app.post("/v1/collections/{collection}/queries/{name}:run")
+async def run_collection_query(collection: str, name: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body must be JSON.")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+    status, payload = await run_in_threadpool(_run_collection_query, collection, name, body)
+    if status == 200:
+        return Response(payload, media_type="application/json")
+    return JSONResponse(payload, status_code=status)
+
+
 @app.get("/v1/docs", response_class=HTMLResponse)
 def swagger_docs():
     """Swagger UI over the hand-written REST contract (api/openapi.yaml) —
@@ -1256,7 +1402,7 @@ def _index_hint(con, hint, bundle_objects):
     claim = bundle_objects.get(claim_id) or _fetch_payload(con, claim_id)
     if claim is None:
         raise HTTPException(status_code=400, detail=f"index hint references unknown claim {claim_id}")
-    if claim.get("class_name") != "Claim":
+    if _class_of(claim) != "Claim":
         raise HTTPException(status_code=400, detail=f"index hint claim_id {claim_id} is not a Claim")
     scores = {}
     for sid in claim.get("has_score", []):
@@ -1434,53 +1580,23 @@ def _same_document(a, b) -> bool:
     return type(a) is type(b) and a == b
 
 
-def _validate_object(obj):
-    if not isinstance(obj, dict):
-        raise HTTPException(status_code=400, detail="every entry in objects must be a JSON object")
-    oid, cls = obj.get("id"), obj.get("class_name")
-    if not isinstance(cls, str) or not _CLASS_RE.match(cls):
-        raise HTTPException(status_code=400, detail=f"object has a missing or invalid class_name: {str(oid)[:140]!r}")
-    if (not isinstance(oid, str) or not DAPPER_ID_RE.match(oid) or len(oid) > MAX_ID_LENGTH
-            or not oid.startswith(f"dapper:{cls}.")):
-        raise HTTPException(
-            status_code=400,
-            detail=f"object id {str(oid)[:140]!r} is not a dapper:{cls}.<digest> identifier of at most {MAX_ID_LENGTH} characters",
-        )
-    long_refs = [r for r in dapper_refs(obj) if len(r) > MAX_ID_LENGTH]
-    if long_refs:
-        raise HTTPException(status_code=400, detail=f"{oid} references over-long ids: {long_refs[:3]}")
-    if "identity_profile" in obj and not isinstance(obj["identity_profile"], str):
-        raise HTTPException(status_code=400, detail=f"{oid}: identity_profile must be a string")
-    if cls == "Proposition":
-        for slot in ("subject_entity", "relation", "object_entity", "statement"):
-            if slot in obj and not isinstance(obj[slot], str):
-                raise HTTPException(status_code=400, detail=f"{oid}: {slot} must be a string")
-    if cls == "EvidenceItem" and "value_locators" in obj and not (
-            isinstance(obj["value_locators"], list) and all(isinstance(x, str) for x in obj["value_locators"])):
-        raise HTTPException(status_code=400, detail=f"{oid}: value_locators must be a list of id strings")
-    if cls == "Claim":
-        if not isinstance(obj.get("proposition", ""), str):
-            raise HTTPException(status_code=400, detail=f"{oid}: proposition must be a dapper id string")
-        for slot in ("has_score", "has_evidence", "was_derived_from"):
-            if slot in obj and not (isinstance(obj[slot], list) and all(isinstance(x, str) for x in obj[slot])):
-                raise HTTPException(status_code=400, detail=f"{oid}: {slot} must be a list of id strings")
-    # The local-dev identity profile is verifiable here: the id must be the
-    # digest of the content. Nothing can sit at an address it does not hash
-    # to (DAPPER-ID-1 verification is Task-5 hardening).
-    if LOCAL_DEV_ID_RE.match(oid) and not tpl.local_dev_address_ok(obj):
-        raise HTTPException(status_code=400, detail=f"{oid}: content does not hash to its local-dev address")
-    return oid, cls
+MAX_DEPOSIT_OBJECTS = 1000
+MAX_DEPOSIT_BYTES = 16 * 1024 * 1024
+MAX_DEPOSIT_EDGES = 5000
+_UNAUTHORIZED = {"WWW-Authenticate": "ApiKey"}
 
 
-@app.post("/v1/claims")
-async def deposit(request: Request):
-    """The only external write path. v0 checks structure and identifier shape
-    and stores idempotently; full DAPPER-profile validation and general
-    content-address verification are Task-5 hardening. Addresses that the
-    loaded data implies are RESERVED: a Claim deposited at one must equal the
-    claim the template synthesizes for it."""
+async def _deposit_body(request: Request) -> dict:
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_DEPOSIT_BYTES:
+        raise HTTPException(status_code=413, detail=f"A deposit is at most {MAX_DEPOSIT_BYTES:,} bytes; send a larger document in parts.")
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw += chunk
+        if len(raw) > MAX_DEPOSIT_BYTES:
+            raise HTTPException(status_code=413, detail=f"A deposit is at most {MAX_DEPOSIT_BYTES:,} bytes; send a larger document in parts.")
     try:
-        body = json.loads(await request.body(), parse_constant=_reject_constant)
+        body = json.loads(bytes(raw), parse_constant=_reject_constant)
     except HTTPException:
         raise
     except Exception:
@@ -1488,26 +1604,35 @@ async def deposit(request: Request):
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
     _check_interoperable(body)
-    objects = body.get("objects")
-    if not isinstance(objects, list) or not objects:
-        raise HTTPException(status_code=400, detail="objects is required and must be a non-empty list")
     hints = body.get("index_hints") or []
     if not isinstance(hints, list):
         raise HTTPException(status_code=400, detail="index_hints must be a list")
+    return body
+
+
+def _write_deposit(depositor, prepared, hints, edges=()):
+    """The write behind POST /v1/deposits. `prepared` is what validation accepted: for each object its id, class and
+    the plain DAPPER document to store, every id verified as the DAPPER-ID-1 address of its content. Everything a
+    deposit must do happens here, in one transaction: the reserved address rule, idempotent storage, the reference
+    index, the claims registry, index hints, the key re-check and the deposit record. A bundle is accepted or
+    rejected whole."""
     con = db.connect()
     try:
         deposited = []
         bundle_objects = {}
         with con:
-            for obj in objects:
-                oid, cls = _validate_object(obj)
+            for item in prepared:
+                oid, cls, obj = item["id"], item["class_name"], item["document"]
                 bundle_objects[oid] = obj
                 if cls == "Claim":
                     source = _index_source(con, oid)
                     if source is not None:
                         try:
-                            expected = synthesize_claim(*source)
-                        except ClaimSynthesisError as exc:
+                            if source[0] == "collection":
+                                expected = cserve.render_claim(con, source[1])
+                            else:
+                                expected = synthesize_claim(*source)
+                        except (ClaimSynthesisError, cserve.ClaimRenderError, cserve.engine.TemplateError, cidn.MintError) as exc:
                             raise HTTPException(status_code=400, detail=str(exc))
                         if not _same_document(obj, expected):
                             raise HTTPException(
@@ -1518,11 +1643,7 @@ async def deposit(request: Request):
                                 ),
                             )
                 exists = con.execute("SELECT payload FROM dapper_objects WHERE id = ?", (oid,)).fetchone()
-                if exists and not _same_document(json.loads(exists["payload"]), obj):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"{oid} already holds a different document; a content address names one document",
-                    )
+                differs = bool(exists) and _stored_differs(oid, json.loads(exists["payload"]), obj)
                 if exists:
                     # Idempotent re-deposit of the same content address: count
                     # how often this document keeps being minted (2026-11-09).
@@ -1540,19 +1661,17 @@ async def deposit(request: Request):
                     # (sorted keys) so every object reads back consistently.
                     con.execute(
                         con.dialect.upsert_object,
-                        (oid, cls, obj.get("identity_profile", "unverified"),
+                        (oid, cls, cidn.PROFILE,
                          json.dumps(obj, sort_keys=True, separators=(",", ":"), allow_nan=False)),
                     )
                     stored = con.execute("SELECT payload, times_seen FROM dapper_objects WHERE id = ?", (oid,)).fetchone()
-                    if not _same_document(json.loads(stored["payload"]), obj):
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"{oid} already holds a different document; a content address names one document",
-                        )
+                    differs = _stored_differs(oid, json.loads(stored["payload"]), obj)
+                    exists = exists or differs or stored["times_seen"] > 1  # a concurrent deposit stored it first
                     times = stored["times_seen"]
-                refs = sorted(dapper_refs(obj))
-                if refs:
-                    con.executemany(con.dialect.insert_ref, [(oid, ref) for ref in refs])
+                if not differs:
+                    refs = sorted(dapper_refs(obj))
+                    if refs:
+                        con.executemany(con.dialect.insert_ref, [(oid, ref) for ref in refs])
                 if cls == "Claim":
                     # Register every deposited Claim with its proposition so
                     # the GraphQL fan-in (Query.proposition) sees claims that
@@ -1564,27 +1683,138 @@ async def deposit(request: Request):
                         f"{con.dialect.insert_or_ignore} claims (claim_id, proposition_id, method) VALUES (?, ?, ?)",
                         (oid, obj.get("proposition", ""), ""),
                     )
-                deposited.append(
-                    {
-                        "id": oid,
-                        "class_name": cls,
-                        "status": "exists" if exists else "created",
-                        "times_deposited": times,
-                    }
-                )
+                outcome = {
+                    "id": oid,
+                    "class_name": cls,
+                    "status": "exists" if exists else "created",
+                    "times_deposited": times,
+                }
+                if differs:
+                    outcome["stored_differs"] = True
+                deposited.append(outcome)
             for hint in hints:
                 _index_hint(con, hint, bundle_objects)
-        return {"deposited": deposited}
+            # Last, after this transaction's own writes and as a locking read: a key revoked before this point
+            # deposits nothing, and a revocation that arrives now waits for this deposit to finish.
+            if not api_keys.still_valid(con, depositor):
+                raise HTTPException(status_code=401, detail=api_keys.UNAUTHORIZED, headers=_UNAUTHORIZED)
+            # Same transaction as the objects: a rejected bundle records no deposit.
+            deposit_id = api_keys.record_deposit(con, depositor, deposited, edges)
+            unresolved = _unresolved_references(con, bundle_objects, edges)
+        return {"deposit_id": deposit_id, "depositor": depositor, "deposited": deposited}, unresolved
     except HTTPException:
         raise
-    except (TypeError, ValueError, KeyError, OverflowError) as exc:
+    except (TypeError, ValueError, KeyError, IndexError, OverflowError) as exc:  # sqlite3.Row raises IndexError
         raise HTTPException(status_code=400, detail=f"malformed deposit: {type(exc).__name__}: {exc}")
     except Exception as exc:  # noqa: BLE001 — driver binding errors from malformed values
         if type(exc).__name__ in ("ProgrammingError", "InterfaceError", "DataError", "IntegrityError"):
             raise HTTPException(status_code=400, detail=f"malformed deposit: {type(exc).__name__}: {exc}")
+        if type(exc).__name__ == "OperationalError":
+            # A lock wait (a concurrent deposit or revocation) or a dropped connection: nothing was stored.
+            raise HTTPException(status_code=503, detail="The store is busy; nothing was deposited. Retry the same request.",
+                                headers={"Retry-After": "2"})
         raise
     finally:
         con.close()
+
+
+def _plain(document: dict) -> dict:
+    """A stored document as a plain DAPPER node: without the legacy envelope keys and null slots."""
+    return {k: v for k, v in document.items() if k not in ("class_name", "identity_profile") and v is not None}
+
+
+def _stored_differs(oid, stored, obj) -> bool:
+    """Whether the document already at this address differs from the one being deposited, when that is allowed.
+
+    The deposited id is the address of the document's hashed content. If the stored document also hashes to this
+    address and agrees literally in every hashed slot, the two can differ only in slots identity ignores (a File's
+    location, an Activity's timestamp): the first one stands and this deposit is `exists` with `stored_differs`.
+    A stored document that does NOT hash to this address (written out of band, or by an earlier version of the
+    service) is never taken for the object, and nothing stored is ever rewritten, so the deposit is refused."""
+    if _same_document(stored, obj):
+        return False
+    plain = _plain(stored)
+    if _same_document(plain, obj):
+        return False  # the same node, stored earlier with the legacy class_name envelope
+    try:
+        stored_verifies = cidn.verify(plain)
+    except Exception:  # noqa: BLE001 — a stored document dapper's identity code cannot canonicalize does not verify
+        stored_verifies = False
+    if not stored_verifies:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"{oid} is held by a stored document that does not hash to this address, so it cannot be "
+                    "confirmed as the same object; an operator must resolve it before this object can be deposited"),
+        )
+    # Both hash to this address. dapper's identity replaces a reference by its bare digest before hashing, so two
+    # spellings of one reference hash alike; only literal equality of every hashed slot shows the documents differ
+    # in nothing but the slots identity ignores.
+    hashed = dval.hashable_slots(cidn.class_of(oid))
+    unequal = sorted(k for k in hashed if not _same_document(plain.get(k), obj.get(k)))
+    if unequal:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"{oid} is already stored with different content in {', '.join(unequal[:5])}, although both "
+                    "documents hash to this address (a reference is written two ways); nothing stored is rewritten"),
+        )
+    return True
+
+
+def _unresolved_references(con, bundle_objects, edges) -> list[str]:
+    """dapper ids the bundle points at that are neither in it nor in the store. Reported, not refused: Files and
+    GeneSets may be described elsewhere, and a large document may arrive in several deposits."""
+    wanted = set()
+    for obj in bundle_objects.values():
+        wanted |= dapper_refs(obj)
+    for _, edge in edges:
+        wanted |= dapper_refs(edge)
+    wanted = sorted(ref for ref in wanted - set(bundle_objects) if len(ref) <= MAX_ID_LENGTH)
+    found = set()
+    for i in range(0, len(wanted), 500):
+        chunk = wanted[i:i + 500]
+        rows = con.execute(f"SELECT id FROM dapper_objects WHERE id IN ({', '.join('?' * len(chunk))})", chunk).fetchall()
+        found |= {row["id"] for row in rows}
+    return [ref for ref in wanted if ref not in found]
+
+
+@app.post("/v1/deposits")
+async def deposit(request: Request, depositor: dict = Depends(api_keys.require_depositor)):
+    """The only external write path: deposit DAPPER objects of any class, validated. The depositor's X-API-Key is checked before
+    the body is read. The body is either a DAPPER document (`document`: nodes and edges under dapper's group names,
+    which is what dapper's tooling mints, e.g. a whole ScientificAccount) or a flat list (`objects`). Every node must
+    be valid for its class in the vendored DAPPER schema and sit at the DAPPER-ID-1 address of its content
+    (service/dapper_validation.py). The bundle is stored whole or not at all and recorded as one deposit by the key."""
+    body = await _deposit_body(request)
+    if ("document" in body) == ("objects" in body):
+        raise HTTPException(status_code=400, detail="send exactly one of document (a DAPPER document) or objects (a list of DAPPER nodes)")
+
+    def validate():
+        try:
+            if "document" in body:
+                nodes, edges = dval.document_items(body["document"])
+            else:
+                if not isinstance(body["objects"], list):
+                    raise dval.Invalid("objects must be a list")
+                nodes, edges = [(None, node) for node in body["objects"]], []
+            if not nodes:
+                raise dval.Invalid("a deposit needs at least one object")
+            if len(nodes) > MAX_DEPOSIT_OBJECTS or len(edges) > MAX_DEPOSIT_EDGES:
+                raise dval.Invalid(f"a deposit holds at most {MAX_DEPOSIT_OBJECTS} objects and {MAX_DEPOSIT_EDGES} edges; send a larger document in parts")
+            prepared = []
+            for expected, node in nodes:
+                oid, cls, document = dval.validate_node(node, expected)
+                prepared.append({"id": oid, "class_name": cls, "document": document})
+            return prepared, [(cls, dval.validate_edge(cls, edge)) for cls, edge in edges]
+        except dval.Invalid as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    def run():
+        prepared, edges = validate()
+        result, unresolved = _write_deposit(depositor, prepared, body.get("index_hints") or [], edges)
+        return {**result, "edges": len(edges), "unresolved_references": unresolved,
+                "validation": {"identity_profile": cidn.PROFILE, "dapper_version": cidn.DAPPER_VERSION}}
+
+    return await run_in_threadpool(run)
 
 
 _DAPPER_ID_RE = re.compile(r"dapper:[A-Za-z]+\.[A-Za-z0-9_-]+")
@@ -1616,10 +1846,10 @@ def _object_landing_html(object_id: str, payload: dict) -> str:
     qid = quote(object_id, safe=":")
     referenced_by = _href(f"{PUBLIC_BASE}/v1/objects/search?references={qid}")
     claim_hint = ""
-    if payload.get("class_name") == "Proposition":
+    if _class_of(payload) == "Proposition":
         claims_href = _href(f"{PUBLIC_BASE}/v1/objects/search?class_name=Claim&references={qid}")
         claim_hint = f'<p><a href="{claims_href}">Claims assessing this proposition</a></p>'
-    elif payload.get("class_name") == "Claim":
+    elif _class_of(payload) == "Claim":
         claim_hint = (
             "<p>Dereferenced envelope (scores, evidence + locators, provenance): GraphQL "
             f'<code>claim(id: "{html.escape(object_id)}")</code></p>'
@@ -1632,7 +1862,7 @@ def _object_landing_html(object_id: str, payload: dict) -> str:
 pre{{background:#f6f8fa;padding:1rem;overflow-x:auto;border-radius:6px}}
 code{{background:#f6f8fa;padding:0.1rem 0.3rem;border-radius:4px}}</style></head>
 <body>
-<h1>{html.escape(str(payload.get("class_name", "DapperObject")))}</h1>
+<h1>{html.escape(str(_class_of(payload) or "DapperObject"))}</h1>
 <p><code>{html.escape(object_id)}</code> — a content-addressed DAPPER identifier; this page is its
 resolver view (<code>GET {base}/v1/objects/{{id}}</code>, JSON by default).</p>
 {claim_hint}
@@ -1658,7 +1888,7 @@ def _label(payload: dict) -> str | None:
     for slot in _TEXT_SLOTS:
         if payload.get(slot):
             return payload[slot]
-    cls = payload.get("class_name")
+    cls = _class_of(payload)
     if cls == "ClaimScore":
         return f"{payload.get('metric')} = {payload.get('value')}"
     if cls == "ValueLocator":
@@ -1672,7 +1902,7 @@ MAX_OFFSET = 10_000_000
 
 
 def _object_search(con, *, class_name=None, q=None, references=None, match=None,
-                   limit=50, offset=0):
+                   deposited_by=None, deposit=None, limit=50, offset=0):
     """Shared engine for GET /v1/objects and /v1/objects/search: filters
     ANDed, deterministic id order, total computed over the same filters.
     Text matching is case-insensitive and literal (wildcards escaped) on both
@@ -1683,11 +1913,24 @@ def _object_search(con, *, class_name=None, q=None, references=None, match=None,
         raise HTTPException(status_code=400, detail=f"class_name must be letters only, got {class_name!r}")
     if references is not None and (not DAPPER_ID_RE.match(references) or len(references) > MAX_ID_LENGTH):
         raise HTTPException(status_code=400, detail=f"references must be a dapper identifier, got {references[:140]!r}")
+    if deposited_by is not None and not api_keys.KEY_ID_RE.match(deposited_by):
+        raise HTTPException(status_code=400, detail="deposited_by must be a key id such as key_0123456789abcdef")
+    if deposit is not None and not api_keys.DEPOSIT_ID_RE.match(deposit):
+        raise HTTPException(status_code=400, detail="deposit must be a deposit id (dep_ followed by 32 hex characters)")
     je = con.dialect.je
     joins, where, params = "", [], []
     if references:
         joins = " JOIN object_refs r ON r.from_id = o.id AND r.to_id = ?"
         params.append(references)
+    # Deposit provenance: objects one key sent, or one deposit carried. Minting on serve (GraphQL, collection
+    # queries) and loaders record no deposit, so such an object matches only if someone also deposited it.
+    if deposited_by:
+        where.append("EXISTS (SELECT 1 FROM deposit_objects dx JOIN deposits dp ON dp.deposit_id = dx.deposit_id "
+                     "WHERE dx.object_id = o.id AND dp.key_id = ?)")
+        params.append(deposited_by)
+    if deposit:
+        where.append("EXISTS (SELECT 1 FROM deposit_objects dy WHERE dy.object_id = o.id AND dy.deposit_id = ?)")
+        params.append(deposit)
     if class_name:
         where.append("o.class_name = ?")
         params.append(class_name)
@@ -1746,6 +1989,8 @@ def search_objects(
     q: str | None = None,
     references: str | None = None,
     match: list[str] | None = Query(default=None),
+    deposited_by: str | None = None,
+    deposit: str | None = None,
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0, le=MAX_OFFSET),
 ):
@@ -1754,13 +1999,54 @@ def search_objects(
     a proposition, propositions about a GeneSet, ...); `q` substring-matches
     the statement / name / description text; `match=slot:value` (repeatable)
     is exact equality on a top-level string slot (e.g. relation:has_members,
-    subject_entity:NOD2). No numeric filters: metric questions are GraphQL's."""
+    subject_entity:NOD2); `deposited_by=<key id>` = objects that depositor sent
+    in a deposit, and `deposit=<deposit id>` = objects one deposit
+    carried. No numeric filters: metric questions are GraphQL's."""
     con = db.connect()
     try:
-        return _object_search(con, class_name=class_name, q=q, references=references,
-                              match=match, limit=limit, offset=offset)
+        return _object_search(con, class_name=class_name, q=q, references=references, match=match,
+                              deposited_by=deposited_by, deposit=deposit, limit=limit, offset=offset)
     finally:
         con.close()
+
+
+@app.get("/v1/deposits")
+def list_deposits(
+    object: str | None = None,
+    deposited_by: str | None = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0, le=MAX_OFFSET),
+):
+    """Who deposited what, newest first: every deposit, the deposits that
+    carried one object (`object=<dapper id>`), or the deposits one depositor
+    sent (`deposited_by=<key id>`). A depositor is a key id and the name it was
+    issued under; the key itself is never served. Objects the service minted
+    when serving a query, or a loader wrote, belong to no deposit."""
+    if object is not None and (not DAPPER_ID_RE.match(object) or len(object) > MAX_ID_LENGTH):
+        raise HTTPException(status_code=400, detail=f"object must be a dapper identifier, got {object[:140]!r}")
+    if deposited_by is not None and not api_keys.KEY_ID_RE.match(deposited_by):
+        raise HTTPException(status_code=400, detail="deposited_by must be a key id such as key_0123456789abcdef")
+    con = db.connect()
+    try:
+        return api_keys.deposits(con, object_id=object, deposited_by=deposited_by, limit=limit, offset=offset)
+    finally:
+        con.close()
+
+
+@app.get("/v1/deposits/{deposit_id}")
+def get_deposit(deposit_id: str):
+    """One deposit: its depositor, when it was received and every object it
+    carried, with whether this deposit created the object or it already existed."""
+    if not api_keys.DEPOSIT_ID_RE.match(deposit_id):
+        raise HTTPException(status_code=404, detail="Unknown deposit.")
+    con = db.connect()
+    try:
+        found = api_keys.deposit(con, deposit_id)
+    finally:
+        con.close()
+    if found is None:
+        raise HTTPException(status_code=404, detail="Unknown deposit.")
+    return found
 
 
 @app.get("/v1/objects/{object_id}")
@@ -1781,8 +2067,7 @@ def get_object(object_id: str, request: Request):
                 detail=(
                     f"{object_id} is a claim this repository's data implies but has not yet "
                     "asserted — it is minted when the scientific query surface (GraphQL) first "
-                    "serves the result behind it (or stored when its identical document is deposited "
-                    "via POST /v1/claims)"
+                    "serves the result behind it"
                 ),
             )
         raise HTTPException(status_code=404, detail=f"no deposited object with id {object_id}")
