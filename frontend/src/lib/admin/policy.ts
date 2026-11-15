@@ -19,13 +19,15 @@ export function adminBypass(env: Env): boolean {
 const KEY = "[a-z0-9][a-z0-9._-]{0,127}";
 const JOB = "[A-Za-z0-9_-]{1,64}";
 const KEY_ID = "key_[0-9a-f]{16}";
+const DAPPER = "dapper:[A-Za-z]+\\.[A-Za-z0-9_-]{1,200}";
 const exact = (pattern: string) => new RegExp(`^${pattern}$`);
 
 /** Admin API paths the browser may read through the proxy (GET, purpose admin_read). */
 const READ_PATHS = [
   "me", "overview",
   "collections", `collections/${KEY}`, `collections/${KEY}/queries/${KEY}/example`,
-  "claims", "claims/dapper:[A-Za-z]+\\.[A-Za-z0-9_-]{1,200}",
+  "claims", `claims/${DAPPER}`,
+  "objects", "objects/classes", `objects/${DAPPER}`, "deposits", "accounts", `accounts/${DAPPER}`,
   "tables", "tables/[a-z_]{1,64}/rows", "activity",
   "registration/sources", "registration/jobs", `registration/jobs/${JOB}`,
   "keys",

@@ -10,7 +10,11 @@ no-store. The API knows collections only through their registered releases
 Reads never assert or mint: the claim detail re-renders a collection claim to
 show whether it still matches its recorded id, and the example query runs a
 query template without serving claims. Tables are read-only and allowlisted;
-there is no SQL editor.
+there is no SQL editor. The object browser (/objects, /deposits, /accounts)
+shows every stored object of any class exactly as stored, what it references
+and what references it, the deposited edges that touch it and the deposits
+that carried it; a ScientificAccount is also served assembled with its
+question, claims, propositions, evidence and quoted files.
 
 What writes: the console's sign-in audit (POST /auth-events, purpose
 auth_event), and collection registration (POST /registration/jobs, purpose
@@ -710,6 +714,268 @@ def _activity(con) -> dict:
 
 
 
+# --- objects, deposits and scientific accounts ------------------------------------
+
+# Every stored object is a row of dapper_objects, whatever its class: this is the console's view of what the
+# repository holds, as stored. Reads only; nothing here mints, asserts or changes times_seen.
+LABEL_SLOTS = ("title", "text", "context", "snippet", "value_text", "filename")
+REFERENCE_LIMIT, REFERENCED_BY_LIMIT, EDGE_LIMIT = 300, 50, 200
+ACCOUNT_CLASS = "ScientificAccount"
+
+
+def _object_label(doc) -> str | None:
+    """One readable line for any class: the public label, then the slots it does not look at."""
+    if not isinstance(doc, dict):
+        return None
+    label = _core()._label(doc)
+    if isinstance(label, str) and label:
+        return label
+    for slot in LABEL_SLOTS:
+        if isinstance(doc.get(slot), str) and doc[slot]:
+            return doc[slot]
+    person = " ".join(doc[s] for s in ("given_name", "family_name") if isinstance(doc.get(s), str) and doc[s])
+    return person or None
+
+
+def _class_name(object_id, doc=None) -> str | None:
+    """A document's class, or the class its id names when the object is not stored."""
+    named = (doc or {}).get("class_name") if isinstance(doc, dict) else None
+    if named:
+        return named
+    head = object_id.split(":", 1)[-1] if isinstance(object_id, str) else ""
+    return head.split(".", 1)[0] if "." in head else None
+
+
+def _references_in(value, slot=None, found=None) -> list[tuple[str, str]]:
+    """(top-level slot, dapper id) for every dapper id a document mentions, in document order, once each."""
+    from .refs import DAPPER_ID_RE
+    found = [] if found is None else found
+    if isinstance(value, str):
+        if slot is not None and slot != "id" and DAPPER_ID_RE.match(value) and (slot, value) not in found:
+            found.append((slot, value))
+    elif isinstance(value, list):
+        for item in value:
+            _references_in(item, slot, found)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _references_in(item, slot if slot is not None else key, found)
+    return found
+
+
+def _summaries_of(con, ids) -> dict:
+    """{id: {id, className, label, stored}} for ids, stored or not, in one read."""
+    ids = list(dict.fromkeys(i for i in ids if isinstance(i, str)))
+    docs = _core()._fetch_payloads(con, ids)
+    return {i: {"id": i, "className": _class_name(i, docs.get(i)), "label": _object_label(docs.get(i)),
+                "stored": i in docs} for i in ids}
+
+
+def _deposits_of(con, object_id) -> list[dict]:
+    rows = con.execute(
+        "SELECT d.deposit_id, d.received_at, d.object_count, d.key_id, k.name, o.status FROM deposit_objects o "
+        "JOIN deposits d ON d.deposit_id = o.deposit_id JOIN api_keys k ON k.key_id = d.key_id "
+        "WHERE o.object_id = ? ORDER BY d.received_at DESC, d.deposit_id DESC LIMIT 50", (object_id,)).fetchall()
+    return [{"depositId": r["deposit_id"], "receivedAt": _ts(r["received_at"]), "objectCount": int(r["object_count"]),
+             "depositor": {"keyId": r["key_id"], "name": r["name"]}, "status": r["status"]} for r in rows]
+
+
+def _edges_of(con, object_ids) -> list[dict]:
+    """Deposited edges (prov:used, prov:wasDerivedFrom, ...) that start or end at any of the ids. An edge is not
+    an object, so this is the only place the console shows it. The same edge sent by several deposits is one row."""
+    ids = list(dict.fromkeys(object_ids))
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+    seen, out = {}, []
+    for column in ("subject_id", "object_id"):
+        for r in con.execute(
+                f"SELECT deposit_id, seq, class_name, subject_id, object_id, payload FROM deposit_edges "
+                f"WHERE {column} IN ({marks}) ORDER BY deposit_id, seq LIMIT {EDGE_LIMIT}", ids).fetchall():
+            payload = _loads(r["payload"])
+            key = (r["class_name"], r["subject_id"], r["object_id"], json.dumps(payload, sort_keys=True))
+            if key in seen:
+                if r["deposit_id"] not in seen[key]["depositIds"]:
+                    seen[key]["depositIds"].append(r["deposit_id"])
+                continue
+            seen[key] = {"className": r["class_name"], "subject": r["subject_id"], "object": r["object_id"],
+                         "predicate": payload.get("predicate") if isinstance(payload, dict) else None,
+                         "document": payload, "depositIds": [r["deposit_id"]]}
+            out.append(seen[key])
+    return out
+
+
+def _object_classes(con) -> dict:
+    classes = [{"className": r["class_name"], "count": int(r["n"])} for r in con.execute(
+        "SELECT class_name, COUNT(*) AS n FROM dapper_objects GROUP BY class_name ORDER BY class_name").fetchall()]
+    edges = [{"className": r["class_name"], "count": int(r["n"])} for r in con.execute(
+        "SELECT class_name, COUNT(*) AS n FROM deposit_edges GROUP BY class_name ORDER BY class_name").fetchall()]
+    return {"total": sum(c["count"] for c in classes), "classes": classes, "edgeClasses": edges,
+            "deposits": int(con.execute("SELECT COUNT(*) AS n FROM deposits").fetchone()["n"])}
+
+
+def _objects(con, class_name, q, references, deposit, page, page_size) -> dict:
+    from .refs import DAPPER_ID_RE, MAX_ID_LENGTH
+    core = _core()
+    if q and DAPPER_ID_RE.match(q) and len(q) <= MAX_ID_LENGTH:
+        # A pasted id is looked up as an id, not searched for as text.
+        row = con.execute("SELECT id FROM dapper_objects WHERE id = ?", (q,)).fetchone()
+        found = {"total": 1 if row else 0, "objects": [{"id": q}] if row else []}
+    else:
+        found = core._object_search(con, class_name=class_name, q=q, references=references, deposit=deposit,
+                                    limit=page_size, offset=(page - 1) * page_size)
+    ids = [o["id"] for o in found["objects"]]
+    rows = {}
+    if ids:
+        marks = ",".join("?" * len(ids))
+        rows = {r["id"]: r for r in con.execute(
+            f"SELECT id, class_name, identity_profile, payload, times_seen, created_at, last_seen_at FROM dapper_objects "
+            f"WHERE id IN ({marks})", ids).fetchall()}
+    out = []
+    for i in ids:
+        r = rows.get(i)
+        if r is None:
+            continue
+        doc = _loads(r["payload"])
+        out.append({"id": i, "className": r["class_name"], "label": _object_label(doc),
+                    "identityProfile": r["identity_profile"], "timesSeen": int(r["times_seen"]),
+                    "createdAt": _ts(r["created_at"]), "lastSeenAt": _ts(r["last_seen_at"] or r["created_at"]),
+                    "slots": sorted(k for k in doc if k not in ("id", "class_name")) if isinstance(doc, dict) else []})
+    return {"total": int(found["total"]), "page": page, "pageSize": page_size, "rows": out}
+
+
+def _object_detail(con, object_id) -> dict | None:
+    core = _core()
+    row = con.execute(
+        "SELECT class_name, identity_profile, payload, times_seen, created_at, last_seen_at FROM dapper_objects WHERE id = ?",
+        (object_id,)).fetchone()
+    doc = _loads(row["payload"]) if row is not None else None
+    referenced_total = int(con.execute("SELECT COUNT(*) AS n FROM object_refs WHERE to_id = ?", (object_id,)).fetchone()["n"])
+    edges = _edges_of(con, [object_id])
+    if row is None and not referenced_total and not edges:
+        return None
+    referrers = [r["from_id"] for r in con.execute(
+        f"SELECT from_id FROM object_refs WHERE to_id = ? ORDER BY from_id LIMIT {REFERENCED_BY_LIMIT}", (object_id,)).fetchall()]
+    references = _references_in(doc)[:REFERENCE_LIMIT] if doc is not None else []
+    known = _summaries_of(con, [i for _, i in references] + referrers
+                          + [e[k] for e in edges for k in ("subject", "object")])
+    proposition = doc if row is not None and row["class_name"] == "Proposition" else None
+    return {
+        "id": object_id, "stored": row is not None,
+        "className": row["class_name"] if row is not None else _class_name(object_id),
+        "label": _object_label(doc),
+        "identityProfile": row["identity_profile"] if row is not None else None,
+        "timesSeen": int(row["times_seen"]) if row is not None else 0,
+        "createdAt": _ts(row["created_at"]) if row is not None else None,
+        "lastSeenAt": _ts(row["last_seen_at"] or row["created_at"]) if row is not None else None,
+        "document": doc,
+        "triple": core._triple_of(proposition) if proposition else None,
+        "references": [{"slot": slot, **known[i]} for slot, i in references],
+        "referencedBy": {"total": referenced_total, "objects": [known[i] for i in referrers]},
+        "edges": [{**e, "subjectSummary": known.get(e["subject"]), "objectSummary": known.get(e["object"])} for e in edges],
+        "deposits": _deposits_of(con, object_id),
+        "resolverUrl": core._resolver_url(object_id) if row is not None else None,
+    }
+
+
+def _deposit_list(con, page, page_size) -> dict:
+    found = api_keys.deposits(con, limit=page_size, offset=(page - 1) * page_size)
+    return {"total": int(found["total"]), "page": page, "pageSize": page_size,
+            "rows": [{"depositId": d["deposit_id"], "receivedAt": _ts(d["received_at"]), "objectCount": int(d["object_count"]),
+                      "depositor": {"keyId": d["depositor"]["key_id"], "name": d["depositor"]["name"]}} for d in found["deposits"]]}
+
+
+def _docs(con, ids) -> dict:
+    return _core()._fetch_payloads(con, list(dict.fromkeys(i for i in ids if isinstance(i, str))))
+
+
+def _accounts(con, page, page_size) -> dict:
+    core = _core()
+    total = con.execute("SELECT COUNT(*) AS n FROM dapper_objects WHERE class_name = ?", (ACCOUNT_CLASS,)).fetchone()["n"]
+    rows = con.execute(
+        "SELECT id, payload, times_seen, created_at FROM dapper_objects WHERE class_name = ? "
+        "ORDER BY created_at DESC, id LIMIT ? OFFSET ?", (ACCOUNT_CLASS, page_size, (page - 1) * page_size)).fetchall()
+    docs = {r["id"]: _loads(r["payload"]) for r in rows}
+    linked = _docs(con, [d.get("question") for d in docs.values()]
+                   + [a for d in docs.values() for a in core._id_list(d.get("was_attributed_to"))])
+    out = []
+    for r in rows:
+        doc = docs[r["id"]]
+        deposits = _deposits_of(con, r["id"])
+        out.append({
+            "id": r["id"], "question": _object_label(linked.get(doc.get("question"))),
+            "claims": len(core._id_list(doc.get("component_claims"))),
+            "attributedTo": [_object_label(linked.get(a)) or a for a in core._id_list(doc.get("was_attributed_to"))],
+            "storedAt": _ts(r["created_at"]), "timesSeen": int(r["times_seen"]),
+            "deposits": len(deposits), "lastDeposit": deposits[0] if deposits else None,
+        })
+    return {"total": int(total), "page": page, "pageSize": page_size, "rows": out}
+
+
+def _account(con, account_id) -> dict | None:
+    """One ScientificAccount with everything it points at, each object exactly as stored: its question, every
+    component claim with its proposition and evidence, each evidence item's publication and located quotes, the
+    files those quotes address and what they derive from, and the deposits that carried it."""
+    core = _core()
+    row = con.execute("SELECT class_name, payload, times_seen, created_at FROM dapper_objects WHERE id = ?",
+                      (account_id,)).fetchone()
+    if row is None or row["class_name"] != ACCOUNT_CLASS:
+        return None
+    account = _loads(row["payload"])
+    claim_ids = core._id_list(account.get("component_claims"))
+    claims = _docs(con, claim_ids)
+    evidence_ids = [e for c in claims.values() for e in core._id_list(c.get("has_evidence"))]
+    evidence = _docs(con, evidence_ids)
+    locator_ids = [v for e in evidence.values() for v in core._id_list(e.get("value_locators"))]
+    locators = _docs(con, locator_ids)
+    file_ids = [v.get("file") for v in locators.values() if isinstance(v.get("file"), str)]
+    edges = _edges_of(con, list(dict.fromkeys(file_ids)))
+    derived = {}
+    for e in edges:
+        if e["predicate"] == "prov:wasDerivedFrom" and e["subject"] in file_ids:
+            derived.setdefault(e["subject"], []).append(e["object"])
+    head_ids = [account.get("question"), account.get("was_generated_by")] + core._id_list(account.get("was_attributed_to"))
+    others = _docs(con, head_ids + [c.get("proposition") for c in claims.values()]
+                   + [e.get("reference") for e in evidence.values()] + file_ids + [f for fs in derived.values() for f in fs])
+    wanted = [i for i in head_ids + claim_ids + evidence_ids + locator_ids + file_ids if isinstance(i, str)]
+    stored = {**claims, **evidence, **locators, **others}
+
+    def node(object_id):
+        return None if not isinstance(object_id, str) else {"id": object_id, "document": stored.get(object_id)}
+
+    def claim_view(claim_id):
+        claim = claims.get(claim_id) or {}
+        proposition = others.get(claim.get("proposition")) if isinstance(claim.get("proposition"), str) else None
+        items = []
+        for evidence_id in core._id_list(claim.get("has_evidence")):
+            item = evidence.get(evidence_id) or {}
+            quotes = []
+            for locator_id in core._id_list(item.get("value_locators")):
+                locator = locators.get(locator_id) or {}
+                file_id = locator.get("file") if isinstance(locator.get("file"), str) else None
+                quotes.append({"id": locator_id, "document": locators.get(locator_id), "file": node(file_id),
+                               "derivedFrom": [node(f) for f in derived.get(file_id, [])]})
+            items.append({"id": evidence_id, "document": evidence.get(evidence_id),
+                          "publication": node(item.get("reference")), "quotes": quotes})
+        return {"id": claim_id, "document": claims.get(claim_id), "proposition": node(claim.get("proposition")),
+                "triple": core._triple_of(proposition) if proposition else None, "evidence": items}
+
+    classes: dict = {}
+    for object_id in dict.fromkeys([account_id, *stored]):
+        name = _class_name(object_id, stored.get(object_id)) or "Unknown"
+        classes[name] = classes.get(name, 0) + 1
+    return {
+        "id": account_id, "document": account, "storedAt": _ts(row["created_at"]), "timesSeen": int(row["times_seen"]),
+        "question": node(account.get("question")), "activity": node(account.get("was_generated_by")),
+        "attributedTo": [node(a) for a in core._id_list(account.get("was_attributed_to"))],
+        "claims": [claim_view(c) for c in claim_ids],
+        "deposits": _deposits_of(con, account_id), "edges": edges,
+        "objectsByClass": [{"className": k, "count": v} for k, v in sorted(classes.items())],
+        "missing": sorted(i for i in dict.fromkeys(wanted) if i not in stored),
+        "resolverUrl": core._resolver_url(account_id),
+    }
+
+
+
 # --- API routes -----------------------------------------------------------------
 
 @router.get("/me")
@@ -798,6 +1064,61 @@ async def table_rows(
 @router.get("/activity")
 async def activity(_: dict = Depends(gateway.require_admin)):
     return _json(await _read(_activity))
+
+
+def _object_id(value: str) -> str:
+    from .refs import DAPPER_ID_RE, MAX_ID_LENGTH
+    if not DAPPER_ID_RE.match(value) or len(value) > MAX_ID_LENGTH:
+        raise HTTPException(status_code=400, detail="This is not a dapper identifier.")
+    return value
+
+
+@router.get("/objects/classes")
+async def object_classes(_: dict = Depends(gateway.require_admin)):
+    return _json(await _read(_object_classes))
+
+
+@router.get("/objects")
+async def objects(
+    _: dict = Depends(gateway.require_admin),
+    class_name: str | None = Query(None, pattern="^[A-Za-z]{1,64}$"),
+    q: str | None = Query(None, max_length=200),
+    references: str | None = Query(None, max_length=128),
+    deposit: str | None = Query(None, max_length=40),
+    page: int = Query(1, ge=1, le=100_000),
+    page_size: int = Query(25, ge=1, le=100),
+):
+    def clean(v):
+        return (v or "").strip() or None
+    return _json(await _read(_objects, class_name, clean(q), clean(references), clean(deposit), page, page_size))
+
+
+@router.get("/objects/{object_id:path}")
+async def object_detail(object_id: str, _: dict = Depends(gateway.require_admin)):
+    detail = await _read(_object_detail, _object_id(object_id))
+    if detail is None:
+        raise HTTPException(status_code=404, detail="No object with this ID is stored or referenced.")
+    return _json(detail)
+
+
+@router.get("/deposits")
+async def deposit_list(_: dict = Depends(gateway.require_admin), page: int = Query(1, ge=1, le=100_000),
+                       page_size: int = Query(25, ge=1, le=100)):
+    return _json(await _read(_deposit_list, page, page_size))
+
+
+@router.get("/accounts")
+async def accounts(_: dict = Depends(gateway.require_admin), page: int = Query(1, ge=1, le=100_000),
+                   page_size: int = Query(25, ge=1, le=100)):
+    return _json(await _read(_accounts, page, page_size))
+
+
+@router.get("/accounts/{account_id:path}")
+async def account_detail(account_id: str, _: dict = Depends(gateway.require_admin)):
+    detail = await _read(_account, _object_id(account_id))
+    if detail is None:
+        raise HTTPException(status_code=404, detail="No scientific account with this ID is stored.")
+    return _json(detail)
 
 
 class AuthEvent(BaseModel):

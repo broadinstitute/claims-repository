@@ -1,0 +1,463 @@
+{
+  "document": {
+    "files": [
+      {
+        "id": "dapper:File.Uo03RcspOSahzHvFgR5oHHf0JP9SL4h2",
+        "sha256": "6274ef9e58c775063c8289074521a2167a988a40bf20f536d5f4e9862fe4d9b5",
+        "filename": "25501099.abstract.html",
+        "mime_type": "text/html",
+        "description": "Text of PMID 25501099 abstract as read by a REVEAL agent: the abstractText of its Europe PMC record (UTF-8, extraction reveal.literature-text/1). Derived from the upstream document with SHA-256 0d7d73bf2f37a98cb2e96998d7562474951c0261f68cb0236d033cfccccbc28c. The text is not redistributed; this record identifies it by checksum so a quoted span can be re-checked against a copy rebuilt from the same document.",
+        "size_in_bytes": 1493
+      },
+      {
+        "id": "dapper:File.pP7IQ02lIDK-7teM7G7ApzpwKci1iWCD",
+        "sha256": "0d7d73bf2f37a98cb2e96998d7562474951c0261f68cb0236d033cfccccbc28c",
+        "filename": "25501099.europepmc.json",
+        "location": "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID%3A25501099+AND+SRC%3AMED&format=json&resultType=core&pageSize=1",
+        "mime_type": "application/json",
+        "description": "Europe PMC response for PMID 25501099 abstract, exactly as fetched at 2026-11-15T01:14:38.612128+00:00. A later fetch of the same address may differ in bytes.",
+        "size_in_bytes": 7316
+      },
+      {
+        "id": "dapper:File.9a8jRUB3Lypub0AzdqMFeQj6tkZN8Ucf",
+        "sha256": "5a3751ab1299031fced87844c7109c37ada602c2d355c2d333fbc97c74ca56a7",
+        "filename": "39530074.abstract.html",
+        "mime_type": "text/html",
+        "description": "Text of PMID 39530074 abstract as read by a REVEAL agent: the abstractText of its Europe PMC record (UTF-8, extraction reveal.literature-text/1). Derived from the upstream document with SHA-256 5f779f1cd6137aa1047181991f0bab85b65edd3ebc1315b6c18add5cd493d9a9. The text is not redistributed; this record identifies it by checksum so a quoted span can be re-checked against a copy rebuilt from the same document.",
+        "size_in_bytes": 1688
+      },
+      {
+        "id": "dapper:File.-GHIZ8ahrogRCNWg_3VE3JO1qdgbug4o",
+        "sha256": "5f779f1cd6137aa1047181991f0bab85b65edd3ebc1315b6c18add5cd493d9a9",
+        "filename": "39530074.europepmc.json",
+        "location": "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID%3A39530074+AND+SRC%3AMED&format=json&resultType=core&pageSize=1",
+        "mime_type": "application/json",
+        "description": "Europe PMC response for PMID 39530074 abstract, exactly as fetched at 2026-11-15T01:14:58.386091+00:00. A later fetch of the same address may differ in bytes.",
+        "size_in_bytes": 12583
+      },
+      {
+        "id": "dapper:File.NZsIQiLxdvdEcu2KOACqmytvdeG7x4PW",
+        "sha256": "97b55f1158b2f433a7a8d95f06486ba6c5029eeca8d449b4e4bd4f65b3761fec",
+        "filename": "PMC9008988.fulltext.txt",
+        "mime_type": "text/plain",
+        "description": "Text of PMC9008988 full text as read by a REVEAL agent: the title and paragraph text of its Europe PMC open-access full-text XML, in document order, joined by newlines (UTF-8, extraction reveal.literature-text/1). Derived from the upstream document with SHA-256 62ec81f927e519f6d27e0e103bed45c02fe98928ca40cd4c3958117661adbd1b. The text is not redistributed; this record identifies it by checksum so a quoted span can be re-checked against a copy rebuilt from the same document.",
+        "size_in_bytes": 55789
+      },
+      {
+        "id": "dapper:File.OQzz3ulYclt0sD1tl9DtYZ9BfZXVWxd1",
+        "sha256": "62ec81f927e519f6d27e0e103bed45c02fe98928ca40cd4c3958117661adbd1b",
+        "filename": "PMC9008988.europepmc.xml",
+        "location": "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC9008988/fullTextXML",
+        "mime_type": "application/xml",
+        "description": "Europe PMC response for PMC9008988 full text, exactly as fetched at 2026-11-15T01:14:43.869962+00:00. A later fetch of the same address may differ in bytes.",
+        "size_in_bytes": 182906
+      },
+      {
+        "id": "dapper:File.lh7pLDVq4LNxgcFnVzenOUfJ3o1QMtZB",
+        "sha256": "ea8845196911806c6dfda82e4eebdfe20485e81bfb641c272435811584e1ae43",
+        "filename": "40312552.abstract.html",
+        "mime_type": "text/html",
+        "description": "Text of PMID 40312552 abstract as read by a REVEAL agent: the abstractText of its Europe PMC record (UTF-8, extraction reveal.literature-text/1). Derived from the upstream document with SHA-256 f04e5d3cf80e2e046db3d2a7b7ed84f093957f682f8ac4c52bf00d8d1341b22d. The text is not redistributed; this record identifies it by checksum so a quoted span can be re-checked against a copy rebuilt from the same document.",
+        "size_in_bytes": 2408
+      },
+      {
+        "id": "dapper:File.kwKrFp4IriPlJBTapW4BEANIbujvZWq4",
+        "sha256": "f04e5d3cf80e2e046db3d2a7b7ed84f093957f682f8ac4c52bf00d8d1341b22d",
+        "filename": "40312552.europepmc.json",
+        "location": "https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=EXT_ID%3A40312552+AND+SRC%3AMED&format=json&resultType=core&pageSize=1",
+        "mime_type": "application/json",
+        "description": "Europe PMC response for PMID 40312552 abstract, exactly as fetched at 2026-11-15T01:14:48.734175+00:00. A later fetch of the same address may differ in bytes.",
+        "size_in_bytes": 9973
+      },
+      {
+        "id": "dapper:File.k2yt0KLsYybUpkNnNupcGfYAuuwPm1LI",
+        "sha256": "b0b1723838b2bc7be154a2bc064968876f16f54729a4748786c370b3f149b017",
+        "filename": "PMC12913491.fulltext.txt",
+        "mime_type": "text/plain",
+        "description": "Text of PMC12913491 full text as read by a REVEAL agent: the title and paragraph text of its Europe PMC open-access full-text XML, in document order, joined by newlines (UTF-8, extraction reveal.literature-text/1). Derived from the upstream document with SHA-256 13175de9a08fd86f1dbb79ec97d82e11b5f27d85ab9df7f6247d19e646b4ab7c. The text is not redistributed; this record identifies it by checksum so a quoted span can be re-checked against a copy rebuilt from the same document.",
+        "size_in_bytes": 32690
+      },
+      {
+        "id": "dapper:File.heNlE69PK_ooHueMVdLbdZuf3vkK91yf",
+        "sha256": "13175de9a08fd86f1dbb79ec97d82e11b5f27d85ab9df7f6247d19e646b4ab7c",
+        "filename": "PMC12913491.europepmc.xml",
+        "location": "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC12913491/fullTextXML",
+        "mime_type": "application/xml",
+        "description": "Europe PMC response for PMC12913491 full text, exactly as fetched at 2026-11-15T01:15:10.057868+00:00. A later fetch of the same address may differ in bytes.",
+        "size_in_bytes": 105497
+      }
+    ],
+    "claims": [
+      {
+        "id": "dapper:Claim.sZA3VptxvrR08U3M_oKsuXrOPWv60Ghu",
+        "status": "proposed",
+        "direction": "SUPPORTS",
+        "statement": "Supported, strongly. Independent primary case-control studies in Indian (CD and UC) and Chinese (CD) cohorts replicate TNFSF15 association with IBD. In patient ileum, the risk genotype goes with higher TL1A expression and stricturing CD. A systematic review ranks TNFSF15 among the most-replicated CD genes.",
+        "proposition": "dapper:Proposition.ZjqB4bPxArpExcd7hWP9afeboaxFg4qH",
+        "has_evidence": [
+          "dapper:EvidenceItem.jIkpn6lKuJo1jYuh6qs5-R3fcPWdaaPX",
+          "dapper:EvidenceItem.rDDugFn1yCEry42iaZrpXpFDD-Td04tV",
+          "dapper:EvidenceItem.cWww_usUc4qsDW6DkJqVGPeJUkSi_8mK"
+        ],
+        "was_generated_by": "dapper:Activity.XDbJUk04gTGSFbnq0iiBhmY0lEI5hA1s",
+        "was_attributed_to": [
+          "dapper:Organization.vOYxfXQxbQEqpPD5YP1wUCM3OJHZsn1m"
+        ]
+      },
+      {
+        "id": "dapper:Claim.FA-LGxVBz5609ld9VWdlh78R9_jiZbJC",
+        "status": "proposed",
+        "direction": "SUPPORTS",
+        "statement": "Supported, but only by genetic association. ELF1 is a GWAS Catalog Crohn disease locus with an associated SNP within the gene, and the ELF1 region shows IBD–SLE shared local genetic correlation. No expression or functional evidence in IBD was found in what was read.",
+        "proposition": "dapper:Proposition.bxXL-ZO33-YkjfgHqqB2cYk9deaiWNmu",
+        "has_evidence": [
+          "dapper:EvidenceItem.TfXfGoJa1z4XE0B4bOSQugi71XrgKuAQ",
+          "dapper:EvidenceItem.u_PM5CeW7ysNivX7FSmYvxYlyl30rVug"
+        ],
+        "was_generated_by": "dapper:Activity.XDbJUk04gTGSFbnq0iiBhmY0lEI5hA1s",
+        "was_attributed_to": [
+          "dapper:Organization.vOYxfXQxbQEqpPD5YP1wUCM3OJHZsn1m"
+        ]
+      },
+      {
+        "id": "dapper:Claim.ChHbOyX7Ed_0P_IfWM4kW-Id7yGeFaWC",
+        "status": "proposed",
+        "direction": "SUPPORTS",
+        "statement": "Weakly supported. LITAF is upregulated in IBD mucosa and blood in one exploratory transcriptomic reanalysis, and that paper says LITAF has established pro-inflammatory roles in IBD. No primary human genetic, patient-tissue validation or functional study of LITAF in IBD was read in this run.",
+        "proposition": "dapper:Proposition.JeQkYCGqX76DkUwL2pDXT4v8rviomzY4",
+        "has_evidence": [
+          "dapper:EvidenceItem.Qt8UOuns0Zu_7VDRTvb3vSM4pSMATbnj",
+          "dapper:EvidenceItem.V3BXfWQyLaI04tI7IQ23FKy4ijlmbza_"
+        ],
+        "was_generated_by": "dapper:Activity.XDbJUk04gTGSFbnq0iiBhmY0lEI5hA1s",
+        "was_attributed_to": [
+          "dapper:Organization.vOYxfXQxbQEqpPD5YP1wUCM3OJHZsn1m"
+        ]
+      }
+    ],
+    "activities": [
+      {
+        "id": "dapper:Activity.XDbJUk04gTGSFbnq0iiBhmY0lEI5hA1s",
+        "name": "REVEAL Claude Code account construction",
+        "command": "reveal-worker box 87e272f4-c6bb-4581-ab8a-46b2baaecff5 --attempt 1",
+        "software_name": "REVEAL Mechanisms worker",
+        "software_version": "0.2.0",
+        "generated_at_time": "2026-11-15T01:20:28.382413Z"
+      }
+    ],
+    "used_edges": [
+      {
+        "object": "dapper:File.Uo03RcspOSahzHvFgR5oHHf0JP9SL4h2",
+        "subject": "dapper:Activity.XDbJUk04gTGSFbnq0iiBhmY0lEI5hA1s",
+        "predicate": "prov:used"
+      },
+      {
+        "object": "dapper:File.9a8jRUB3Lypub0AzdqMFeQj6tkZN8Ucf",
+        "subject": "dapper:Activity.XDbJUk04gTGSFbnq0iiBhmY0lEI5hA1s",
+        "predicate": "prov:used"
+      },
+      {
+        "object": "dapper:File.NZsIQiLxdvdEcu2KOACqmytvdeG7x4PW",
+        "subject": "dapper:Activity.XDbJUk04gTGSFbnq0iiBhmY0lEI5hA1s",
+        "predicate": "prov:used"
+      },
+      {
+        "object": "dapper:File.lh7pLDVq4LNxgcFnVzenOUfJ3o1QMtZB",
+        "subject": "dapper:Activity.XDbJUk04gTGSFbnq0iiBhmY0lEI5hA1s",
+        "predicate": "prov:used"
+      },
+      {
+        "object": "dapper:File.k2yt0KLsYybUpkNnNupcGfYAuuwPm1LI",
+        "subject": "dapper:Activity.XDbJUk04gTGSFbnq0iiBhmY0lEI5hA1s",
+        "predicate": "prov:used"
+      }
+    ],
+    "propositions": [
+      {
+        "id": "dapper:Proposition.JeQkYCGqX76DkUwL2pDXT4v8rviomzY4",
+        "statement": "LITAF is associated with inflammatory bowel disease."
+      },
+      {
+        "id": "dapper:Proposition.ZjqB4bPxArpExcd7hWP9afeboaxFg4qH",
+        "statement": "TNFSF15 is associated with inflammatory bowel disease."
+      },
+      {
+        "id": "dapper:Proposition.bxXL-ZO33-YkjfgHqqB2cYk9deaiWNmu",
+        "statement": "ELF1 is associated with inflammatory bowel disease."
+      }
+    ],
+    "publications": [
+      {
+        "id": "dapper:Publication.GzWxLYruKdCm55HQ-OQeB1MQsIEyv41k",
+        "doi": "doi:10.1371/journal.pone.0114665",
+        "pmid": "25501099",
+        "title": "Protective association of tumor necrosis factor superfamily 15 (TNFSF15) polymorphic haplotype with Ulcerative Colitis and Crohn's disease in an Indian population.",
+        "citation": "PMCID:PMC4264777"
+      },
+      {
+        "id": "dapper:Publication.OEUZX6j2Erg-N-pPQvaFV6LUGemN1Y5c",
+        "doi": "doi:10.1093/gastro/goae103",
+        "pmid": "39530074",
+        "title": "<i>TNFSF15</i> variant predicts disease progression in Chinese patients with Crohn's disease.",
+        "citation": "PMCID:PMC11552634"
+      },
+      {
+        "id": "dapper:Publication.PNHk2q-Edpz305Xthqc00d9K8jZNAoNH",
+        "doi": "doi:10.1186/s12864-022-08491-y",
+        "pmid": "35418025",
+        "title": "A systematic review and functional bioinformatics analysis of genes associated with Crohn’s disease identify more than 120 related genes",
+        "citation": "PMCID:PMC9008988"
+      },
+      {
+        "id": "dapper:Publication.RjmV9cR5q1jKfJNndaBMtqN3JEz0YDlL",
+        "doi": "doi:10.1038/s41598-025-98991-0",
+        "pmid": "40312552",
+        "title": "Uncovering shared genetic features between inflammatory bowel disease and systemic lupus erythematosus.",
+        "citation": "PMCID:PMC12046011"
+      },
+      {
+        "id": "dapper:Publication.MN1JNw1DDRQtJRbpYQ_1kQZh4ZBQrFY4",
+        "doi": "doi:10.3389/fimmu.2026.1761476",
+        "pmid": "41716401",
+        "title": "Integrated single-cell and transcriptomic profiling identifies machine-learning–based pyroptosis biomarkers in IBD",
+        "citation": "PMCID:PMC12913491"
+      }
+    ],
+    "organizations": [
+      {
+        "id": "dapper:Organization.vOYxfXQxbQEqpPD5YP1wUCM3OJHZsn1m",
+        "name": "REVEAL Mechanisms agent service"
+      }
+    ],
+    "evidence_items": [
+      {
+        "id": "dapper:EvidenceItem.jIkpn6lKuJo1jYuh6qs5-R3fcPWdaaPX",
+        "context": "Europe PMC abstract, PMID:25501099 (Baskaran et al. 2014, PLoS One). Human; Indian population; case-control SNP association. Abstract only; full text not read.",
+        "snippet": "Strong associations exist between TNFSF15 gene polymorphisms and IBD (both CD and UC) in the Indian population.",
+        "direction": "SUPPORTS",
+        "reference": "dapper:Publication.GzWxLYruKdCm55HQ-OQeB1MQsIEyv41k",
+        "explanation": "A primary case-control genotyping study (309 CD, 330 UC, 437 controls) found TNFSF15 SNPs rs10114470 and rs3810936 were associated with both CD and UC. The minor alleles were protective, and a haplotype block was strongly associated. This is independent human genetic replication outside European and Japanese GWAS cohorts.",
+        "value_locators": [
+          "dapper:ValueLocator.IjNo4Da-4Z_4YFbVttt9Q5zwWVnucYVl"
+        ],
+        "reference_title": "Protective association of tumor necrosis factor superfamily 15 (TNFSF15) polymorphic haplotype with Ulcerative Colitis and Crohn's disease in an Indian population.",
+        "was_derived_from": [
+          "dapper:File.Uo03RcspOSahzHvFgR5oHHf0JP9SL4h2"
+        ],
+        "target_proposition": "dapper:Proposition.ZjqB4bPxArpExcd7hWP9afeboaxFg4qH"
+      },
+      {
+        "id": "dapper:EvidenceItem.rDDugFn1yCEry42iaZrpXpFDD-Td04tV",
+        "context": "Europe PMC abstract, PMID:39530074 (Zhang et al. 2024, Gastroenterol Rep). Human; Chinese CD cohort; genotyping plus ileal tissue western blot and IHC. Abstract only.",
+        "snippet": "The G allele frequency of rs6478109 was significantly higher among CD patients compared with health controls (63.3% vs. 46.7%, <i>P </i><<i> </i>0.001).",
+        "direction": "SUPPORTS",
+        "reference": "dapper:Publication.OEUZX6j2Erg-N-pPQvaFV6LUGemN1Y5c",
+        "explanation": "A primary study of 428 Chinese CD patients and 450 controls replicated association of TNFSF15 rs6478109 with CD. The GG risk genotype predicted stricturing disease. Non-diseased ileal mucosa from GG carriers showed more TL1A protein and more pro-fibrotic TGFβ1/Smad3 signalling, which links genotype to expression in patient tissue.",
+        "value_locators": [
+          "dapper:ValueLocator.cdAesVYcD7AIu8RAsEO0Xi9WAO13Tf1o"
+        ],
+        "reference_title": "<i>TNFSF15</i> variant predicts disease progression in Chinese patients with Crohn's disease.",
+        "was_derived_from": [
+          "dapper:File.9a8jRUB3Lypub0AzdqMFeQj6tkZN8Ucf"
+        ],
+        "target_proposition": "dapper:Proposition.ZjqB4bPxArpExcd7hWP9afeboaxFg4qH"
+      },
+      {
+        "id": "dapper:EvidenceItem.cWww_usUc4qsDW6DkJqVGPeJUkSi_8mK",
+        "context": "Europe PMC open-access full text PMC9008988 (Garza-Hernandez et al. 2022, BMC Genomics), Results, Table 1 as rendered in the text, read at offset 8000. Systematic review, not a primary study.",
+        "snippet": "SLC22A55000YesTNFSF154504NoNOD14100No",
+        "direction": "SUPPORTS",
+        "reference": "dapper:Publication.PNHk2q-Edpz305Xthqc00d9K8jZNAoNH",
+        "explanation": "Table 1 of a PRISMA systematic review of Crohn disease genetics lists TNFSF15 among the top genes with experimental variant evidence for CD. It has 45 supporting abstracts and 4 GWAS Catalog studies, ranking just after NOD2, TNF, IL23R, ATG16L1, TLR4, IL10, SLC22A4, IRGM and SLC22A5. This is secondary corroboration that the association is extensively replicated.",
+        "value_locators": [
+          "dapper:ValueLocator.nw42UZpKcTHOjgITbHeHoPBeo-dryiAX"
+        ],
+        "reference_title": "A systematic review and functional bioinformatics analysis of genes associated with Crohn’s disease identify more than 120 related genes",
+        "was_derived_from": [
+          "dapper:File.NZsIQiLxdvdEcu2KOACqmytvdeG7x4PW"
+        ],
+        "target_proposition": "dapper:Proposition.ZjqB4bPxArpExcd7hWP9afeboaxFg4qH"
+      },
+      {
+        "id": "dapper:EvidenceItem.TfXfGoJa1z4XE0B4bOSQugi71XrgKuAQ",
+        "context": "Europe PMC open-access full text PMC9008988 (Garza-Hernandez et al. 2022, BMC Genomics), Results, Table 3 as rendered in the text, read at offset 8000. Secondary systematic review; the underlying GWAS paper was not read.",
+        "snippet": "TAB1 (1), CDYL2 (1), ELF1 (1)*, NLRP11 (1), IL2RB (1)",
+        "direction": "SUPPORTS",
+        "reference": "dapper:Publication.PNHk2q-Edpz305Xthqc00d9K8jZNAoNH",
+        "explanation": "In the same systematic review, Table 3 places ELF1 in the 'GWAS evidence within the gene' category for Crohn disease. The asterisk marks genes retrieved from the GWAS Catalog. This means ELF1 carries a CD-associated GWAS SNP within the gene but has no reported experimental variant work. The evidence is genetic association only.",
+        "value_locators": [
+          "dapper:ValueLocator.woezEL4L0PKF5LcqcdrRVE71jQ6uy8nW"
+        ],
+        "reference_title": "A systematic review and functional bioinformatics analysis of genes associated with Crohn’s disease identify more than 120 related genes",
+        "was_derived_from": [
+          "dapper:File.NZsIQiLxdvdEcu2KOACqmytvdeG7x4PW"
+        ],
+        "target_proposition": "dapper:Proposition.bxXL-ZO33-YkjfgHqqB2cYk9deaiWNmu"
+      },
+      {
+        "id": "dapper:EvidenceItem.u_PM5CeW7ysNivX7FSmYvxYlyl30rVug",
+        "context": "Europe PMC abstract, PMID:40312552 (Shaw et al. 2025, Sci Rep). Human GWAS summary statistics; local genetic correlation. Abstract only.",
+        "snippet": "local genetic correlation analysis demonstrated several positive and significant correlations in local genomic regions harboring disease variants in genes common to both SLE and IBD etiology, including variants in ELF1, CD226, JAZF1, WDFY4, and JAK2.",
+        "direction": "SUPPORTS",
+        "reference": "dapper:Publication.RjmV9cR5q1jKfJNndaBMtqN3JEz0YDlL",
+        "explanation": "A post-GWAS analysis using published summary statistics found significant positive local genetic correlation between IBD and SLE in the region harbouring ELF1. This implies the ELF1 region carries IBD association signal shared with lupus. It is statistical genetic evidence only and does not show which gene in the region is causal.",
+        "value_locators": [
+          "dapper:ValueLocator.KUPlFpdSqfOcdY-yNyEUCLNHxaUIS_f6"
+        ],
+        "reference_title": "Uncovering shared genetic features between inflammatory bowel disease and systemic lupus erythematosus.",
+        "was_derived_from": [
+          "dapper:File.lh7pLDVq4LNxgcFnVzenOUfJ3o1QMtZB"
+        ],
+        "target_proposition": "dapper:Proposition.bxXL-ZO33-YkjfgHqqB2cYk9deaiWNmu"
+      },
+      {
+        "id": "dapper:EvidenceItem.Qt8UOuns0Zu_7VDRTvb3vSM4pSMATbnj",
+        "context": "Europe PMC open-access full text PMC12913491 (Lu et al. 2026, Front Immunol), Results, 'Identification of optimal genes using machine learning', read at offset 12000. Human public datasets (mucosal scRNA-seq; blood GSE3365).",
+        "snippet": "Intersection analysis of the marker genes identified by all five algorithms yielded six characteristic genes: BASP1, LITAF, NAMPT, PHACTR1, PLAUR, and PPIF (Figure 4F).",
+        "direction": "SUPPORTS",
+        "reference": "dapper:Publication.MN1JNw1DDRQtJRbpYQ_1kQZh4ZBQrFY4",
+        "explanation": "Reanalysis of public intestinal-mucosa scRNA-seq and peripheral-blood bulk transcriptomes found LITAF among 16 pyroptosis-associated genes upregulated in IBD in both datasets. All five machine-learning methods selected it as a diagnostic feature, with a blood ROC AUC of 0.733. This is correlative expression evidence in patient samples. It is not genetic or functional evidence, UC and CD were pooled, and the study was exploratory.",
+        "value_locators": [
+          "dapper:ValueLocator.w4jgIlzS9gRDuOstB5Hrj5-XyceKHApF"
+        ],
+        "reference_title": "Integrated single-cell and transcriptomic profiling identifies machine-learning–based pyroptosis biomarkers in IBD",
+        "was_derived_from": [
+          "dapper:File.k2yt0KLsYybUpkNnNupcGfYAuuwPm1LI"
+        ],
+        "target_proposition": "dapper:Proposition.JeQkYCGqX76DkUwL2pDXT4v8rviomzY4"
+      },
+      {
+        "id": "dapper:EvidenceItem.V3BXfWQyLaI04tI7IQ23FKy4ijlmbza_",
+        "context": "Europe PMC open-access full text PMC12913491 (Lu et al. 2026, Front Immunol), Discussion, read at offset 12000. Secondary citation within the paper.",
+        "snippet": "LITAF, representing the inflammatory transcriptional regulatory axis, is a critical regulator of TNF-α with established pro-inflammatory roles in IBD (35).",
+        "direction": "SUPPORTS",
+        "reference": "dapper:Publication.MN1JNw1DDRQtJRbpYQ_1kQZh4ZBQrFY4",
+        "explanation": "The authors' discussion says LITAF regulates TNF-α and has established pro-inflammatory roles in IBD, citing their reference 35. This is a secondary statement. The cited primary work was not read here, so it only points to the existence of prior functional literature.",
+        "value_locators": [
+          "dapper:ValueLocator.hdymAOh-DHPLWH0N2CGMIMqlctE9sqhF"
+        ],
+        "reference_title": "Integrated single-cell and transcriptomic profiling identifies machine-learning–based pyroptosis biomarkers in IBD",
+        "was_derived_from": [
+          "dapper:File.k2yt0KLsYybUpkNnNupcGfYAuuwPm1LI"
+        ],
+        "target_proposition": "dapper:Proposition.JeQkYCGqX76DkUwL2pDXT4v8rviomzY4"
+      }
+    ],
+    "knowledge_gaps": [
+      {
+        "id": "dapper:KnowledgeGap.2kkY6C6ST0pPiQn1CIn1gljixm-IURpD",
+        "text": "Which of the top PIGEAN candidate genes for inflammatory bowel disease (LITAF, TNFSF15, ELF1) have published evidence of a role in the disease?",
+        "gap_description": "Question supplied by the requester of a REVEAL literature account. It is the question the account addresses, not a knowledge gap curated from a source catalogue."
+      }
+    ],
+    "value_locators": [
+      {
+        "id": "dapper:ValueLocator.IjNo4Da-4Z_4YFbVttt9Q5zwWVnucYVl",
+        "file": "dapper:File.Uo03RcspOSahzHvFgR5oHHf0JP9SL4h2",
+        "selector": "abstract; chars=1378-1489",
+        "byte_start": 1382,
+        "media_type": "text/html",
+        "value_text": "Strong associations exist between TNFSF15 gene polymorphisms and IBD (both CD and UC) in the Indian population.",
+        "byte_length": 111
+      },
+      {
+        "id": "dapper:ValueLocator.cdAesVYcD7AIu8RAsEO0Xi9WAO13Tf1o",
+        "file": "dapper:File.9a8jRUB3Lypub0AzdqMFeQj6tkZN8Ucf",
+        "selector": "abstract; chars=775-927",
+        "byte_start": 775,
+        "media_type": "text/html",
+        "value_text": "The G allele frequency of rs6478109 was significantly higher among CD patients compared with health controls (63.3% vs. 46.7%, <i>P </i><<i> </i>0.001).",
+        "byte_length": 156
+      },
+      {
+        "id": "dapper:ValueLocator.nw42UZpKcTHOjgITbHeHoPBeo-dryiAX",
+        "file": "dapper:File.NZsIQiLxdvdEcu2KOACqmytvdeG7x4PW",
+        "selector": "paragraph=26; section=Classification and identification of CD genes; chars=17213-17250",
+        "byte_start": 17298,
+        "media_type": "text/plain",
+        "value_text": "SLC22A55000YesTNFSF154504NoNOD14100No",
+        "byte_length": 37
+      },
+      {
+        "id": "dapper:ValueLocator.woezEL4L0PKF5LcqcdrRVE71jQ6uy8nW",
+        "file": "dapper:File.NZsIQiLxdvdEcu2KOACqmytvdeG7x4PW",
+        "selector": "paragraph=29; section=Classification and identification of CD genes; chars=19093-19146",
+        "byte_start": 19184,
+        "media_type": "text/plain",
+        "value_text": "TAB1 (1), CDYL2 (1), ELF1 (1)*, NLRP11 (1), IL2RB (1)",
+        "byte_length": 53
+      },
+      {
+        "id": "dapper:ValueLocator.KUPlFpdSqfOcdY-yNyEUCLNHxaUIS_f6",
+        "file": "dapper:File.lh7pLDVq4LNxgcFnVzenOUfJ3o1QMtZB",
+        "selector": "abstract; chars=1394-1644",
+        "byte_start": 1398,
+        "media_type": "text/html",
+        "value_text": "local genetic correlation analysis demonstrated several positive and significant correlations in local genomic regions harboring disease variants in genes common to both SLE and IBD etiology, including variants in ELF1, CD226, JAZF1, WDFY4, and JAK2.",
+        "byte_length": 250
+      },
+      {
+        "id": "dapper:ValueLocator.w4jgIlzS9gRDuOstB5Hrj5-XyceKHApF",
+        "file": "dapper:File.k2yt0KLsYybUpkNnNupcGfYAuuwPm1LI",
+        "selector": "paragraph=22; section=Identification of optimal genes using machine learning; chars=16756-16924",
+        "byte_start": 16825,
+        "media_type": "text/plain",
+        "value_text": "Intersection analysis of the marker genes identified by all five algorithms yielded six characteristic genes: BASP1, LITAF, NAMPT, PHACTR1, PLAUR, and PPIF (Figure 4F).",
+        "byte_length": 169
+      },
+      {
+        "id": "dapper:ValueLocator.hdymAOh-DHPLWH0N2CGMIMqlctE9sqhF",
+        "file": "dapper:File.k2yt0KLsYybUpkNnNupcGfYAuuwPm1LI",
+        "selector": "paragraph=27; section=Discussion; chars=21426-21581",
+        "byte_start": 21508,
+        "media_type": "text/plain",
+        "value_text": "LITAF, representing the inflammatory transcriptional regulatory axis, is a critical regulator of TNF-α with established pro-inflammatory roles in IBD (35).",
+        "byte_length": 156
+      }
+    ],
+    "scientific_accounts": [
+      {
+        "id": "dapper:ScientificAccount.1FmKLxZMYHdplxGK0qxpLjO93kaIr6-B",
+        "context": "Assesses whether three top PIGEAN IBD candidates (LITAF, TNFSF15, ELF1) have published evidence of a role in IBD. Sources came from 8 Europe PMC searches. Five cited papers were read: 3 abstracts and 2 partial open-access full texts; a sixth abstract (Whiley 2025) was read but not used. Repository claims motivated the gene choice and were not cited.",
+        "question": "dapper:KnowledgeGap.2kkY6C6ST0pPiQn1CIn1gljixm-IURpD",
+        "closing_remarks": "TNFSF15 is a well-established IBD gene, with replicated human genetics in several ancestries and genotype-linked TL1A expression in patient ileum. ELF1 is supported only as a Crohn disease GWAS locus shared with SLE. LITAF evidence is the weakest here: one correlative transcriptomic study plus a secondary citation. No primary GWAS or functional LITAF paper was read. Not read: the original IBD GWAS and meta-analyses that reported these loci (e.g., Franke 2010, Jostins 2012, Liu 2015), TL1A transgenic, knockout or antibody mouse colitis studies, the primary LITAF functional work cited as ref 35 in Lu et al., and full texts of the abstract-only papers. Search ranking favoured recent reviews, and the search budget was exhausted before a targeted ELF1 or LITAF genetics search.",
+        "component_claims": [
+          "dapper:Claim.sZA3VptxvrR08U3M_oKsuXrOPWv60Ghu",
+          "dapper:Claim.FA-LGxVBz5609ld9VWdlh78R9_jiZbJC",
+          "dapper:Claim.ChHbOyX7Ed_0P_IfWM4kW-Id7yGeFaWC"
+        ],
+        "was_generated_by": "dapper:Activity.XDbJUk04gTGSFbnq0iiBhmY0lEI5hA1s",
+        "was_attributed_to": [
+          "dapper:Organization.vOYxfXQxbQEqpPD5YP1wUCM3OJHZsn1m"
+        ]
+      }
+    ],
+    "was_derived_from_edges": [
+      {
+        "object": "dapper:File.pP7IQ02lIDK-7teM7G7ApzpwKci1iWCD",
+        "subject": "dapper:File.Uo03RcspOSahzHvFgR5oHHf0JP9SL4h2",
+        "predicate": "prov:wasDerivedFrom"
+      },
+      {
+        "object": "dapper:File.-GHIZ8ahrogRCNWg_3VE3JO1qdgbug4o",
+        "subject": "dapper:File.9a8jRUB3Lypub0AzdqMFeQj6tkZN8Ucf",
+        "predicate": "prov:wasDerivedFrom"
+      },
+      {
+        "object": "dapper:File.OQzz3ulYclt0sD1tl9DtYZ9BfZXVWxd1",
+        "subject": "dapper:File.NZsIQiLxdvdEcu2KOACqmytvdeG7x4PW",
+        "predicate": "prov:wasDerivedFrom"
+      },
+      {
+        "object": "dapper:File.kwKrFp4IriPlJBTapW4BEANIbujvZWq4",
+        "subject": "dapper:File.lh7pLDVq4LNxgcFnVzenOUfJ3o1QMtZB",
+        "predicate": "prov:wasDerivedFrom"
+      },
+      {
+        "object": "dapper:File.heNlE69PK_ooHueMVdLbdZuf3vkK91yf",
+        "subject": "dapper:File.k2yt0KLsYybUpkNnNupcGfYAuuwPm1LI",
+        "predicate": "prov:wasDerivedFrom"
+      }
+    ]
+  }
+}

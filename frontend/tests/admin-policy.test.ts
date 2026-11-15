@@ -30,6 +30,8 @@ const READS = [
   "tables", "tables/dapper_objects/rows", "activity",
   "registration/sources", "registration/jobs", "registration/jobs/Ab_9-x",
   "keys",
+  "objects", "objects/classes", "objects/dapper:ScientificAccount.1FmKLxZMYHdplxGK0qxpLjO93kaIr6-B", "objects/dapper:File.local05d7d245",
+  "deposits", "accounts", "accounts/dapper:ScientificAccount.1FmKLxZMYHdplxGK0qxpLjO93kaIr6-B",
 ];
 const REVOKE = "keys/key_0123456789abcdef/revoke";
 const WRITES = ["registration/check", "registration/jobs", "keys", REVOKE];
@@ -54,6 +56,8 @@ test("proxy reads only the read API", () => {
     "collections/pigean/queries/top", "collections/pigean/queries/top/example/run", "collections/pigean/queries/../example",
     "registration/jobs/", `registration/jobs/${"j".repeat(65)}`, "registration/jobs/a.b", "registration/jobs/a/b", "registration/jobs/../check",
     "registration", "registration/sources/x", "overview\n", "me\n",
+    "objects/", "objects/not-an-id", "objects/classes/x", "objects/dapper:Claim.a/b", "objects/dapper:Claim.a?x=1", "objects/../keys",
+    "accounts/", "accounts/not-an-id", "accounts/dapper:Claim.a/texts", "deposits/dep_01", "deposits/",
     REVOKE, ...BAD_KEY_PATHS,
   ]) assert.equal(readablePath(bad), false, JSON.stringify(bad));
   assert.equal(readablePath(`collections/${"a".repeat(128)}`), true);

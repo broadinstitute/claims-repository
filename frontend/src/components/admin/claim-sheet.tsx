@@ -50,6 +50,11 @@ export function ClaimSheet({ claimId, onClose }: { claimId: string | null; onClo
               ["Identity profile", <span key="i" className="font-mono text-xs">{d.identityProfile}</span>],
               ["Stored claims on proposition", number(d.claimsAssessingProposition)],
               ["Resolver", <span key="r" className="inline-flex gap-3"><a href={d.resolverUrl} target="_blank" rel="noopener noreferrer" className="underline-offset-4 hover:underline">Open</a><CopyButton text={d.claimId} label="Copy ID" /></span>],
+              ["Stored objects", <span key="o" className="inline-flex flex-wrap gap-3">
+                {d.minted && <ObjectLink id={d.claimId}>Claim</ObjectLink>}
+                {typeof d.proposition?.id === "string" && <ObjectLink id={d.proposition.id}>Proposition</ObjectLink>}
+                {!d.minted && !d.proposition && <span className="text-muted-foreground">Nothing stored yet</span>}
+              </span>],
             ]} />
             {d.scores.length > 0 && <section>
               <h3 className="mb-2 text-sm font-semibold">Scores</h3>
@@ -58,7 +63,7 @@ export function ClaimSheet({ claimId, onClose }: { claimId: string | null; onClo
             {d.evidence.length > 0 && <section>
               <h3 className="mb-2 text-sm font-semibold">Evidence ({d.evidence.length})</h3>
               <div className="space-y-2 text-sm">
-                {d.evidence.map(ev => <details key={ev.id}><summary className="cursor-pointer">{ev.missing ? `${shortId(ev.id)} (missing)` : ev.name ?? shortId(ev.id)}</summary><div className="mt-2"><Json value={ev} /></div></details>)}
+                {d.evidence.map(ev => <details key={ev.id}><summary className="cursor-pointer">{ev.missing ? `${shortId(ev.id)} (missing)` : ev.name ?? shortId(ev.id)}</summary><div className="mt-2 space-y-2">{!ev.missing && <ObjectLink id={ev.id}>Open with what it references</ObjectLink>}<Json value={ev} /></div></details>)}
               </div>
             </section>}
             {d.source && <Source source={d.source} />}
@@ -69,6 +74,11 @@ export function ClaimSheet({ claimId, onClose }: { claimId: string | null; onClo
       </SheetContent>
     </Sheet>
   );
+}
+
+/** Opens a stored object in the object browser, where every slot and reference is shown. */
+function ObjectLink({ id, children }: { id: string; children: ReactNode }) {
+  return <Link href={`/admin/objects?object=${encodeURIComponent(id)}`} className="text-xs underline-offset-4 hover:underline">{children}</Link>;
 }
 
 function Source({ source: s }: { source: ClaimSource }) {

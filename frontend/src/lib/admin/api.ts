@@ -144,6 +144,52 @@ export type ClaimDetail = {
   claimsAssessingProposition: number; resolverUrl: string;
 };
 
+// The object browser: any stored object of any class, as stored.
+
+export type ObjectSummary = { id: string; className: string | null; label: string | null; stored: boolean };
+export type ObjectRow = {
+  id: string; className: string; label: string | null; identityProfile: string; timesSeen: number;
+  createdAt: string | null; lastSeenAt: string | null; slots: string[];
+};
+export type ObjectList = { total: number; page: number; pageSize: number; rows: ObjectRow[] };
+export type ClassCount = { className: string; count: number };
+export type ObjectClasses = { total: number; classes: ClassCount[]; edgeClasses: ClassCount[]; deposits: number };
+export type DepositRef = {
+  depositId: string; receivedAt: string | null; objectCount: number;
+  depositor: { keyId: string; name: string }; status?: string;
+};
+export type DepositList = { total: number; page: number; pageSize: number; rows: DepositRef[] };
+export type ObjectEdge = {
+  className: string; subject: string; object: string; predicate: string | null; document: unknown; depositIds: string[];
+  subjectSummary?: ObjectSummary | null; objectSummary?: ObjectSummary | null;
+};
+export type Doc = Record<string, unknown>;
+export type ObjectDetail = {
+  id: string; stored: boolean; className: string | null; label: string | null; identityProfile: string | null;
+  timesSeen: number; createdAt: string | null; lastSeenAt: string | null; document: Doc | null; triple: Triple | null;
+  references: (ObjectSummary & { slot: string })[];
+  referencedBy: { total: number; objects: ObjectSummary[] };
+  edges: ObjectEdge[]; deposits: DepositRef[]; resolverUrl: string | null;
+};
+
+// Scientific accounts: one account with everything it points at, each object as stored.
+
+export type AccountRow = {
+  id: string; question: string | null; claims: number; attributedTo: string[]; storedAt: string | null;
+  timesSeen: number; deposits: number; lastDeposit: DepositRef | null;
+};
+export type AccountList = { total: number; page: number; pageSize: number; rows: AccountRow[] };
+export type StoredNode = { id: string; document: Doc | null };
+export type AccountQuote = { id: string; document: Doc | null; file: StoredNode | null; derivedFrom: StoredNode[] };
+export type AccountEvidence = { id: string; document: Doc | null; publication: StoredNode | null; quotes: AccountQuote[] };
+export type AccountClaim = { id: string; document: Doc | null; proposition: StoredNode | null; triple: Triple | null; evidence: AccountEvidence[] };
+export type AccountDetail = {
+  id: string; document: Doc; storedAt: string | null; timesSeen: number;
+  question: StoredNode | null; activity: StoredNode | null; attributedTo: StoredNode[];
+  claims: AccountClaim[]; deposits: DepositRef[]; edges: ObjectEdge[]; objectsByClass: ClassCount[];
+  missing: string[]; resolverUrl: string;
+};
+
 // Registration (the Add collection flow).
 
 export type RegistrationSources = {
