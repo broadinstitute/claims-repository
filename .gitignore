@@ -4,3 +4,4 @@ __pycache__/
 claims.db
 .DS_Store
 .pytest_cache/
+site/
