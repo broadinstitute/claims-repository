@@ -1,7 +1,7 @@
 # Introduction
 
-The Broad Institute Claims Repository API service allows users to search and 
-register deposited scientific claims along with their associated provenance.
+The Knowledge Portal Network Claims Repository service allows users to search 
+and register deposited scientific claims along with their associated provenance.
 
 All claims in the service are modeled using the Dataset Attribution and Evidence
 Profile for Evidence Retrieval (DAPPER schema). DAPPER is a LinkML schema that
@@ -16,7 +16,7 @@ following format
 dapper:Class_Name:digest
 ```
 
-Here, `dapper` is the namesapce, `Class_Name` describes the corresponding 
+Here, `dapper` is the namespace, `Class_Name` describes the corresponding 
 class name, and `digest` is a 32 character digest that is encoded using the
 sha512t24 algorithm ([Hart and Prlić 2020](#hart-prlic-2020)).
 

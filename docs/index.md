@@ -1,6 +1,9 @@
 # Claims Repository Documentation
 
-- [Introduction](introduction.md): what the service does, DAPPER, and how object identifiers are built.
+Please use the links here to navigate to different documentation about the
+Knowledge Portal Network Claims Repository service.
+
+- [Introduction](introduction.md): what the service does, what DAPPER is, and how object identifiers are built.
 - [Inputs and outputs](inputs-and-outputs.md): what goes in and out of the repository, and why.
 - [Method modules](method-modules.md): how each method's claim template ships its own GraphQL schema module.
 - [Graph-query contract design](query-graph-design.md): execution semantics, storage design, and open decisions.
