@@ -1,4 +1,4 @@
-# Claims Repository documentation
+# Claims Repository Documentation
 
 - [Introduction](introduction.md): what the service does, DAPPER, and how object identifiers are built.
 - [Inputs and outputs](inputs-and-outputs.md): what goes in and out of the repository, and why.
