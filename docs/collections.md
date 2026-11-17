@@ -27,8 +27,8 @@ the same claims and the same challenge-query results, and then a second method
 | Owner-hosted APIs | Pull and snapshot a release through a small Rows contract; live calls only for data that cannot leave the owner's system. |
 | Query surface | A generic plan executor, `runQuery(collection, query, variables)`. Typed GraphQL may be generated later. |
 | Organizing object | The **collection**: files, datasets, templates and queries, released together, and self-describing. |
-| Collection identity | A UUID declared as `id` in the manifest, written once by the owner and reviewed in git, so a collection has the same id in every database. Its short name is a **handle**: unique, changeable, and accepted wherever a collection is addressed. Claim ids depend on the UUID, never on the handle or the title. |
-| Collection in DAPPER | Each release is a DAPPER `ResultCollection` record; the release id is its DAPPER id, and its `collection_key` holds the collection's UUID. `ResultCollection` and `GeneSetCollection` both inherit from an abstract DAPPER `Collection` (members plus a version chain). |
+| Collection identity | The **handle** (the manifest's `collection:`, such as `pigean`), decided 2026-11-17 by Chase: it is what a collection is addressed by and what claim ids depend on. A UUID, if one is ever added, is internal to the database and enters no id. The UUID-as-identity design described in §1, §2 and §12 below was never built and is superseded by this row. |
+| Collection in DAPPER | Each release is a DAPPER `ResultCollection` record; the release id is its DAPPER id, and its `collection_key` holds the collection's handle. `ResultCollection` and `GeneSetCollection` both inherit from an abstract DAPPER `Collection` (members plus a version chain). |
 | Bringing data | Upload, an owner's Rows API, or a pointer to a data repository: a Croissant record, a DOI or DRS objects. All three snapshot bytes by sha256. |
 | Ids | DAPPER-ID-1 now, through dapper's own `dapper_identity` at the 0.2.1-a1 tag. No interim local-dev scheme. |
 | Methods per collection | One is the norm. More than one is allowed, but DAPPER documents it as usually an anti-pattern and the linter warns. |
@@ -101,10 +101,10 @@ dimensions:
   trait:   { entity: Trait }            # resolved through the KPN trait registry
   library: { type: string }             # gene-set library, e.g. cfde-inc-v2
 entities:           # how a file's value becomes a CURIE; values are never normalized
-  Gene:    { prefix: hgnc.symbol }      # today's files carry symbols; switch if they move to HGNC ids
+  Gene:    { prefix: HGNC.SYMBOL }      # today's files carry symbols; switch if they move to HGNC ids
   GeneSet: { mint: GeneSet }            # DAPPER GeneSet id from the membership roster
   Trait:   { registry: kpn-traits }     # IBD -> KPN.TRAIT:0000505
-prefixes: { hgnc.symbol: "https://identifiers.org/hgnc.symbol:" }
+prefixes: { HGNC.SYMBOL: "https://identifiers.org/hgnc.symbol:" }
 row_kinds:
   gene_phenotype:     { subject: Gene,    object: $trait, metrics: [combined, log_bf, prior] }
   gene_set_phenotype: { subject: GeneSet, object: $trait, metrics: [beta, beta_uncorrected] }
@@ -419,7 +419,8 @@ Open:
 1. **Releasing 0.2.1-a1.** The schema, linter, examples and docs are in the
    dapper working tree. It still needs a commit, a PR to broadinstitute/dapper
    and the tag.
-2. **Gene symbol namespace.** `hgnc.symbol` (identifiers.org) is the proposed
+2. **Gene symbol namespace.** Decided 2026-11-17: `HGNC.SYMBOL:` (upper case, as REVEAL deposits
+   write it), expanding to identifiers.org `hgnc.symbol`. Earlier text: `hgnc.symbol` (identifiers.org) is the proposed
    prefix for symbol-keyed files. It is a declaration in the manifest, not a
    mapping step.
 3. **Claim-only documents.** DAPPER has no linter profile for a document of
@@ -445,7 +446,7 @@ Built, beside the PIGEAN path rather than replacing it:
 - **The template engine** (`service/collections/engine.py`): placeholders plus
   `classify`, `direction`, `locate` and grouping. Measurement, tier and roster
   claims all render from templates, so tier claims now mint on serve too.
-- **Collections are identified by UUID.** The manifest's required `id` is the
+- **(Not built; superseded 2026-11-17: the handle is the identity.)** Collections are identified by UUID. The manifest's required `id` is the
   identity and `collection:` is a changeable handle, accepted wherever a
   collection is addressed. A local SQLite database made before this change is
   refused on connect: drop its collection tables (or delete the database) and
@@ -457,6 +458,17 @@ Built, beside the PIGEAN path rather than replacing it:
   yields 23,321 rows, 143,508 edges and 92,135 mintable claims. Claim ids
   depend only on the template, the file and the manifest's minting semantics,
   so a new release of unchanged data re-addresses nothing.
+- **Partial releases and files by location** (2026-11-17). A release specification may carry `where`
+  (for the whole release or per dataset): strict lower bounds per row kind and metric, such as
+  `gene_phenotype: {combined: {gt: 0.5}}`. A row at or below a bound is not ingested at all. A minted
+  entity (a gene set) then exists only for a kept row and keeps its whole roster, because its roster
+  claim counts the edges that end at it. The bounds are written into the Dataset description and enter
+  no claim id; the same files under other bounds cannot be a second dataset, and adding rows to an
+  ingested dataset is not supported yet. A result file may be given by `location` (an `s3://` URI)
+  with its `sha256` and `size` instead of a `path`; the CLI downloads it when its dataset is ingested,
+  checks the sha256 and removes it. Each dataset is stored in its own transaction and the release is
+  recorded last, so an interrupted publish resumes. Edge files are read with a bare Python `None` as
+  null (some aggregator runs write their membership file that way); row files stay strict.
 - **Serving and discovery.** Claims are re-rendered and checked on every serve
   (a drifted row is refused). Endpoints: `GET /v1/collections`,
   `/v1/collections/{c}`, `/v1/collections/{c}/queries`,

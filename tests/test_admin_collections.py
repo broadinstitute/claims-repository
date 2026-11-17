@@ -542,7 +542,7 @@ def test_claim_detail_never_mints_or_asserts(published):
     assert d["verification"] == {"collectionBacked": True, "renders": True, "storedMatches": None, "error": None}
     assert d["claim"]["id"] == unminted["claimId"] and d["statement"] == d["claim"]["statement"]
     assert d["collection"] == "pigean" and d["claimKey"] == "tier-combined" and d["method"] == "pigean"
-    assert d["proposition"]["id"] == d["claim"]["proposition"] and d["triple"]["subject"].startswith("hgnc.symbol:")
+    assert d["proposition"]["id"] == d["claim"]["proposition"] and d["triple"]["subject"].startswith("HGNC.SYMBOL:")
     src = d["source"]
     assert src["template"]["name"] == "gene" and src["releases"] == ["0.0.1-test"] and src["group"] is None
     assert src["row"]["kind"] == "gene_phenotype" and src["row"]["subject"]["value"] == unminted["subject"]

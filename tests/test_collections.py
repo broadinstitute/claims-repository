@@ -250,7 +250,7 @@ def test_serving_mints_claims_once_and_counts_reassertions(published):
     stored, doc = _fetch(measurement["id"])
     assert stored["identity_profile"] == idn.PROFILE and idn.verify(doc)
     assert doc == measurement["claim"]
-    assert measurement["triple"]["subject"].startswith("hgnc.symbol:")
+    assert measurement["triple"]["subject"].startswith("HGNC.SYMBOL:")
     assert measurement["evidence"][0]["valueLocators"][0]["value_text"]
     tier = row["claims"]["tier-combined"]["claim"]
     assert tier["direction"] in ("SUPPORTS", "NEUTRAL")
@@ -369,3 +369,152 @@ def test_a_collection_claims_address_is_reserved_on_deposit(published):
     served = client.post("/v1/graphql", json={"query": f'{{ claim(id: "{genuine["id"]}") {{ id }} }}'}).json()
     assert "errors" not in served and served["data"]["claim"]["id"] == genuine["id"]
 
+
+
+# --- partial releases, files by location, resume ---------------------------
+
+PIGEAN_FIX = FIX / "pigean"
+ROLES = {"gene_stats": "combined_gene_stats.json", "gene_set_stats": "combined_gene_set_stats.json",
+         "membership": "gene_gene_set_stats.json"}
+
+
+def _fresh_db():
+    return service_db.connect(str(Path(tempfile.mkdtemp()) / "partial.db"))
+
+
+def _variant_files(tmp_path, phenotype="FIXPHENO"):
+    """A copy of the PIGEAN fixture files, optionally as another phenotype's run."""
+    out = tmp_path / phenotype
+    out.mkdir(parents=True, exist_ok=True)
+    for name in ROLES.values():
+        rows = [json.loads(line) for line in (PIGEAN_FIX / name).read_text().splitlines() if line.strip()]
+        for row in rows:
+            row["phenotype"] = phenotype
+        (out / name).write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return out
+
+
+def _spec(folder, version="0.1.0-partial", phenotype="FIXPHENO", **extra):
+    return {"version": version, **extra, "datasets": [{
+        "dimensions": {"trait": phenotype, "library": "fixture-v1"},
+        "files": {role: {"path": str(folder / name)} for role, name in ROLES.items()}}]}
+
+
+def test_where_bounds_ingest_kept_rows_and_whole_rosters(tmp_path):
+    # Fixture rows: genes FIXG1 3.5, FIXG2 2, FIXG3 4.75; sets FIXSET_A 1.5, FIXSET_B 0.9;
+    # pairs (FIXG1, A), (FIXG2, A), (FIXG1, B). Bounds are strict.
+    col = load_collection(COLLECTION)
+    folder = _variant_files(tmp_path)
+    where = {"gene_phenotype": {"combined": {"gt": 2}}, "gene_set_phenotype": {"beta_uncorrected": {"gt": 1.0}}}
+    con = _fresh_db()
+    try:
+        out = publish(con, col, _spec(folder, where=where), tmp_path)
+        assert (out.stats["rows"], out.stats["edges"]) == (3, 2)
+        subjects = {(r["kind"], r["subject_value"]) for r in con.execute("SELECT kind, subject_value FROM result_rows")}
+        assert subjects == {("gene_phenotype", "FIXG1"), ("gene_phenotype", "FIXG3"), ("gene_set_phenotype", "FIXSET_A")}
+        # The kept set keeps its whole roster, including a gene whose own row was dropped.
+        edges = {(r["from_value"], r["to_value"]) for r in con.execute("SELECT from_value, to_value FROM result_edges")}
+        assert edges == {("FIXG1", "FIXSET_A"), ("FIXG2", "FIXSET_A")}
+        sets = [json.loads(r["payload"]) for r in con.execute("SELECT payload FROM dapper_objects WHERE id LIKE 'dapper:GeneSet.%'")]
+        assert [(s["name"], s["members"]) for s in sets] == [("FIXSET_A", ["HGNC.SYMBOL:FIXG1", "HGNC.SYMBOL:FIXG2"])]
+        # Nothing is minted for a dropped row, and the bounds are named on the Dataset.
+        statements = " ".join(json.loads(r["payload"]).get("statement", "") for r in
+                              con.execute("SELECT payload FROM dapper_objects WHERE id LIKE 'dapper:Proposition.%'"))
+        assert "FIXG2" not in statements and "FIXSET_B" not in statements
+        dataset = out.document["datasets"][0]
+        assert "combined > 2" in dataset["description"] and "beta_uncorrected > 1" in dataset["description"]
+        # Claim ids do not depend on the bounds: the same rows give the same claims unbounded.
+        bounded = {r["claim_id"] for r in con.execute("SELECT claim_id FROM result_claims")}
+        other = _fresh_db()
+        try:
+            publish(other, col, _spec(folder), tmp_path)
+            assert bounded < {r["claim_id"] for r in other.execute("SELECT claim_id FROM result_claims")}
+        finally:
+            other.close()
+        # The same files under other bounds cannot be a second dataset.
+        looser = {"gene_phenotype": {"combined": {"gt": 1}}}
+        with pytest.raises(PublishError, match="other `where` bounds"):
+            publish(con, col, _spec(folder, version="0.1.1-partial", where=looser), tmp_path)
+        with pytest.raises(PublishError, match="not a metric of that row kind"):
+            publish(con, col, _spec(folder, version="0.1.2-partial", where={"gene_phenotype": {"beta": {"gt": 1}}}), tmp_path)
+    finally:
+        con.close()
+
+
+def test_python_none_is_read_in_edge_files_only(tmp_path):
+    col = load_collection(COLLECTION)
+    folder = _variant_files(tmp_path)
+    membership = folder / ROLES["membership"]
+    lines = membership.read_text().splitlines()
+    lines[0] = lines[0][:-1] + ', "log_bf": None}'
+    membership.write_text("\n".join(lines) + "\n")
+    con = _fresh_db()
+    try:
+        assert publish(con, col, _spec(folder), tmp_path).stats["edges"] == 3
+    finally:
+        con.close()
+    genes = folder / ROLES["gene_stats"]
+    genes.write_text(genes.read_text().replace('"n": 4', '"n": None'))
+    con = _fresh_db()
+    try:
+        with pytest.raises(PublishError, match="not valid JSON"):
+            publish(con, col, _spec(folder), tmp_path)
+    finally:
+        con.close()
+
+
+def test_files_by_location_are_fetched_checked_and_resumed(tmp_path):
+    import hashlib
+
+    col = load_collection(COLLECTION)
+    folders = {p: _variant_files(tmp_path / "upstream", p) for p in ("FIXPHENO", "OTHERPHENO")}
+    spec = {"version": "0.2.0-located", "datasets": []}
+    for phenotype, folder in folders.items():
+        files = {}
+        for role, name in ROLES.items():
+            data = (folder / name).read_bytes()
+            files[role] = {"location": f"s3://bucket/{phenotype}/{name}", "sha256": hashlib.sha256(data).hexdigest(),
+                           "size": len(data)}
+        spec["datasets"].append({"dimensions": {"trait": phenotype, "library": "fixture-v1"}, "files": files})
+    work = tmp_path / "work"
+    calls = []
+
+    def fetch(location, dest, fail_on=None):
+        calls.append(location)
+        if fail_on and fail_on in location:
+            raise PublishError(f"cannot fetch {location}")
+        dest.write_bytes((folders[location.split("/")[3]] / location.rsplit("/", 1)[1]).read_bytes())
+
+    con = _fresh_db()
+    try:
+        with pytest.raises(PublishError, match="needs a fetcher"):
+            publish(con, col, spec, tmp_path)
+        # The second dataset's fetch fails: the first is stored, no release is recorded, nothing is left on disk.
+        with pytest.raises(PublishError, match="cannot fetch"):
+            publish(con, col, spec, tmp_path, workdir=work, fetch=lambda loc, dest: fetch(loc, dest, "OTHERPHENO"))
+        assert con.execute("SELECT COUNT(DISTINCT dataset_id) AS n FROM dataset_files").fetchone()["n"] == 1
+        assert con.execute("SELECT COUNT(*) AS n FROM collection_releases").fetchone()["n"] == 0
+        assert not [p for p in work.rglob("*") if p.is_file()]
+        # A staged run that has nothing left under its limit stores nothing new and records no release.
+        staged = publish(con, col, spec, tmp_path, workdir=work, fetch=fetch, max_ingest=0)
+        assert not staged.complete and "not recorded" in staged.warnings[-1]
+        assert con.execute("SELECT COUNT(*) AS n FROM collection_releases").fetchone()["n"] == 0
+        # A shard that owns nothing still missing does the same.
+        sharded = publish(con, col, spec, tmp_path, workdir=work, fetch=fetch, shard=(0, 2))
+        assert not sharded.complete and sharded.stats["datasets_ingested"] == 0
+        # Re-running fetches and ingests only what is missing, then records the release.
+        calls.clear()
+        out = publish(con, col, spec, tmp_path, workdir=work, fetch=fetch)
+        assert out.complete and out.stats["datasets_ingested"] == 1 and all("OTHERPHENO" in c for c in calls)
+        assert con.execute("SELECT COUNT(*) AS n FROM release_datasets").fetchone()["n"] == 2
+        assert not [p for p in work.rglob("*") if p.is_file()]
+        # A file that is not the declared bytes is refused.
+        bad = copy.deepcopy(spec)
+        bad["version"] = "0.2.1-located"
+        bad["datasets"] = [copy.deepcopy(spec["datasets"][0])]
+        bad["datasets"][0]["dimensions"]["trait"] = "THIRDPHENO"
+        bad["datasets"][0]["files"]["gene_stats"]["sha256"] = "0" * 64
+        with pytest.raises(PublishError, match="the release declares"):
+            publish(con, col, bad, tmp_path, workdir=work, fetch=fetch)
+    finally:
+        con.close()

@@ -20,7 +20,7 @@ attribution:
   agent: urn:broad:dig-aggregator-pipeline
 
 prefixes:
-  hgnc.symbol: "https://identifiers.org/hgnc.symbol:"
+  HGNC.SYMBOL: "https://identifiers.org/hgnc.symbol:"
   biolink: "https://w3id.org/biolink/vocab/"
   KPN.TRAIT: "https://broadinstitute.github.io/kpn-data-models/kpn.trait/"
 
@@ -44,7 +44,7 @@ dataset_dimensions:
 # them (gene symbols today); only the prefix is declared here.
 entities:
   Gene:
-    id: "hgnc.symbol:{value}"
+    id: "HGNC.SYMBOL:{value}"
   GeneSet:
     mint: GeneSet           # a DAPPER GeneSet per set and dataset
     members_from: member_of # members: the genes the dataset's membership file lists

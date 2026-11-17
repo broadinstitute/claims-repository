@@ -41,9 +41,6 @@
             "additionalProperties": {
               "type": "object",
               "additionalProperties": false,
-              "required": [
-                "path"
-              ],
               "properties": {
                 "path": {
                   "type": "string",
@@ -52,8 +49,71 @@
                 "location": {
                   "type": "string",
                   "minLength": 1
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "size": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              },
+              "description": "A result file: a path relative to the release file, or its upstream location with its sha256 and size (fetched when its dataset is ingested).",
+              "anyOf": [
+                {
+                  "required": [
+                    "path"
+                  ]
+                },
+                {
+                  "required": [
+                    "location",
+                    "sha256",
+                    "size"
+                  ]
+                }
+              ]
+            }
+          },
+          "where": {
+            "type": "object",
+            "description": "This dataset's bounds, replacing the release's (an empty object keeps every row).",
+            "additionalProperties": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "gt"
+                ],
+                "properties": {
+                  "gt": {
+                    "type": "number"
+                  }
                 }
               }
+            }
+          }
+        }
+      }
+    },
+    "where": {
+      "type": "object",
+      "description": "Strict lower bounds per row kind and metric. A row at or below a bound is not ingested.",
+      "additionalProperties": {
+        "type": "object",
+        "minProperties": 1,
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "gt"
+          ],
+          "properties": {
+            "gt": {
+              "type": "number"
             }
           }
         }

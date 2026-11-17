@@ -14,7 +14,7 @@ params:
     description: Trait as a KPN.TRAIT id or a legacy key such as IBD.
   library:
     type: string
-    default: cfde-inc-v2
+    default: mouse_msigdb
     description: Gene-set library.
   priorMax:
     type: number
