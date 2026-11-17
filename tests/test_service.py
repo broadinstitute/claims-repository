@@ -1653,6 +1653,127 @@ def test_loader_cli_membership_options():
     assert own.returncode == 0 and "membership pairs indexed: 3" in own.stdout
 
 
+def _load_variant(variant, path, **kwargs):
+    con = service_db.connect(path)
+    try:
+        return _loader().load(con, variant / "combined_gene_stats.json", variant / "combined_gene_set_stats.json",
+                              variant / "gene_gene_set_stats.json", **kwargs)
+    finally:
+        con.close()
+
+
+def test_loader_keeps_only_rows_above_the_thresholds():
+    loader = _loader()
+    path = os.path.join(tempfile.mkdtemp(), "filtered.db")
+    variant = _variant("KEEPPHENO", "keep-v1")
+    # Fixture rows: genes FIXG1 3.5, FIXG2 2, FIXG3 4.75; sets FIXSET_A 1.5, FIXSET_B 0.9;
+    # pairs (FIXG1, A), (FIXG2, A), (FIXG1, B). Bounds are strict.
+    stats = _load_variant(variant, path, keep=loader.Keep(min_combined=2, min_beta_uncorrected=1.0))
+    assert (stats["gene_claims"], stats["gene_set_claims"], stats["roster_claims"]) == (2, 1, 1)
+    assert stats["membership_pairs"] == 1
+    assert stats["skipped"] == {"gene_rows": 1, "gene_set_rows": 1, "membership_pairs": 2, "rosters": 0}
+    con = service_db.connect(path)
+    try:
+        genes = {r["gene"] for r in con.execute("SELECT gene FROM pigean_gene_associations").fetchall()}
+        assert genes == {"FIXG1", "FIXG3"}
+        sets = {r["gene_set"] for r in con.execute("SELECT gene_set FROM pigean_gene_set_associations").fetchall()}
+        assert sets == {"FIXSET_A"}
+        pairs = {(r["gene"], r["gene_set"]) for r in con.execute("SELECT gene, gene_set FROM claim_memberships").fetchall()}
+        assert pairs == {("FIXG1", "FIXSET_A")}
+        # The kept set's entity still lists its whole observed roster; the dropped set has none.
+        entities = [json.loads(r["payload"]) for r in
+                    con.execute("SELECT payload FROM dapper_objects WHERE class_name = 'GeneSet'").fetchall()]
+        assert [(e["name"], e["members"]) for e in entities] == [("FIXSET_A", ["FIXG1", "FIXG2"])]
+        # Nothing was minted for a row below a threshold.
+        statements = " ".join(json.loads(r["payload"])["statement"] for r in
+                              con.execute("SELECT payload FROM dapper_objects WHERE class_name = 'Proposition'").fetchall())
+        assert "FIXG2" not in statements and "FIXSET_B" not in statements
+    finally:
+        con.close()
+    # Raising the gene bound past every member of the kept set leaves no edge and no roster row behind.
+    stats = _load_variant(variant, path, keep=loader.Keep(min_combined=4, min_beta_uncorrected=1.0))
+    assert (stats["gene_claims"], stats["roster_claims"], stats["membership_pairs"]) == (1, 0, 0)
+    assert stats["skipped"]["rosters"] == 1
+    con = service_db.connect(path)
+    try:
+        assert con.execute("SELECT COUNT(*) AS c FROM claim_memberships").fetchone()["c"] == 0
+        assert {r["gene"] for r in con.execute("SELECT gene FROM pigean_gene_associations").fetchall()} == {"FIXG3"}
+    finally:
+        con.close()
+
+
+def test_loader_reads_python_none_in_membership_only():
+    loader = _loader()
+    variant = _variant("NONEPHENO", "none-v1")
+    membership = variant / "gene_gene_set_stats.json"
+    lines = membership.read_text().splitlines()
+    lines[0] = lines[0][:-1] + ', "log_bf": None}'
+    membership.write_text("\n".join(lines) + "\n")
+    stats = _load_variant(variant, os.path.join(tempfile.mkdtemp(), "none.db"))
+    assert stats["membership_pairs"] == 3 and loader.PY_NONE_LINES == {"gene_gene_set_stats.json": 1}
+    # A value-bearing file is never repaired: its numbers are what the claims state.
+    genes = variant / "combined_gene_stats.json"
+    genes.write_text(genes.read_text().replace('"n": 4', '"n": None'))
+    try:
+        _load_variant(variant, os.path.join(tempfile.mkdtemp(), "none2.db"))
+    except json.JSONDecodeError:
+        pass
+    else:
+        raise AssertionError("a Python None in combined_gene_stats.json must be refused")
+
+
+def test_loader_source_sets_file_locations_and_defaults_are_unchanged():
+    loader = _loader()
+    variant = _variant("SRCPHENO", "src-v1")
+
+    def files(path):
+        con = service_db.connect(path)
+        try:
+            return {r["id"]: json.loads(r["payload"])["source_uri"] for r in
+                    con.execute("SELECT id, payload FROM dapper_objects WHERE class_name = 'File'").fetchall()}
+        finally:
+            con.close()
+
+    default_path = os.path.join(tempfile.mkdtemp(), "default.db")
+    _load_variant(variant, default_path)
+    assert all("/cfde-inc-v2/portal/IBD/" in uri for uri in files(default_path).values())
+    source = loader.Source.under("s3://bucket/out/run/", "src-v1", "portal", "SRCPHENO",
+                                 run_description="A run.", library_origin="a library")
+    other_path = os.path.join(tempfile.mkdtemp(), "other.db")
+    _load_variant(variant, other_path, source=source)
+    assert sorted(files(other_path).values()) == [
+        "s3://bucket/out/run/combined_gene_set_stats/src-v1/portal/SRCPHENO/combined_gene_set_stats.json",
+        "s3://bucket/out/run/combined_gene_stats/src-v1/portal/SRCPHENO/combined_gene_stats.json",
+        "s3://bucket/out/run/gene_gene_set_stats/src-v1/portal/SRCPHENO/gene_gene_set_stats.json",
+    ]
+    assert not set(files(default_path)) & set(files(other_path))
+
+
+def test_run_receipt_resumes_only_the_same_target_and_thresholds():
+    spec = importlib.util.spec_from_file_location("load_pigean_run", ROOT / "scripts" / "load_pigean_run.py")
+    run = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run)
+    keep = {"min_combined": 1.0, "min_beta_uncorrected": 0.0}
+    receipt = Path(tempfile.mkdtemp()) / "run.receipt.jsonl"
+    lines = [
+        {"phenotype": "A", "status": "loaded", "target": "SQLite /x.db", "spec": "run.json", "keep": keep},
+        {"phenotype": "B", "status": "failed", "target": "SQLite /x.db", "spec": "run.json", "keep": keep},
+        {"phenotype": "C", "status": "loaded", "target": "MySQL other on host", "spec": "run.json", "keep": keep},
+        {"phenotype": "D", "status": "loaded", "target": "SQLite /x.db", "spec": "run.json",
+         "keep": {"min_combined": 0.5, "min_beta_uncorrected": 0.0}},
+        {"phenotype": "E", "status": "skipped-unregistered", "target": "SQLite /x.db", "spec": "run.json", "keep": keep},
+    ]
+    receipt.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    assert run.receipt_done(receipt, "SQLite /x.db", "run.json", keep) == {"A"}
+    assert run.receipt_done(receipt, "SQLite /x.db", "run.json", {"min_combined": 0.5, "min_beta_uncorrected": 0.0}) == {"D"}
+    assert run.receipt_done(receipt.with_name("absent.jsonl"), "SQLite /x.db", "run.json", keep) == set()
+    # The checked-in run specification parses, and names only keys the driver knows.
+    for path in sorted((ROOT / "loads").glob("*.json")):
+        parsed = run.read_spec(path)
+        assert parsed["prefix"].startswith("s3://") and not parsed["prefix"].endswith("/")
+    assert run.storable_key("Migraine") and not run.storable_key("x" * 65) and not run.storable_key("caf\u00e9")
+
+
 def _silent_server():
     """A TCP endpoint that accepts connections and never replies."""
     import socket

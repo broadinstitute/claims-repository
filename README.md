@@ -55,6 +55,17 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m uvicorn service.app:app --port 8100
 ```
 
+A whole PIGEAN aggregator run (every phenotype of one gene-set library) loads from a run specification in
+`loads/`, which pins the upstream location, the run and library descriptions, and the row thresholds
+(`min_combined`, `min_beta_uncorrected`: rows at or below a threshold are not ingested). It downloads each
+phenotype's files with the aws CLI, keeps a receipt, and resumes where it stopped. Phenotype folders the trait
+registry does not know are skipped, or loaded under their folder names when the specification says so. Try it on
+a scratch database first:
+
+```bash
+.venv/bin/python scripts/load_pigean_run.py loads/pigean-paper-regression-2.mouse_msigdb.json --db /tmp/scratch.db --only IBD,AD
+```
+
 Deposits need a key ([docs/inputs-and-outputs.md](docs/inputs-and-outputs.md#deposit-keys)); issue one into the
 local database and send it as `X-API-Key`:
 

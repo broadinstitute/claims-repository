@@ -1,0 +1,9 @@
+{
+  "prefix": "s3://dig-pigean-paper-regression-2/out/falcon",
+  "library": "mouse_msigdb",
+  "trait_group": "portal",
+  "run_description": "PIGEAN run recorded under s3://dig-pigean-paper-regression-2/out/falcon (gene-set library mouse_msigdb, trait group portal; combined result files written 2026-10-14).",
+  "library_origin": "the mouse_msigdb library of the dig-pigean-paper-regression-2 PIGEAN run",
+  "keep": {"min_combined": 0.5, "min_beta_uncorrected": 0.01},
+  "unregistered_traits": "load"
+}
