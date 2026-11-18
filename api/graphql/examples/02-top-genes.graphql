@@ -1,0 +1,20 @@
+# 2. Top genes for a trait
+#
+# A trait by any of its keys (here the portal key IBD; its KPN.TRAIT id
+# works too), with its strongest PIGEAN genes by combined score.
+#   combined = logBf (direct GWAS evidence) + prior (gene-set evidence),
+#   all on a log scale.
+# Filter with `where`, e.g. where: { logBf: { gt: 2 } }.
+query TopGenes($phenotype: ID!, $first: Int!) {
+  phenotype(id: $phenotype) {
+    id
+    name
+    pigeanGeneAssociations(orderBy: { field: COMBINED, dir: DESC }, first: $first) {
+      gene { symbol }
+      combined
+      logBf
+      prior
+      claim { id }
+    }
+  }
+}

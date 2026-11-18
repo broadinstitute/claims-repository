@@ -1,0 +1,47 @@
+# 1. The PIGEAN validation challenge
+#
+# The strongest PIGEAN genes for a trait, each with its top gene sets.
+# 1. Pick anchor genes: keep genes whose gene-set prior is below priorMax
+#    (mostly direct GWAS support), order by combined score, keep topGenes.
+# 2. For each anchor gene, list the gene sets it belongs to that are also
+#    associated with the trait, strongest first, up to setsPerGene.
+#
+# Every row is a claim the repository stands behind (claim { id }), with its
+# subject, predicate and object. `collection` is the gene-set library.
+# Change the variables below: try "T2D", or priorMax 2.0.
+query ValidationChallenge(
+  $phenotype: ID!
+  $collection: String
+  $priorMax: Float!
+  $topGenes: Int!
+  $setsPerGene: Int!
+) {
+  pigeanValidationChallenge(
+    phenotype: $phenotype
+    collection: $collection
+    where: { prior: { lt: $priorMax } }
+    orderBy: { field: COMBINED, dir: DESC }
+    topGenes: $topGenes
+    setOrder: { field: BETA_UNCORRECTED, dir: DESC }
+    setsPerGene: $setsPerGene
+  ) {
+    warnings
+    rows {
+      geneAssociation {
+        gene { symbol }
+        combined
+        logBf
+        prior
+        claim { id triple { subject predicate object } }
+      }
+      sets {
+        geneSetAssociation {
+          geneSet { name }
+          betaUncorrected
+          claim { id }
+        }
+        membership { claim { id } }
+      }
+    }
+  }
+}

@@ -21,7 +21,6 @@ from pathlib import Path
 from urllib.parse import quote
 
 from ariadne import ObjectType, QueryType, ScalarType, graphql_sync, make_executable_schema
-from ariadne.explorer import ExplorerGraphiQL
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -29,6 +28,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
 from . import api_keys
+from . import explorer
 from . import dapper_validation as dval
 from . import db
 from . import pigean_template as tpl
@@ -41,7 +41,12 @@ from .refs import DAPPER_ID_RE, MAX_ID_LENGTH, dapper_refs
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_VERSION = "0.2.0"
 DAPPER_PROFILE = "0.2.0-a1"
-DEFAULT_COLLECTION = "cfde-inc-v2"
+DEFAULT_COLLECTION = "cfde-inc-v2"  # deposit hints' default gene-set collection
+# PIGEAN GraphQL fields read the registered PIGEAN collection (docs/collections.md)
+# whenever one is published; their `collection` argument names its gene-set
+# library (the `library` dataset dimension), as it named the legacy tables' column.
+PIGEAN_COLLECTION = "pigean"
+DEFAULT_LIBRARY = "mouse_msigdb"
 
 # Identity vs location (design decision 2026-11-09, per Chase): the
 # content-addressed CURIE (dapper:{Class}.{digest}) is the canonical,
@@ -704,6 +709,9 @@ def resolve_phenotype(_, info, id):
         return _phenotype_view(con, row["phenotype"], row["trait_group"])
     if _trait(con, id) is not None:  # registered trait without loaded results
         return _phenotype_view(con, id, None)
+    if con.execute("SELECT 1 FROM dataset_dimensions WHERE dimension = 'trait' AND value = ? LIMIT 1",
+                   (id,)).fetchone():  # a collection's trait outside the registry, kept as given
+        return _phenotype_view(con, id, None)
     return None
 
 
@@ -820,21 +828,32 @@ def resolve_proposition(_, info, id):
 
 
 @phenotype_type.field("pigeanGeneAssociations")
-def resolve_pheno_gene_assocs(obj, info, collection=DEFAULT_COLLECTION, where=None, orderBy=None, first=20):
+def resolve_pheno_gene_assocs(obj, info, collection=None, where=None, orderBy=None, first=20):
     _bounded("first", first, MAX_ROWS)
     con = _con(info)
+    if _pigean_published(con):
+        out = _coll_run(con, "gene_phenotype", obj["id"], collection or DEFAULT_LIBRARY, _plan_where(where, GENE_FILTER_COLS),
+                        _plan_order(orderBy, GENE_ORDER_COLS, "COMBINED"), first)
+        return [_coll_gene_assoc_view(con, r) for r in out["rows"]]
+    collection = collection or DEFAULT_COLLECTION
     return [_gene_assoc_view(con, r) for r in _gene_assoc_rows(con, obj["id"], collection, where, orderBy, first)]
 
 
 @phenotype_type.field("pigeanGeneSetAssociations")
-def resolve_pheno_set_assocs(obj, info, collection=DEFAULT_COLLECTION, where=None, orderBy=None, first=20):
+def resolve_pheno_set_assocs(obj, info, collection=None, where=None, orderBy=None, first=20):
     _bounded("first", first, MAX_ROWS)
     con = _con(info)
+    if _pigean_published(con):
+        out = _coll_run(con, "gene_set_phenotype", obj["id"], collection or DEFAULT_LIBRARY, _plan_where(where, SET_FILTER_COLS),
+                        _plan_order(orderBy, SET_ORDER_COLS, "BETA_UNCORRECTED"), first)
+        return [_coll_set_assoc_view(con, r) for r in out["rows"]]
+    collection = collection or DEFAULT_COLLECTION
     return [_set_assoc_view(con, r) for r in _set_assoc_rows(con, obj["id"], collection, where, orderBy, first)]
 
 
 @gene_type.field("pigeanAssociation")
-def resolve_gene_assoc(obj, info, phenotype, collection=DEFAULT_COLLECTION):
+def resolve_gene_assoc(obj, info, phenotype, collection=None):
+    collection = collection or DEFAULT_COLLECTION
     con = _con(info)
     keys = _phenotype_keys(con, phenotype)
     row = con.execute(
@@ -845,7 +864,8 @@ def resolve_gene_assoc(obj, info, phenotype, collection=DEFAULT_COLLECTION):
 
 
 @gene_set_type.field("pigeanAssociation")
-def resolve_set_assoc(obj, info, phenotype, collection=DEFAULT_COLLECTION):
+def resolve_set_assoc(obj, info, phenotype, collection=None):
+    collection = collection or DEFAULT_COLLECTION
     con = _con(info)
     keys = _phenotype_keys(con, phenotype)
     row = con.execute(
@@ -917,12 +937,114 @@ def resolve_set_members(obj, info, phenotype=None, first=100):
     return [_membership_view(con, r) for r in rows]
 
 
+# ---------------------------------------------------------------------------
+# PIGEAN fields over the registered collection. The legacy pigean_* tables are
+# read only when no PIGEAN collection is published (old fixtures and tests).
+# Each field builds a query plan from its arguments and runs it with the
+# collection executor; it serves each row's measurement claim and each
+# membership's roster claim, not the evidence-tier claims.
+
+CHALLENGE_CLAIMS = ["measurement", "roster"]
+
+
+def _pigean_published(con) -> bool:
+    try:
+        cserve.release_row(con, PIGEAN_COLLECTION)
+        return True
+    except cserve.CollectionNotFound:
+        return False
+
+
+def _plan_where(where, colmap):
+    return {colmap[field]: {op: v for op, v in (conds or {}).items() if v is not None}
+            for field, conds in (where or {}).items() if conds}
+
+
+def _plan_order(order_by, colmap, default):
+    return {"metric": colmap[(order_by or {}).get("field", default)],
+            "dir": "asc" if (order_by or {}).get("dir", "DESC") == "ASC" else "desc"}
+
+
+def _served(row, key):
+    claim = (row.get("claims") or {}).get(key)
+    if claim is None:
+        raise ValueError(f"the PIGEAN collection serves no {key} claim for {row['subject']['value']}")
+    return claim
+
+
+def _coll_phenotype(con, row):
+    return _phenotype_view(con, row["object"]["id"], (row.get("columns") or {}).get("trait_group"))
+
+
+def _coll_gene_set(row):
+    subject = row["subject"]["id"]
+    return {"name": row["subject"]["value"], "source": (row.get("columns") or {}).get("source") or "",
+            "collection": row["dataset"]["dimensions"].get("library", ""),
+            "dapperGeneSetId": subject if subject.startswith("dapper:GeneSet.") else None}
+
+
+def _coll_gene_assoc_view(con, row):
+    m = row["metrics"]
+    return {"gene": {"symbol": row["subject"]["value"]}, "phenotype": _coll_phenotype(con, row),
+            "collection": row["dataset"]["dimensions"].get("library", ""),
+            "combined": m["combined"], "logBf": m["log_bf"], "prior": m["prior"],
+            "claim": _served(row, "measurement")}
+
+
+def _coll_set_assoc_view(con, row):
+    m = row["metrics"]
+    return {"geneSet": _coll_gene_set(row), "phenotype": _coll_phenotype(con, row),
+            "collection": row["dataset"]["dimensions"].get("library", ""),
+            "beta": m["beta"], "betaUncorrected": m["beta_uncorrected"], "claim": _served(row, "measurement")}
+
+
+def _coll_run(con, kind, phenotype, library, where, order, limit, join=None):
+    plan = [{"anchor": {"kind": kind, "dimensions": {"trait": "$trait", "library": "$library"},
+                        "where": where, "order": order, "limit": limit}}]
+    if join:
+        plan.append({"join": join})
+    out = cserve.run_plan(con, PIGEAN_COLLECTION, {"plan": plan}, {"trait": phenotype, "library": library},
+                          claims=CHALLENGE_CLAIMS, envelope=_collection_envelope)
+    if not out["rows"]:
+        out["warnings"].append(
+            f"The PIGEAN collection (release {out['release']['version']}) has no {kind} rows for phenotype "
+            f"'{phenotype}' with gene-set library '{library}' that pass the filter: either no such dataset is "
+            "published, or no row passed `where`.")
+    return out
+
+
+def _coll_challenge(con, phenotype, library, where, orderBy, topGenes, setsPerGene, setOrder, first):
+    out = _coll_run(
+        con, "gene_phenotype", phenotype, library, _plan_where(where, GENE_FILTER_COLS),
+        _plan_order(orderBy, GENE_ORDER_COLS, "COMBINED"), topGenes,
+        join={"as": "sets", "via": "member_of", "kind": "gene_set_phenotype",
+              "order": _plan_order(setOrder, SET_ORDER_COLS, "BETA_UNCORRECTED"), "limit_per_anchor": setsPerGene})
+    unique, seen = [], set()
+    for r in out["rows"]:
+        if r["subject"]["value"] not in seen:
+            seen.add(r["subject"]["value"])
+            unique.append(r)
+    rows = []
+    for r in unique[:first]:
+        gene = {"symbol": r["subject"]["value"]}
+        sets = []
+        for item in r.get("sets", []):
+            gene_set = _coll_gene_set(item["row"])
+            roster = (item["edge"].get("claims") or {}).get("roster")
+            if roster is None:
+                raise ValueError(f"the PIGEAN collection serves no roster claim for gene set {gene_set['name']}")
+            sets.append({"membership": {"gene": gene, "geneSet": gene_set, "claim": roster},
+                         "geneSetAssociation": _coll_set_assoc_view(con, item["row"])})
+        rows.append({"geneAssociation": _coll_gene_assoc_view(con, r), "sets": sets})
+    return {"rows": rows, "truncated": len(unique) > first, "warnings": out["warnings"]}
+
+
 @query.field("pigeanValidationChallenge")
 def resolve_challenge(
     _,
     info,
     phenotype,
-    collection=DEFAULT_COLLECTION,
+    collection=None,
     where=None,
     orderBy=None,
     topGenes=20,
@@ -934,6 +1056,9 @@ def resolve_challenge(
     _bounded("setsPerGene", setsPerGene, MAX_SETS_PER_GENE)
     _bounded("first", first, MAX_ROWS)
     con = _con(info)
+    if _pigean_published(con):
+        return _coll_challenge(con, phenotype, collection or DEFAULT_LIBRARY, where, orderBy, topGenes, setsPerGene, setOrder, first)
+    collection = collection or DEFAULT_COLLECTION
     warnings = []
     anchors = _gene_assoc_rows(con, phenotype, collection, where, orderBy, topGenes)
 
@@ -1096,34 +1221,8 @@ SWAGGER_HTML = """<!doctype html>
 </body>
 </html>"""
 
-DEFAULT_EXPLORER_QUERY = """\
-# Claims repository — PIGEAN IBD examples (schema docs via the sidebar).
-# Top IBD genes whose direct GWAS evidence outruns their gene-set support:
-{
-  phenotype(id: "IBD") {
-    pigeanGeneAssociations(
-      where: {prior: {lt: 0.5}}
-      orderBy: {field: COMBINED, dir: DESC}
-      first: 5
-    ) {
-      gene { symbol }
-      combined
-      logBf
-      prior
-      claim {
-        id
-        triple { subject predicate object }
-        scores { metric value interpretation }
-        provenanceRefs { derivedFromFiles resolution }
-      }
-    }
-  }
-}
-"""
-
-EXPLORER_HTML = ExplorerGraphiQL(
-    title="Claims Repository", default_query=DEFAULT_EXPLORER_QUERY
-).html(None)
+# GraphiQL opened on the example queries in api/graphql/examples (service/explorer.py).
+EXPLORER_HTML = explorer.render("Claims Repository")
 
 
 @app.get("/")

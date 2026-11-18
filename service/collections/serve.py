@@ -241,12 +241,23 @@ def run_query(con, collection: str, name: str, variables: dict | None = None, *,
     all, [] for none)."""
     rel = release_row(con, collection, release)
     record = _json(rel["manifest"])
-    manifest = record["manifest"]
     if name not in record["queries"]:
         raise CollectionNotFound(f"collection {collection!r} has no query {name!r}; "
                                  f"it has {sorted(record['queries'])}")
     qdoc = record["queries"][name]["doc"]
-    bound = bind_params(qdoc, variables)
+    return run_plan(con, collection, qdoc, bind_params(qdoc, variables), release=release, name=name,
+                    claims=claims, envelope=envelope)
+
+
+def run_plan(con, collection: str, qdoc: dict, bound: dict, *, release: str | None = None, name: str | None = None,
+             claims: list[str] | None = None, envelope=None) -> dict:
+    """Run a query plan (a query template's `plan`, or one a caller builds,
+    such as the pigeanValidationChallenge GraphQL field) against a release.
+    `bound` holds the values its `$` references take; literal values in the
+    plan are used as they are."""
+    rel = release_row(con, collection, release)
+    record = _json(rel["manifest"])
+    manifest = record["manifest"]
     warnings: list[str] = []
     dims_cache: dict = {}
 

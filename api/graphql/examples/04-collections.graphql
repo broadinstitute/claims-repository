@@ -1,0 +1,15 @@
+# 4. What collections hold
+#
+# Every registered collection of results, its current release, and the query
+# templates it offers (name, description, parameters and a runnable example).
+query Collections {
+  collections {
+    id
+    title
+    methods
+    version
+    currentRelease
+    datasets
+  }
+  collectionQueries(collection: "pigean")
+}

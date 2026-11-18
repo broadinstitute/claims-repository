@@ -76,17 +76,24 @@ input PigeanGeneSetAssociationOrder {
   dir: SortDir! = DESC
 }
 
+# Where the data come from: the PIGEAN fields read the registered `pigean`
+# collection (GET /v1/collections/pigean), current release. Their `collection`
+# argument names the gene-set library the PIGEAN run used (the collection's
+# `library` dimension, e.g. mouse_msigdb; mouse_msigdb when omitted), as it
+# named the result files' gene_set_size field before collections. Each row serves its measurement
+# claim, and each membership its gene set's roster claim.
+
 extend type Phenotype {
-  "PIGEAN gene associations for this phenotype. filter → order → first, in that sequence, deterministic ties (gene symbol asc)."
+  "PIGEAN gene associations for this phenotype. filter → order → first, in that sequence, deterministic ties (gene symbol asc). `collection` is the gene-set library."
   pigeanGeneAssociations(
-    collection: String = "cfde-inc-v2"
+    collection: String
     where: PigeanGeneAssociationFilter
     orderBy: PigeanGeneAssociationOrder
     first: Int = 20
   ): [PigeanGeneAssociation!]!
 
   pigeanGeneSetAssociations(
-    collection: String = "cfde-inc-v2"
+    collection: String
     where: PigeanGeneSetAssociationFilter
     orderBy: PigeanGeneSetAssociationOrder
     first: Int = 20
@@ -94,11 +101,11 @@ extend type Phenotype {
 }
 
 extend type Gene {
-  pigeanAssociation(phenotype: ID!, collection: String = "cfde-inc-v2"): PigeanGeneAssociation
+  pigeanAssociation(phenotype: ID!, collection: String): PigeanGeneAssociation
 }
 
 extend type GeneSet {
-  pigeanAssociation(phenotype: ID!, collection: String = "cfde-inc-v2"): PigeanGeneSetAssociation
+  pigeanAssociation(phenotype: ID!, collection: String): PigeanGeneSetAssociation
 }
 
 extend type Query {
@@ -113,12 +120,14 @@ extend type Query {
   still appears with sets: []. A missing data source (no memberships loaded
   for the phenotype) surfaces in warnings and the anchors are still returned
   with empty sets, never a silent empty result. `phenotype` accepts a
-  KPN.TRAIT ID or a legacy / PIGEAN key. Bounds: topGenes <= 200,
+  KPN.TRAIT ID or a legacy / PIGEAN key (traits outside the KPN registry go
+  by their PIGEAN key, e.g. Migraine). `collection` is the gene-set library
+  (default mouse_msigdb; cfde-inc-v2 only where no PIGEAN collection is published). Bounds: topGenes <= 200,
   setsPerGene <= 50, first <= 500; a request asserts at most 2,000 claims.
   """
   pigeanValidationChallenge(
     phenotype: ID!
-    collection: String = "cfde-inc-v2"
+    collection: String
     where: PigeanGeneAssociationFilter
     orderBy: PigeanGeneAssociationOrder
     topGenes: Int! = 20

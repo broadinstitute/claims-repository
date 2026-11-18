@@ -16,7 +16,11 @@ that composes `core + methods/*` at startup and knows nothing method-specific. S
 - [api/graphql/core.graphql](api/graphql/core.graphql) — method-agnostic schema: nodes, claim
   envelopes, provenance refs, association interfaces.
 - [api/graphql/methods/pigean.graphql](api/graphql/methods/pigean.graphql) — the PIGEAN module:
-  typed metrics, filters, order enums, and the `pigeanValidationChallenge` root field.
+  typed metrics, filters, order enums, and the `pigeanValidationChallenge` root field. These
+  fields read the published `pigean` collection; `collection` names its gene-set library.
+- [api/graphql/examples/](api/graphql/examples/) — the example queries the GraphiQL explorer opens
+  on, one tab each with its variables (validation challenge, top genes and gene sets, collections,
+  a collection query, one claim, a trait).
 - [api/graphql/queries/](api/graphql/queries/) — the persisted Day-10 IBD validation-challenge
   query, its researcher-editable variables, and a synthetic fixture response for UI mocks.
 - [api/openapi.yaml](api/openapi.yaml) — REST: health, vocabulary, deposit (`POST /v1/deposits`: any DAPPER class, validated; needs a key),
@@ -105,6 +109,6 @@ evidence + byte-span locators, gene-set entities (172,700 DAPPER objects) — in
 claims the data implies (18,321 gene, 5,000 gene-set, 3,851 gene-set rosters) is minted the first
 time GraphQL serves it. IDs are deterministic local-dev digests, not DAPPER-ID-1 content
 addresses; real minting belongs to the toolkit. Then http://localhost:8100/v1/graphql is the
-GraphiQL explorer (pre-loaded with an IBD example), http://localhost:8100/v1/docs the REST
+GraphiQL explorer (opened on the example queries in `api/graphql/examples/`), http://localhost:8100/v1/docs the REST
 contract. `scripts/audit_objects.py` verifies the whole store.
 Tests: `.venv/bin/python -m pytest tests/`.

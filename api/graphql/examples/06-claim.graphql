@@ -1,0 +1,16 @@
+# 6. One claim, in full
+#
+# Look up any claim by its id, for example one returned by example 1 (this
+# one is PIGEAN's measurement of NOD2 in IBD). You get the scores, and the
+# evidence for each: which result file, and the exact bytes of the number in
+# it (a value locator you can check against the file's sha256).
+query Claim($id: ID!) {
+  claim(id: $id) {
+    id
+    resolverUrl
+    triple { subject predicate object }
+    scores { metric value interpretation }
+    evidence { valueLocators }
+    provenanceRefs { derivedFromFiles resolution }
+  }
+}

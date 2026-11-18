@@ -187,7 +187,7 @@ type GeneSet {
   name: ID!
   "Upstream source tag, e.g. lincs, geobulk___igvf."
   source: String!
-  "Gene-set collection / run tag (the result files' gene_set_size field), e.g. cfde-inc-v2."
+  "Gene-set library of the PIGEAN run (the result files' gene_set_size field), e.g. mouse_msigdb."
   collection: String!
   "dapper:GeneSet ID when known; resolves via provenance-indexer."
   dapperGeneSetId: String

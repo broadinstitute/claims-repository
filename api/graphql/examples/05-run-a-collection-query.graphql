@@ -1,0 +1,14 @@
+# 5. Run a collection's query template
+#
+# runQuery runs one of a collection's templates (see example 4) and returns
+# JSON rows: each with its dataset, subject, object, metrics, and the claims
+# the row stands for. `claims` picks which claims to serve: "measurement"
+# carries the scores; leave it out to also get the evidence-tier claims.
+query RunCollectionQuery($variables: JSON) {
+  runQuery(
+    collection: "pigean"
+    query: "top-genes-with-sets"
+    variables: $variables
+    claims: ["measurement"]
+  )
+}
