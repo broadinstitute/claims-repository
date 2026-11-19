@@ -313,9 +313,10 @@ example: { trait: IBD }
   library-wide ones; `warnings` and `truncated`; the 25,000-query budget; the
   2,000-assertion cap; row bounds; one transaction per request; render before
   write.
-- `pigeanValidationChallenge` becomes this query template and is then
-  removed. Development is local only, so no wrapper is kept for the challenge
-  UI. The persisted-query fixture is the parity check.
+- `pigeanValidationChallenge` became this query template and was removed on
+  2026-11-18, with every other per-method GraphQL field (`pigean*Associations`,
+  `pigeanAssociation`, `gene`, `geneSet`, `phenotypes`, `methods`). The
+  persisted-query fixture is gone with it.
 
 ## 7. Discovery: asking a collection about itself
 
@@ -473,8 +474,12 @@ Built, beside the PIGEAN path rather than replacing it:
   (a drifted row is refused). Endpoints: `GET /v1/collections`,
   `/v1/collections/{c}`, `/v1/collections/{c}/queries`,
   `/v1/collections/{c}/releases/{version}/document` and
-  `POST /v1/collections/{c}/queries/{name}:run`. GraphQL adds `collections`,
-  `collection`, `collectionQueries` and `runQuery`.
+  `POST /v1/collections/{c}/queries/{name}:run`, plus the query catalog
+  `GET /v1/queries` (every query with its params and their values, the rows it
+  returns, the claims it serves and a request that runs as given) and
+  `GET /v1/collections/{c}/dimensions/{d}` (a dimension's values). GraphQL
+  has `queries`, `dimensionValues`, `collections`, `collection`,
+  `collectionQueries` and `runQuery`, and no per-method fields.
 - **Parity.** The challenge query template returns the same genes, order,
   values and gene sets as `pigeanValidationChallenge`. That holds on the
   fixtures (tested) and on real IBD at 20, 37, 50 and 60 genes, up to 550 sets.
@@ -486,7 +491,8 @@ Not built yet:
 - **The Croissant/DOI/DRS source adapter** (§4). Files are given by path.
 - **Toolkit side:** `methods/pigean/claims.py` still mints local-dev ids. It
   retires in favor of the engine.
-- **Removing the PIGEAN path** (`pigeanValidationChallenge`, the `pigean_*`
-  tables and `load_pigean.py`). This waits until a second collection (EAGGL)
-  onboards with no service change.
+- **Removing the rest of the PIGEAN path.** The GraphQL fields are gone
+  (2026-11-18). Still there: the `pigean_*` tables and `load_pigean.py`, the
+  legacy claim sources `claim(id)` and `proposition` still synthesize from,
+  deposit `index_hints` (which write those tables), and `/v1/vocabulary`.
 

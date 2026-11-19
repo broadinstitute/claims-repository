@@ -1,0 +1,23 @@
+# 3. The PIGEAN validation challenge
+#
+# pigean's top-genes-with-sets query: the strongest PIGEAN genes for a trait,
+# each with its top gene sets.
+# 1. Anchor genes: keep genes whose gene-set prior is below priorMax (mostly
+#    direct GWAS support), order by combined score, keep topGenes.
+# 2. For each anchor gene, the gene sets it belongs to that are also
+#    associated with the trait, by marginal effect (beta_uncorrected), up to
+#    setsPerGene.
+#
+# Each row: subject (the gene), object (the trait), metrics, and claims.measurement,
+# the claim the repository stands behind (id, triple, scores, evidence). Each
+# entry in `sets` has the edge (with the gene set's roster claim) and the gene
+# set's own row. `library` is the gene-set library; `trait` takes a KPN.TRAIT
+# id or a legacy key. Try "T2D", or priorMax 2.0.
+query ValidationChallenge($variables: JSON) {
+  runQuery(
+    collection: "pigean"
+    query: "top-genes-with-sets"
+    variables: $variables
+    claims: ["measurement", "roster"]
+  )
+}

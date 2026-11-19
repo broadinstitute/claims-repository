@@ -267,10 +267,13 @@ def test_index_hints_index_validated_claims_and_only_claims_the_store_knows():
     assert not_a_claim.status_code == 400 and "is not a Claim" in not_a_claim.json()["detail"]
     accepted = client.post("/v1/deposits", json={"objects": [proposition, *scores, claim], "index_hints": [hint]})
     assert accepted.status_code == 200, accepted.text
-    served = anonymous.post("/v1/graphql", json={"query":
-        '{ phenotype(id: "HINTPHENO") { pigeanGeneAssociations(collection: "hint-test-v1") { gene { symbol } combined claim { id } } } }'}).json()
-    assert served["data"]["phenotype"]["pigeanGeneAssociations"] == [
-        {"gene": {"symbol": "HINTGENE"}, "combined": 4.0, "claim": {"id": claim["id"]}}]
+    con = service_db.connect()
+    try:
+        indexed = [dict(r) for r in con.execute("SELECT gene, combined, claim_id FROM pigean_gene_associations "
+                                                "WHERE phenotype = 'HINTPHENO' AND collection = 'hint-test-v1'")]
+    finally:
+        con.close()
+    assert indexed == [{"gene": "HINTGENE", "combined": 4.0, "claim_id": claim["id"]}]
 
 
 def test_the_published_example_bundle_is_valid_dapper_and_deposits_as_given():
@@ -332,10 +335,11 @@ def test_serving_a_query_mints_claims_without_a_key_and_records_no_deposit():
     with base._isolated_db():
         base._load_dir(base._variant("OPENPHENO", "open-v1"))
         before = (_count("dapper_objects"), _count("deposits"), _count("deposit_objects"))
-        served = anonymous.post("/v1/graphql", json={"query":
-            '{ phenotype(id: "OPENPHENO") { pigeanGeneAssociations(collection: "open-v1") { claim { id } } } }'})
-        assert served.status_code == 200, served.text
-        claims = [row["claim"]["id"] for row in served.json()["data"]["phenotype"]["pigeanGeneAssociations"]]
+        claims = [r["claim_id"] for r in base._rows(
+            "SELECT claim_id FROM pigean_gene_associations WHERE phenotype = 'OPENPHENO' ORDER BY gene")]
+        served = anonymous.post("/v1/graphql", json={"query": "{ " + " ".join(
+            f'c{i}: claim(id: "{c}") {{ id }}' for i, c in enumerate(claims)) + " }"})
+        assert served.status_code == 200 and "errors" not in served.json(), served.text
         assert claims and _count("dapper_objects") > before[0]                    # serving minted them
         assert (_count("deposits"), _count("deposit_objects")) == before[1:]      # and that is not a deposit
         assert anonymous.get("/v1/deposits", params={"object": claims[0]}).json()["total"] == 0

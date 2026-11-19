@@ -1,6 +1,5 @@
 """Contract tests on a throwaway DB: deposit idempotency, the objects-only
-REST surface (resolver, list, search), GraphQL queries over deposited claims,
-and — via the real loader on small fixtures — claims synthesized when served
+REST surface (resolver, list, search), GraphQL claim lookups, and — via the real loader on small fixtures — claims synthesized when served
 (2026-11-09: claims are minted when queried)."""
 import importlib.util
 import json
@@ -173,32 +172,6 @@ def test_object_landing_page_negotiation():
     assert raw.json()["class_name"] == "Claim"
 
 
-def test_graph_query_over_deposited_claim():
-    _deposit(_bundle())
-    body = _gql("""{ phenotype(id: "IBD") {
-        pigeanGeneAssociations(where: {prior: {lt: 0.5}}, first: 5) {
-          gene { symbol } combined prior claim { id scores { metric value } } } } }""")
-    assert "errors" not in body, body.get("errors")
-    assocs = body["data"]["phenotype"]["pigeanGeneAssociations"]
-    assert [a["gene"]["symbol"] for a in assocs] == ["NOD2"]
-    assert assocs[0]["claim"]["id"] == R("dapper:Claim.SYNTHG01")
-
-
-def test_challenge_reports_missing_membership_source():
-    _deposit(_bundle())
-    query = (ROOT / "api" / "graphql" / "queries" / "ibd-validation-challenge.graphql").read_text()
-    variables = json.loads((ROOT / "api" / "graphql" / "queries" / "ibd-validation-challenge.variables.json").read_text())
-    body = _gql(query, variables)
-    assert "errors" not in body, body.get("errors")
-    challenge = body["data"]["pigeanValidationChallenge"]
-    # A missing data source is not an empty result: anchors come back with no
-    # sets, and the gap is stated.
-    assert [r["geneAssociation"]["gene"]["symbol"] for r in challenge["rows"]] == ["NOD2"]
-    assert challenge["rows"][0]["sets"] == []
-    assert challenge["truncated"] is False
-    assert any("membership" in w for w in challenge["warnings"])
-
-
 def _membership_bundle():
     """An externally deposited membership claim (REST deposit path) plus the
     gene-set association the challenge join needs on the far side."""
@@ -283,34 +256,6 @@ def _membership_bundle():
     }
 
 
-def test_challenge_joins_after_membership_deposit():
-    # Runs after test_challenge_reports_missing_membership_source by design:
-    # that test needs the shared tmp DB's membership table still empty.
-    _deposit(_bundle())
-    assert _deposit(_membership_bundle()).status_code == 200
-    query = (ROOT / "api" / "graphql" / "queries" / "ibd-validation-challenge.graphql").read_text()
-    variables = json.loads((ROOT / "api" / "graphql" / "queries" / "ibd-validation-challenge.variables.json").read_text())
-    body = _gql(query, variables)
-    assert "errors" not in body, body.get("errors")
-    challenge = body["data"]["pigeanValidationChallenge"]
-    assert not any("membership" in w for w in challenge["warnings"])
-    assert len(challenge["rows"]) == 1
-    row = challenge["rows"][0]
-    assert row["geneAssociation"]["gene"]["symbol"] == "NOD2"
-    assert row["geneAssociation"]["claim"]["triple"] == {
-        "subject": "NOD2", "predicate": "associated_with", "object": "IBD"
-    }
-    assert len(row["sets"]) == 1
-    entry = row["sets"][0]
-    assert entry["membership"]["claim"]["id"] == R("dapper:Claim.SYNTHM01")
-    assert entry["membership"]["claim"]["triple"]["predicate"] == "member_of"
-    assert entry["geneSetAssociation"]["geneSet"]["name"] == "SYNTH_SET"
-    assert entry["geneSetAssociation"]["betaUncorrected"] == 2.5
-    # The membership claim is score-less.
-    membership = _gql("""{ claim(id: "dapper:Claim.SYNTHM01") { scores { metric } } }""")["data"]["claim"]
-    assert membership["scores"] == []
-
-
 def test_resolver_returns_consistent_documents():
     """Every class of dapper object comes back in the same shape: id and
     class_name first, remaining keys sorted, matching the requested ID."""
@@ -372,34 +317,6 @@ def _second_set_bundle():
     }
 
 
-def test_sets_per_gene_limit_and_order():
-    _deposit(_bundle())
-    _deposit(_membership_bundle())
-    assert _deposit(_second_set_bundle()).status_code == 200
-    q = """
-      query($n: Int!) {
-        pigeanValidationChallenge(
-          phenotype: "IBD", where: {prior: {lt: 0.5}}, topGenes: 5, setsPerGene: $n
-        ) {
-          rows {
-            geneAssociation { gene { symbol } }
-            sets { geneSetAssociation { geneSet { name } betaUncorrected } }
-          }
-        }
-      }
-    """
-
-    def set_names(n):
-        body = _gql(q, {"n": n})
-        assert "errors" not in body, body.get("errors")
-        rows = body["data"]["pigeanValidationChallenge"]["rows"]
-        assert [r["geneAssociation"]["gene"]["symbol"] for r in rows] == ["NOD2"]
-        return [s["geneSetAssociation"]["geneSet"]["name"] for s in rows[0]["sets"]]
-
-    assert set_names(5) == ["SYNTH_SET", "SYNTH_SET_B"]
-    assert set_names(1) == ["SYNTH_SET"]
-
-
 def test_gene_set_entity_is_traceable():
     """claim -> geneSetRefs / dapperGeneSetId -> full GeneSet entity record."""
     _deposit(_bundle())
@@ -411,8 +328,6 @@ def test_gene_set_entity_is_traceable():
     }
     assert env["provenanceRefs"]["geneSetRefs"] == [R("dapper:GeneSet.SYNTHSET01")]
     assert env["provenanceRefs"]["resolution"] == "RESOLVED"
-    gs = _gql("""{ geneSet(name: "SYNTH_SET", collection: "cfde-inc-v2") { name dapperGeneSetId } }""")["data"]["geneSet"]
-    assert gs["dapperGeneSetId"] == R("dapper:GeneSet.SYNTHSET01")
     obj = _gql("""{ dapperObject(id: "dapper:GeneSet.SYNTHSET01") }""")["data"]["dapperObject"]
     assert obj["class_name"] == "GeneSet"
     assert obj["members"] == ["NOD2"]
@@ -572,25 +487,28 @@ def test_loader_stores_no_claims():
     assert props["total"] == 1  # the data plane is there
 
 
+CLAIM_FIELDS = "id timesDeposited triple { subject predicate object } scores { metric value } evidence { valueLocators }"
+
+
+def _claims(*claim_ids, fields="id"):
+    """claim(id) for each id, in one request (aliases c0, c1, ...)."""
+    query = "{ " + " ".join(f'c{i}: claim(id: "{cid}") {{ {fields} }}' for i, cid in enumerate(claim_ids)) + " }"
+    return _gql(query)
+
+
 def test_claims_are_synthesized_when_served():
     _load_fixtures()
     fixg1 = _index_claim_id("pigean_gene_associations", "gene", "FIXG1")
     fixg2 = _index_claim_id("pigean_gene_associations", "gene", "FIXG2")
-    q = """{ phenotype(id: "FIXPHENO") {
-        pigeanGeneAssociations(collection: "fixture-v1", where: {prior: {lt: 0.5}}) {
-          gene { symbol } prior
-          claim { id timesDeposited scores { metric value } evidence { valueLocators } } } } }"""
     before = {fixg1: _times_seen(fixg1), fixg2: _times_seen(fixg2)}
-    body = _gql(q)
+    body = _claims(fixg1, fixg2, fields=CLAIM_FIELDS)
     assert "errors" not in body, body.get("errors")
-    assocs = {a["gene"]["symbol"]: a for a in body["data"]["phenotype"]["pigeanGeneAssociations"]}
-    assert set(assocs) == {"FIXG1", "FIXG2"}
-    assert assocs["FIXG1"]["claim"]["id"] == fixg1
-    assert assocs["FIXG2"]["claim"]["id"] == fixg2
-    assert assocs["FIXG1"]["claim"]["timesDeposited"] == before[fixg1] + 1
+    g1, g2 = body["data"]["c0"], body["data"]["c1"]
+    assert (g1["id"], g2["id"]) == (fixg1, fixg2)
+    assert g1["timesDeposited"] == before[fixg1] + 1
+    assert g1["triple"]["subject"] == "FIXG1" and g1["triple"]["object"] == "FIXPHENO"
     # FIXG2's file values are JSON ints ("prior": 0, "combined": 2): the score
     # is normalized to float, the locator keeps the file's exact bytes.
-    g2 = assocs["FIXG2"]["claim"]
     assert {s["metric"]: s["value"] for s in g2["scores"]}["prior"] == 0.0
     locs = [loc for e in g2["evidence"] for loc in e["valueLocators"]]
     prior_loc = next(loc for loc in locs if loc["selector"].endswith("key=prior"))
@@ -599,8 +517,7 @@ def test_claims_are_synthesized_when_served():
     for loc in locs:
         assert data[loc["byte_start"]:loc["byte_start"] + loc["byte_length"]].decode() == loc["value_text"]
     # Every further serve is an assertion; stored claims are found by reference.
-    again = _gql(q)["data"]["phenotype"]["pigeanGeneAssociations"]
-    assert {a["gene"]["symbol"]: a["claim"]["timesDeposited"] for a in again}["FIXG1"] == before[fixg1] + 2
+    assert _claims(fixg1, fields="timesDeposited")["data"]["c0"]["timesDeposited"] == before[fixg1] + 2
     prop = client.get(f"/v1/objects/{fixg2}").json()["proposition"]
     fanin = client.get("/v1/objects/search", params={"class_name": "Claim", "references": prop}).json()
     assert [o["id"] for o in fanin["objects"]] == [fixg2]
@@ -608,59 +525,37 @@ def test_claims_are_synthesized_when_served():
 
 def test_gene_set_associations_synthesize_with_int_beta():
     _load_fixtures()
-    body = _gql("""{ phenotype(id: "FIXPHENO") { pigeanGeneSetAssociations(collection: "fixture-v1") {
-        geneSet { name dapperGeneSetId } beta claim { id scores { metric value } } } } }""")
+    set_a = _index_claim_id("pigean_gene_set_associations", "gene_set", "FIXSET_A")
+    body = _claims(set_a, fields="id triple { subject } scores { metric value } provenanceRefs { geneSetRefs }")
     assert "errors" not in body, body.get("errors")
-    sets = {s["geneSet"]["name"]: s for s in body["data"]["phenotype"]["pigeanGeneSetAssociations"]}
-    assert sets["FIXSET_A"]["beta"] == 0.0  # "beta": 0 in the file
-    assert sets["FIXSET_A"]["claim"]["id"] == _index_claim_id("pigean_gene_set_associations", "gene_set", "FIXSET_A")
-    assert sets["FIXSET_A"]["geneSet"]["dapperGeneSetId"].startswith("dapper:GeneSet.")
+    env = body["data"]["c0"]
+    assert {s["metric"]: s["value"] for s in env["scores"]}["beta"] == 0.0  # "beta": 0 in the file
+    assert env["triple"]["subject"].startswith("dapper:GeneSet.")
+    assert env["provenanceRefs"]["geneSetRefs"] == [env["triple"]["subject"]]
 
 
-def test_roster_claims_members_and_lookup_by_id():
-    _load_fixtures()
-    # One roster claim per gene set backs every (gene, set) pair in it.
-    g1 = _gql("""{ gene(symbol: "FIXG1") { memberships(collection: "fixture-v1") {
-        geneSet { name } claim { id triple { predicate } } } } }""")
-    assert "errors" not in g1, g1.get("errors")
-    g1_sets = {m["geneSet"]["name"]: m["claim"] for m in g1["data"]["gene"]["memberships"]}
-    assert set(g1_sets) == {"FIXSET_A", "FIXSET_B"}
-    assert {c["triple"]["predicate"] for c in g1_sets.values()} == {"has_members"}
-    members = _gql("""{ geneSet(name: "FIXSET_A", collection: "fixture-v1") {
-        members { gene { symbol } claim { id } } } }""")
-    assert "errors" not in members, members.get("errors")
-    rows = members["data"]["geneSet"]["members"]
-    assert sorted(r["gene"]["symbol"] for r in rows) == ["FIXG1", "FIXG2"]
-    assert {r["claim"]["id"] for r in rows} == {g1_sets["FIXSET_A"]["id"]}
-
-    # claim(id) on never-served claims finds the index row and synthesizes:
-    # a gene-set association, and a roster (looked up in the rosters table).
+def test_never_served_claims_are_found_by_id():
+    """claim(id) on never-served claims finds the index row and synthesizes:
+    a gene-set association, and a roster (looked up in the rosters table)."""
     _load_dir(_variant("BYID", "byid-v1"))
     set_b = _index_claim_id("pigean_gene_set_associations", "gene_set", "FIXSET_B", "byid-v1")
     assert _times_seen(set_b) == 0  # never served in this slice
     env = _gql(f'{{ claim(id: "{set_b}") {{ id timesDeposited }} }}')
     assert "errors" not in env, env.get("errors")
     assert env["data"]["claim"] == {"id": set_b, "timesDeposited": 1}
-    roster_b = g1_sets["FIXSET_B"]["id"]
+    roster_b = _rows("SELECT claim_id FROM pigean_gene_set_rosters WHERE collection = 'byid-v1' "
+                     "AND gene_set = 'FIXSET_B'")[0]["claim_id"]
     env = _gql(f'{{ claim(id: "{roster_b}") {{ id triple {{ predicate }} }} }}')
     assert env["data"]["claim"]["triple"]["predicate"] == "has_members"
 
 
-def test_challenge_dedupes_assertions_within_a_request():
-    """A roster / association claim served by several rows of ONE response is
-    asserted once."""
+def test_a_claim_served_twice_in_one_request_is_asserted_once():
     _load_fixtures()
-    roster_a = _index_claim_id("claim_memberships", "gene", "FIXG2")  # FIXG2 is only in FIXSET_A
     set_a = _index_claim_id("pigean_gene_set_associations", "gene_set", "FIXSET_A")
-    before = (_times_seen(roster_a), _times_seen(set_a))
-    body = _gql("""{ pigeanValidationChallenge(phenotype: "FIXPHENO", collection: "fixture-v1",
-        where: {prior: {lt: 10}}, topGenes: 5, setsPerGene: 5) {
-          rows { geneAssociation { gene { symbol } } sets { membership { claim { id } } geneSetAssociation { geneSet { name } } } } } }""")
+    before = _times_seen(set_a)
+    body = _claims(set_a, set_a, set_a)
     assert "errors" not in body, body.get("errors")
-    served = [s["geneSetAssociation"]["geneSet"]["name"]
-              for r in body["data"]["pigeanValidationChallenge"]["rows"] for s in r["sets"]]
-    assert served.count("FIXSET_A") == 2  # FIXG1 and FIXG2 both link to it
-    assert (_times_seen(roster_a), _times_seen(set_a)) == (before[0] + 1, before[1] + 1)
+    assert _times_seen(set_a) == before + 1
 
 
 def test_second_load_keeps_earlier_claims_servable():
@@ -669,39 +564,26 @@ def test_second_load_keeps_earlier_claims_servable():
     _load_dir(_variant("TWOA", "two-v1"))
     _load_dir(_variant("TWOB", "two-v1", membership=[("FIXG1", "FIXSET_A"), ("FIXG3", "FIXSET_A"),
                                                      ("FIXG1", "FIXSET_B")]))
-    body = _gql("""{ phenotype(id: "TWOA") { pigeanGeneSetAssociations(collection: "two-v1") {
-        geneSet { name } claim { id } } } }""")
+    expected = [r["claim_id"] for r in _rows(
+        "SELECT claim_id FROM pigean_gene_set_associations WHERE phenotype = 'TWOA' AND collection = 'two-v1' "
+        "ORDER BY gene_set")]
+    assert len(expected) == 2
+    body = _claims(*expected)
     assert "errors" not in body, body.get("errors")
-    served = {s["geneSet"]["name"]: s["claim"]["id"] for s in body["data"]["phenotype"]["pigeanGeneSetAssociations"]}
-    con = service_db.connect()
-    try:
-        expected = {r["gene_set"]: r["claim_id"] for r in con.execute(
-            "SELECT gene_set, claim_id FROM pigean_gene_set_associations WHERE phenotype = 'TWOA' AND collection = 'two-v1'")}
-    finally:
-        con.close()
-    assert served == expected
-    # TWOA's observed membership (FIXG2 in FIXSET_A) still resolves for TWOA.
-    challenge = _gql("""{ pigeanValidationChallenge(phenotype: "TWOA", collection: "two-v1",
-        where: {prior: {lt: 10}}, topGenes: 5, setsPerGene: 5) {
-          rows { geneAssociation { gene { symbol } } sets { membership { claim { id } } } } } }""")
-    assert "errors" not in challenge, challenge.get("errors")
-    rows = {r["geneAssociation"]["gene"]["symbol"]: r for r in challenge["data"]["pigeanValidationChallenge"]["rows"]}
-    assert len(rows["FIXG2"]["sets"]) == 1 and len(rows["FIXG3"]["sets"]) == 0
+    assert [body["data"][f"c{i}"]["id"] for i in range(len(expected))] == expected
 
 
 def test_tampered_row_is_refused_even_after_mint():
     _load_dir(_variant("TAMPER", "tamper-v1"))
-    q = """{ gene(symbol: "FIXG1") { pigeanAssociation(phenotype: "TAMPER", collection: "tamper-v1") {
-        combined claim { id timesDeposited } } } }"""
-    first = _gql(q)
+    claim_id = _index_claim_id("pigean_gene_associations", "gene", "FIXG1", "tamper-v1")
+    first = _claims(claim_id)
     assert "errors" not in first, first.get("errors")
-    claim_id = first["data"]["gene"]["pigeanAssociation"]["claim"]["id"]
     count = _times_seen(claim_id)
     con = service_db.connect()
     with con:
         con.execute("UPDATE pigean_gene_associations SET combined = 99.0 WHERE phenotype = 'TAMPER' AND gene = 'FIXG1'")
     con.close()
-    body = _gql(q)
+    body = _claims(claim_id)
     assert body.get("errors") and "template drift" in body["errors"][0]["message"]
     assert _times_seen(claim_id) == count  # the failed request counted nothing
 
@@ -715,10 +597,9 @@ def test_failed_response_rolls_back_every_mint():
         con.execute("UPDATE pigean_gene_associations SET claim_id = 'dapper:Claim.localdeadbeef' "
                     "WHERE phenotype = 'ROLLBACK' AND gene = 'FIXG2'")
     con.close()
-    # Ordered by combined: FIXG3 (4.75), FIXG1 (3.5) synthesize, then FIXG2 fails.
-    body = _gql("""{ phenotype(id: "ROLLBACK") { pigeanGeneAssociations(collection: "rb-v1",
-        orderBy: {field: COMBINED, dir: DESC}) { claim { id } } } }""")
-    assert body.get("errors")
+    # FIXG3 and FIXG1 synthesize, then the row now naming dapper:Claim.localdeadbeef fails.
+    body = _claims(ids["FIXG3"], ids["FIXG1"], "dapper:Claim.localdeadbeef")
+    assert body.get("errors") and body["data"] is None
     for gene in ("FIXG3", "FIXG1"):
         assert client.get(f"/v1/objects/{ids[gene]}").status_code == 404, gene
 
@@ -760,16 +641,6 @@ def test_claim_query_on_a_non_claim_returns_null_and_counts_nothing():
     body = _gql("""{ claim(id: "dapper:Proposition.SYNTHG01") { id } }""")
     assert body["data"]["claim"] is None
     assert _times_seen(R("dapper:Proposition.SYNTHG01")) == before
-
-
-def test_graphql_argument_bounds():
-    _load_fixtures()  # the phenotype must exist for its child resolvers to run
-    for q in ('{ phenotype(id: "FIXPHENO") { pigeanGeneAssociations(collection: "fixture-v1", first: -1) { prior } } }',
-              '{ phenotype(id: "FIXPHENO") { pigeanGeneAssociations(collection: "fixture-v1", first: 501) { prior } } }',
-              '{ pigeanValidationChallenge(phenotype: "FIXPHENO", collection: "fixture-v1", topGenes: 201) { truncated } }',
-              '{ pigeanValidationChallenge(phenotype: "FIXPHENO", collection: "fixture-v1", setsPerGene: 51) { truncated } }'):
-        body = _gql(q)
-        assert body.get("errors") and "must be between" in body["errors"][0]["message"], q
 
 
 def test_object_search_is_literal_case_insensitive_and_validated():
@@ -821,9 +692,9 @@ def test_deposit_hint_does_not_break_loaded_rosters():
     entity_after = con.execute("SELECT dapper_id, n_genes FROM gene_set_entities WHERE collection = 'fixture-v1' AND name = 'FIXSET_B'").fetchone()
     con.close()
     assert tuple(entity_after) == tuple(entity_before)  # the hint did not clobber the loaded entity
-    body = _gql("""{ geneSet(name: "FIXSET_B", collection: "fixture-v1") { members { gene { symbol } claim { id } } } }""")
-    assert "errors" not in body, body.get("errors")
-    assert sorted(m["gene"]["symbol"] for m in body["data"]["geneSet"]["members"]) == ["FIXG1", "FIXG9"]
+    genes = {r["gene"] for r in _rows("SELECT gene FROM claim_memberships WHERE collection = 'fixture-v1' "
+                                      "AND gene_set = 'FIXSET_B'")}
+    assert genes == {"FIXG1", "FIXG9"}
 
 
 def test_template_number_canonicalization():
@@ -861,8 +732,7 @@ def test_template_drift_is_refused():
     with con:
         con.execute("UPDATE pigean_gene_associations SET combined = 99.0 WHERE gene = 'FIXG3' AND collection = 'drift-v1'")
     con.close()
-    body = _gql("""{ gene(symbol: "FIXG3") {
-        pigeanAssociation(phenotype: "DRIFT", collection: "drift-v1") { claim { id } } } }""")
+    body = _claims(fixg3)
     assert body.get("errors"), body
     assert body["data"] is None  # a failed response writes nothing and reports no data
     assert "template drift" in body["errors"][0]["message"]
@@ -870,23 +740,15 @@ def test_template_drift_is_refused():
     assert resp.status_code == 404 and "not yet asserted" in resp.json()["detail"]
 
 
-def test_set_pigean_association_and_never_served_gene_claim_by_id():
+def test_never_served_gene_and_roster_claims_by_id():
     _load_dir(_variant("SETASSOC", "setassoc-v1"))
-    body = _gql("""{ geneSet(name: "FIXSET_A", collection: "setassoc-v1") {
-        pigeanAssociation(phenotype: "SETASSOC", collection: "setassoc-v1") { beta claim { id } } } }""")
-    assert "errors" not in body, body.get("errors")
-    assoc = body["data"]["geneSet"]["pigeanAssociation"]
-    assert assoc["beta"] == 0.0
-    assert assoc["claim"]["id"] == _index_claim_id("pigean_gene_set_associations", "gene_set", "FIXSET_A", "setassoc-v1")
     gene = _index_claim_id("pigean_gene_associations", "gene", "FIXG1", "setassoc-v1")
     assert _times_seen(gene) == 0
     env = _gql(f'{{ claim(id: "{gene}") {{ id timesDeposited triple {{ predicate }} }} }}')
     assert env["data"]["claim"] == {"id": gene, "timesDeposited": 1, "triple": {"predicate": "associated_with"}}
     # A never-served ROSTER claim by id (rosters looked up in their own table).
-    con = service_db.connect()
-    roster = con.execute("SELECT claim_id FROM pigean_gene_set_rosters WHERE collection = 'setassoc-v1' "
-                         "AND gene_set = 'FIXSET_B'").fetchone()["claim_id"]
-    con.close()
+    roster = _rows("SELECT claim_id FROM pigean_gene_set_rosters WHERE collection = 'setassoc-v1' "
+                   "AND gene_set = 'FIXSET_B'")[0]["claim_id"]
     assert _times_seen(roster) == 0
     env = _gql(f'{{ claim(id: "{roster}") {{ id triple {{ predicate }} }} }}')
     assert env["data"]["claim"]["triple"]["predicate"] == "has_members"
@@ -917,9 +779,7 @@ def test_kpn_trait_ids_name_the_phenotype():
     assert stored == {"KPN.TRAIT:9000001"}  # index rows carry the canonical id
     q = """query($id: ID!) { phenotype(id: $id) {
         id legacyId name category traitType conceptId conceptLabel mappings { targetId ontology predicate }
-        efo: mappings(ontology: "EFO") { targetId }
-        pigeanGeneAssociations(collection: "reg-v1", first: 1, orderBy: {field: COMBINED, dir: DESC}) {
-          gene { symbol } claim { triple { object } proposition } } } }"""
+        efo: mappings(ontology: "EFO") { targetId } } }"""
     for key in ("REGPHENO", "KPN.TRAIT:9000001"):
         body = _gql(q, {"id": key})
         assert "errors" not in body, body.get("errors")
@@ -928,14 +788,10 @@ def test_kpn_trait_ids_name_the_phenotype():
         assert ph["conceptId"] == "EFO:9999991" and ph["category"] == "digestive"
         assert {m["targetId"] for m in ph["mappings"]} == {"EFO:9999991", "MONDO:9999992"}
         assert [m["targetId"] for m in ph["efo"]] == ["EFO:9999991"]
-        assoc = ph["pigeanGeneAssociations"][0]
-        assert assoc["claim"]["triple"]["object"] == "KPN.TRAIT:9000001"
-        assert "Registered fixture phenotype" in assoc["claim"]["proposition"]["statement"]
-    # The challenge accepts the legacy key too.
-    ch = _gql("""{ pigeanValidationChallenge(phenotype: "REGPHENO", collection: "reg-v1",
-        where: {prior: {lt: 10}}, topGenes: 5) { rows { sets { membership { claim { id } } } } } }""")
-    assert "errors" not in ch, ch.get("errors")
-    assert sum(len(r["sets"]) for r in ch["data"]["pigeanValidationChallenge"]["rows"]) == 3
+    claim = _claims(_index_claim_id("pigean_gene_associations", "gene", "FIXG3", "reg-v1"),
+                    fields="triple { object } proposition")["data"]["c0"]
+    assert claim["triple"]["object"] == "KPN.TRAIT:9000001"
+    assert "Registered fixture phenotype" in claim["proposition"]["statement"]
     # A PIGEAN key resolves via pigean_id; the vocabulary lists the release.
     _load_dir(_variant("PIGKEY", "pig-v1"))
     ph = _gql('{ phenotype(id: "PIGKEY") { id legacyId conceptId } }')["data"]["phenotype"]
@@ -1018,13 +874,12 @@ def test_assertion_budget_bounds_a_request():
     original = svc.MAX_ASSERTIONS_PER_REQUEST
     svc.MAX_ASSERTIONS_PER_REQUEST = 2
     try:
-        body = _gql("""{ phenotype(id: "BUDGET") { pigeanGeneAssociations(collection: "budget-v1") { claim { id } } } }""")
+        ids = [r["claim_id"] for r in _rows("SELECT claim_id FROM pigean_gene_associations WHERE collection = 'budget-v1'")]
+        body = _claims(*ids)
     finally:
         svc.MAX_ASSERTIONS_PER_REQUEST = original
+    assert len(ids) == 3
     assert body.get("errors") and "more than 2 claims" in body["errors"][0]["message"]
-    con = service_db.connect()
-    ids = [r["claim_id"] for r in con.execute("SELECT claim_id FROM pigean_gene_associations WHERE collection = 'budget-v1'")]
-    con.close()
     assert all(_times_seen(i) == 0 for i in ids)  # nothing written
 
 
@@ -1052,7 +907,7 @@ def _rows(sql, params=()):
 
 def test_results_loaded_before_the_registry_never_duplicate():
     """Rows loaded under the legacy key, then the registry, then a reload:
-    one canonical copy, a working challenge, and no deposit can shadow the
+    one canonical copy, and no deposit can shadow the
     legacy-keyed result in between."""
     with _isolated_db():
         _load_dir(_variant("REGPHENO", "late-v1"))
@@ -1069,10 +924,7 @@ def test_results_loaded_before_the_registry_never_duplicate():
         for table in ("pigean_gene_associations", "pigean_gene_set_associations", "claim_memberships"):
             keys = {r["phenotype"] for r in _rows(f"SELECT DISTINCT phenotype FROM {table} WHERE collection = 'late-v1'")}
             assert keys == {"KPN.TRAIT:9000001"}, (table, keys)
-        body = _gql("""{ pigeanValidationChallenge(phenotype: "REGPHENO", collection: "late-v1",
-            where: {prior: {lt: 10}}, topGenes: 5) { rows { geneAssociation { gene { symbol } } } } }""")
-        assert "errors" not in body, body.get("errors")
-        genes = [r["geneAssociation"]["gene"]["symbol"] for r in body["data"]["pigeanValidationChallenge"]["rows"]]
+        genes = [r["gene"] for r in _rows("SELECT gene FROM pigean_gene_associations WHERE collection = 'late-v1'")]
         assert sorted(genes) == ["FIXG1", "FIXG2", "FIXG3"]
 
 
@@ -1085,20 +937,6 @@ def test_superseded_rosters_are_no_longer_implied():
         assert env["data"]["claim"] is None  # superseded: no edge cites it any more
         resp = client.get(f"/v1/objects/{old['FIXSET_A']}")
         assert resp.status_code == 404 and "not yet asserted" not in resp.json()["detail"]
-
-
-def test_gene_set_root_pins_one_phenotypes_observation():
-    with _isolated_db():
-        _load_dir(_variant("P1", "pin-v1"))
-        _load_dir(_variant("P2", "pin-v1", membership=[("FIXG1", "FIXSET_A"), ("FIXG3", "FIXSET_A"), ("FIXG1", "FIXSET_B")]))
-        for phenotype, genes in (("P1", ["FIXG1", "FIXG2"]), ("P2", ["FIXG1", "FIXG3"])):
-            body = _gql(f"""{{ geneSet(name: "FIXSET_A", collection: "pin-v1", phenotype: "{phenotype}") {{
-                dapperGeneSetId members {{ gene {{ symbol }} geneSet {{ dapperGeneSetId }} claim {{ triple {{ subject }} }} }} }} }}""")
-            assert "errors" not in body, body.get("errors")
-            gs = body["data"]["geneSet"]
-            assert sorted(m["gene"]["symbol"] for m in gs["members"]) == genes
-            for m in gs["members"]:  # parent, member, and roster claim name one GeneSet
-                assert m["geneSet"]["dapperGeneSetId"] == gs["dapperGeneSetId"] == m["claim"]["triple"]["subject"]
 
 
 def test_trait_release_guards():
@@ -1181,7 +1019,8 @@ def test_query_budget_bounds_a_request():
     original = svc.MAX_QUERIES_PER_REQUEST
     svc.MAX_QUERIES_PER_REQUEST = 5
     try:
-        body = _gql("""{ phenotype(id: "FIXPHENO") { pigeanGeneAssociations(collection: "fixture-v1") { claim { id } } } }""")
+        body = _claims(*[r["claim_id"] for r in _rows(
+            "SELECT claim_id FROM pigean_gene_associations WHERE collection = 'fixture-v1'")])
     finally:
         svc.MAX_QUERIES_PER_REQUEST = original
     assert body["data"] is None and "database queries" in body["errors"][0]["message"]
@@ -1251,11 +1090,6 @@ def test_another_phenotypes_membership_never_names_the_subject():
         _load_dir(both)
         assert _gene_set_subject("leak-v1", "FIXSET_A", "P2") == own
         assert _gene_set_subject("leak-v1", "FIXSET_A", "P1") != own
-        body = _gql("""{ geneSet(name: "FIXSET_A", collection: "leak-v1", phenotype: "P2") {
-            dapperGeneSetId members { claim { triple { subject } } } } }""")
-        gs = body["data"]["geneSet"]
-        assert gs["dapperGeneSetId"] == own
-        assert {m["claim"]["triple"]["subject"] for m in gs["members"]} == {own}
         # A membership file for a phenotype the result files lack is refused.
         mismatched = _variant("P3", "leak-v1")
         (mismatched / "gene_gene_set_stats.json").write_text(
@@ -1529,26 +1363,6 @@ def test_other_phenotypes_member_less_subject_ignores_this_loads_membership():
         _load_without_membership(_variant("P2", "neutral-v1"))
         subjects.append(_gene_set_subject("neutral-v1", "FIXSET_A", "P2"))
     assert len(set(subjects)) == 1, subjects
-
-
-def test_service_finds_memberships_under_non_ascii_legacy_keys_on_sqlite():
-    with _isolated_db():
-        legacy = "Crohn’s disease"
-        _load_dir(_variant(legacy, "svc-v1"))
-        con = service_db.connect()
-        try:
-            with con:
-                con.execute("INSERT INTO kpn_traits (trait_id, legacy_id, name) VALUES (?, ?, ?)",
-                            ("KPN.TRAIT:9100002", legacy, "Crohn's"))
-        finally:
-            con.close()
-        _load_without_membership(_variant(legacy, "svc-v1"))  # edges stay under the legacy key
-        body = _gql("""{ geneSet(name: "FIXSET_A", collection: "svc-v1", phenotype: "KPN.TRAIT:9100002") {
-            dapperGeneSetId members { gene { symbol } claim { triple { subject } } } } }""")
-        assert "errors" not in body, body.get("errors")
-        gs = body["data"]["geneSet"]
-        assert sorted(m["gene"]["symbol"] for m in gs["members"]) == ["FIXG1", "FIXG2"]
-        assert {m["claim"]["triple"]["subject"] for m in gs["members"]} == {gs["dapperGeneSetId"]}
 
 
 def test_typed_slots_are_validated_and_stored_documents_never_fail_a_response():

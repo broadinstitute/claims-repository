@@ -8,21 +8,20 @@ Depends on broadinstitute/dapper (pinned profile `0.2.0-a1`); provenance resolut
 
 **Contract-first:** the v0 contract is the current deliverable; the service implements it.
 
-**Design centerpiece — method modules:** each KPN method's claim template (kpn-dapper-toolkit)
-ships its own GraphQL schema module alongside its claim generation; this service is a generic host
-that composes `core + methods/*` at startup and knows nothing method-specific. See
-[docs/method-modules.md](docs/method-modules.md).
+**Queries are collection query templates.** Every result query is a registered collection's query
+template, run with `runQuery` (GraphQL) or `POST /v1/collections/{c}/queries/{name}:run`. To find out
+what you can run, start at `GET /v1/queries` (GraphQL: `queries`): each query with its params and the
+values they take, the rows it returns, the claims it serves, and a request that runs as given.
+`GET /v1/collections/{c}/dimensions/{d}` (GraphQL: `dimensionValues`) lists every value of a param
+such as `trait`. There are no per-method GraphQL fields ([docs/collections.md](docs/collections.md)).
 
-- [api/graphql/core.graphql](api/graphql/core.graphql) — method-agnostic schema: nodes, claim
-  envelopes, provenance refs, association interfaces.
-- [api/graphql/methods/pigean.graphql](api/graphql/methods/pigean.graphql) — the PIGEAN module:
-  typed metrics, filters, order enums, and the `pigeanValidationChallenge` root field. These
-  fields read the published `pigean` collection; `collection` names its gene-set library.
+- [api/graphql/core.graphql](api/graphql/core.graphql) — method-agnostic schema: phenotypes (the
+  KPN trait registry), claim and proposition envelopes, objects, provenance refs.
+- [api/graphql/collections.graphql](api/graphql/collections.graphql) — `queries`, `dimensionValues`,
+  `collections`, `collection`, `collectionQueries` and `runQuery`.
 - [api/graphql/examples/](api/graphql/examples/) — the example queries the GraphiQL explorer opens
-  on, one tab each with its variables (validation challenge, top genes and gene sets, collections,
-  a collection query, one claim, a trait).
-- [api/graphql/queries/](api/graphql/queries/) — the persisted Day-10 IBD validation-challenge
-  query, its researcher-editable variables, and a synthetic fixture response for UI mocks.
+  on, one tab each with its variables (what can I run, find a trait, the validation challenge, top
+  genes only, collections, one claim, a trait).
 - [api/openapi.yaml](api/openapi.yaml) — REST: health, vocabulary, deposit (`POST /v1/deposits`: any DAPPER class, validated; needs a key),
   and objects only — the `/v1/objects/{id}` resolver, `/v1/objects` list, `/v1/objects/search`
   — plus the `/v1/graphql` endpoint shell. Browsable at `/v1/docs`. Deposit example:

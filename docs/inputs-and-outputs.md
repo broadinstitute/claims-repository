@@ -111,13 +111,13 @@ Everything that asks a *result-table-shaped question* — filter by a metric,
 order by a metric, take top-N, join edges — goes through
 `POST /v1/graphql`:
 
-- per-method typed fields (`pigeanGeneAssociations`, `beta_uncorrected`
-  ordering, …) generated from the method's claim template, so claim
-  generation and query surface share one source of truth;
-- the persisted CFDE validation-challenge query, where researchers edit
-  **variables, never query text** — the constrained-query guarantee;
-- no cross-method order-by exists in the schema, so unlike scores **cannot**
-  be blended, by construction.
+- every query is a collection's query template, run with `runQuery`; the
+  catalog (`queries`, `GET /v1/queries`) says what each takes and returns.
+  Callers edit **variables, never query text** — the constrained-query
+  guarantee (the CFDE validation challenge is pigean's `top-genes-with-sets`);
+- each plan step filters and orders on its own row kind's metrics only, so
+  unlike scores **cannot** be blended, by construction. (Superseded on
+  2026-11-18: there are no per-method typed fields.)
 
 ### Why there is no REST API over PIGEAN results / the index tables
 

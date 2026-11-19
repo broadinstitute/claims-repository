@@ -1,0 +1,7 @@
+{
+  "variables": {
+    "trait": "IBD",
+    "topGenes": 25,
+    "setsPerGene": 0
+  }
+}

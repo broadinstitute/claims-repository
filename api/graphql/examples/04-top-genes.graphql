@@ -1,0 +1,9 @@
+# 4. Just the ranking
+#
+# The same query with setsPerGene 0 and no priorMax: the top genes for a trait
+# by combined score, with no gene sets. `claims: []` returns the rows without
+# serving any claim, so nothing is asserted; leave `claims` out to get every
+# claim each row stands for (the measurement and the evidence tiers).
+query TopGenes($variables: JSON) {
+  runQuery(collection: "pigean", query: "top-genes-with-sets", variables: $variables, claims: [])
+}

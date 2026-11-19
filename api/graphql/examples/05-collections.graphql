@@ -1,0 +1,16 @@
+# 5. What collections hold
+#
+# Every registered collection of results and its current release. For one
+# collection in full (dimensions, row kinds, metrics, templates, datasets),
+# use collection(id: "pigean"), or GET /v1/collections/pigean.
+query Collections {
+  collections {
+    id
+    title
+    description
+    methods
+    version
+    currentRelease
+    datasets
+  }
+}

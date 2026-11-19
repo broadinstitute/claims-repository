@@ -1,0 +1,10 @@
+# 2. Find the value to pass for a parameter
+#
+# A query's dimension params (pigean's `trait` and `library`) take the values
+# the collection's datasets have. dimensionValues lists them, with labels and
+# the other keys a query accepts for each (a trait's legacy key, e.g. IBD).
+# `search` matches value, label or key. Try "diabetes", or dimension "library".
+# The same list is at GET /v1/collections/pigean/dimensions/trait?search=bowel
+query FindATrait($search: String) {
+  dimensionValues(collection: "pigean", dimension: "trait", search: $search, first: 10)
+}

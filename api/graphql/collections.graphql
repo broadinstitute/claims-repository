@@ -5,11 +5,31 @@
 # collection's own row kinds and metrics, not a fixed schema.
 
 extend type Query {
+  """
+  Start here: every query the repository answers, described so that you can
+  run any of them with runQuery without reading anything else. Returns
+  {guide, queries}: `guide` says how to call runQuery and what a result looks
+  like; each entry in `queries` gives the query's collection and name, its
+  params (type, default, bounds; a dimension param also gives a sample of its
+  values and where to list them all), the rows it returns (kinds, entities,
+  metrics and their meaning, joins), the claim keys `claims` accepts, and a
+  GraphQL and a REST request that run as given. `collection` limits the list
+  to one collection. Same as GET /v1/queries.
+  """
+  queries(collection: String, release: String): JSON
+  """
+  The values a collection's dataset dimension takes (e.g. pigean's `trait`
+  or `library`): each value with its label, the other keys a query accepts
+  for it (a trait's legacy key, such as IBD), and how many datasets have it.
+  `search` matches value, label or key, case-insensitively. Returns
+  {collection, release, dimension, count, values, truncated}.
+  """
+  dimensionValues(collection: String!, dimension: String!, search: String, first: Int, release: String): JSON
   "Every registered collection, with its current release."
   collections: [CollectionSummary!]!
   "One collection described from its release manifest (current release unless `release` names a version or release id)."
   collection(id: String!, release: String): JSON
-  "A collection's query templates: description, parameters, plan, and a runnable example."
+  "One collection's entries from `queries`."
   collectionQueries(collection: String!, release: String): JSON
   """
   Run a collection's query template. `claims` limits which claim keys each row

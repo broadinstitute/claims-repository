@@ -492,11 +492,81 @@ paths:
               schema: { type: object }
         '404':
           $ref: '#/components/responses/NotFoundProblem'
+  /v1/queries:
+    get:
+      operationId: queryCatalog
+      tags: [Collections]
+      summary: Every query the repository answers, described for runQuery (start here)
+      description: >-
+        Returns {guide, queries}. `guide` explains how to call runQuery (GraphQL
+        or REST), its arguments, and the shape of a result row, join item and
+        claim envelope. Each entry in `queries` names a collection's query
+        template and gives its params (type, default, bounds; a dimension param
+        also gives a sample of its values and the URL that lists them all), the
+        rows it returns (kinds, entities, metrics with their meaning, joins),
+        the claim keys `claims` accepts, its plan, and a GraphQL and a REST
+        request that run as given. Derived from each collection's current
+        release manifest. GraphQL: `queries`.
+      parameters:
+        - name: collection
+          in: query
+          required: false
+          description: Only this collection's queries.
+          schema: { type: string }
+        - name: release
+          in: query
+          required: false
+          description: With `collection`, a version or release id instead of the current release.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The guide and the query entries.
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/collections/{collection}/dimensions/{dimension}:
+    get:
+      operationId: collectionDimensionValues
+      tags: [Collections]
+      summary: The values a dataset dimension takes (what to pass for a dimension param)
+      description: >-
+        Each value with its label, the other keys a query accepts for it (a
+        trait's legacy or PIGEAN key), and its number of datasets.
+        GraphQL: `dimensionValues`.
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: dimension
+          in: path
+          required: true
+          schema: { type: string }
+        - name: search
+          in: query
+          required: false
+          description: Case-insensitive match on value, label or accepted key.
+          schema: { type: string }
+        - name: first
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+        - name: release
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: '{collection, release, dimension, count, values: [{value, label, datasets, also_accepts}], truncated}'
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
   /v1/collections/{collection}/queries:
     get:
       operationId: listCollectionQueries
       tags: [Collections]
-      summary: A collection's query templates, each with a runnable example
+      summary: A collection's entries from GET /v1/queries
       parameters:
         - $ref: '#/components/parameters/Collection'
         - name: release
@@ -505,7 +575,7 @@ paths:
           schema: { type: string }
       responses:
         '200':
-          description: Description, parameters, plan and an example REST body and GraphQL call per query.
+          description: '{collection, queries}: the same entries as GET /v1/queries, for one collection.'
           content:
             application/json:
               schema: { type: object }
@@ -592,17 +662,14 @@ paths:
     post:
       operationId: graphql
       tags: [GraphQL]
-      summary: The query surface (GraphQL over composed method modules)
+      summary: The query surface (GraphQL)
       description: >-
-        Standard GraphQL-over-HTTP endpoint executing the schema composed from
-        api/graphql/core.graphql plus every registered method module in
-        api/graphql/methods/ (design: docs/method-modules.md). Introspection is
-        enabled; standard depth/complexity limits apply. Execution semantics
-        (anchor limits before joins, deterministic ties, empty-vs-missing
-        distinction, no score blending) are documented on the schema fields
-        themselves. The Day-10 CFDE validation challenge is the persisted query
-        api/graphql/queries/ibd-validation-challenge.graphql with its
-        researcher-editable variables. Clients cannot write through GraphQL (no
+        Standard GraphQL-over-HTTP endpoint executing api/graphql/core.graphql
+        plus api/graphql/collections.graphql. Results are read only through
+        collections: `queries` lists every query template with what it takes
+        and returns, and `runQuery` runs one (the CFDE validation challenge is
+        the pigean collection's top-genes-with-sets). There are no per-method
+        fields. Introspection is enabled. Clients cannot write through GraphQL (no
         Mutation type; deposit stays on POST /v1/deposits), but serving a result
         MINTS the claim it implies: the claim is synthesized from its index row,
         verified, and recorded with every assertion in one batch after the whole
@@ -720,6 +787,8 @@ components:
       description: >-
         Optional. Each declares the graph edge of one Claim (in this deposit or already stored) for the PIGEAN
         index, so indexing never guesses entity categories from proposition text. A hint may not overwrite a loaded row.
+        Legacy: since 2026-11-18 no query reads the PIGEAN index (results are read through collections), so a
+        hint only records the edge; the deposited claim itself is served by claim(id) and /v1/objects either way.
       items:
         type: object
         required: [claim_id, method, predicate, subject, object]

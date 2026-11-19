@@ -251,8 +251,7 @@ def run_query(con, collection: str, name: str, variables: dict | None = None, *,
 
 def run_plan(con, collection: str, qdoc: dict, bound: dict, *, release: str | None = None, name: str | None = None,
              claims: list[str] | None = None, envelope=None) -> dict:
-    """Run a query plan (a query template's `plan`, or one a caller builds,
-    such as the pigeanValidationChallenge GraphQL field) against a release.
+    """Run a query plan (a query template's `plan`) against a release.
     `bound` holds the values its `$` references take; literal values in the
     plan are used as they are."""
     rel = release_row(con, collection, release)
