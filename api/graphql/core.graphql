@@ -14,13 +14,6 @@ type Query {
   health: Health!
 
   """
-  A phenotype by any of its keys: a canonical KPN trait ID
-  (KPN.TRAIT:0000505), a legacy portal key (IBD), or a PIGEAN phenotype key —
-  resolved through the KPN trait registry (broadinstitute/kpn-data-models).
-  """
-  phenotype(id: ID!): Phenotype
-
-  """
   A claim by dapper:Claim ID: a deposited claim, or one the loaded data
   implies — synthesized from its index row, verified, and minted on first
   serve. Every call is an assertion (counted once per request).
@@ -68,40 +61,6 @@ enum ScoreKind {
   EFFECT_ESTIMATE
   LOADING
   SCORE
-}
-
-type Phenotype {
-  """
-  Canonical KPN trait ID (KPN.TRAIT:…, from broadinstitute/kpn-data-models)
-  when the phenotype is registered; otherwise the key as loaded.
-  """
-  id: ID!
-  "Legacy portal trait key the result files use, e.g. IBD."
-  legacyId: String
-  "KPN trait name, e.g. Inflammatory bowel disease (IBD)."
-  name: String
-  "KPN trait category (registry trait_group), e.g. digestive."
-  category: String
-  "KPN trait type, e.g. disease, measurement."
-  traitType: String
-  "Primary ontology concept from the KPN registry, e.g. EFO:0003767."
-  conceptId: String
-  conceptLabel: String
-  "Cross-ontology mappings from the KPN registry (SSSOM), optionally for one ontology (EFO, MONDO, MESH, DOID, HP, ORPHANET, ...)."
-  mappings(ontology: String): [TraitMapping!]!
-}
-
-"One SSSOM mapping of a KPN trait to an ontology term."
-type TraitMapping {
-  targetId: ID!
-  ontology: String!
-  "SKOS / SSSOM predicate, e.g. skos:exactMatch."
-  predicate: String!
-  label: String
-  confidence: Float
-  justification: String
-  "Where the mapping came from (curated table, EFO cross-reference, ...)."
-  source: String
 }
 
 """

@@ -777,25 +777,14 @@ def test_kpn_trait_ids_name_the_phenotype():
         "SELECT DISTINCT phenotype FROM pigean_gene_associations WHERE collection = 'reg-v1'")}
     con.close()
     assert stored == {"KPN.TRAIT:9000001"}  # index rows carry the canonical id
-    q = """query($id: ID!) { phenotype(id: $id) {
-        id legacyId name category traitType conceptId conceptLabel mappings { targetId ontology predicate }
-        efo: mappings(ontology: "EFO") { targetId } } }"""
-    for key in ("REGPHENO", "KPN.TRAIT:9000001"):
-        body = _gql(q, {"id": key})
-        assert "errors" not in body, body.get("errors")
-        ph = body["data"]["phenotype"]
-        assert ph["id"] == "KPN.TRAIT:9000001" and ph["legacyId"] == "REGPHENO"
-        assert ph["conceptId"] == "EFO:9999991" and ph["category"] == "digestive"
-        assert {m["targetId"] for m in ph["mappings"]} == {"EFO:9999991", "MONDO:9999992"}
-        assert [m["targetId"] for m in ph["efo"]] == ["EFO:9999991"]
     claim = _claims(_index_claim_id("pigean_gene_associations", "gene", "FIXG3", "reg-v1"),
                     fields="triple { object } proposition")["data"]["c0"]
     assert claim["triple"]["object"] == "KPN.TRAIT:9000001"
     assert "Registered fixture phenotype" in claim["proposition"]["statement"]
     # A PIGEAN key resolves via pigean_id; the vocabulary lists the release.
     _load_dir(_variant("PIGKEY", "pig-v1"))
-    ph = _gql('{ phenotype(id: "PIGKEY") { id legacyId conceptId } }')["data"]["phenotype"]
-    assert ph == {"id": "KPN.TRAIT:9000002", "legacyId": "OLDKEY", "conceptId": "ORPHANET:9999993"}
+    assert {r["phenotype"] for r in _rows("SELECT DISTINCT phenotype FROM pigean_gene_associations "
+                                          "WHERE collection = 'pig-v1'")} == {"KPN.TRAIT:9000002"}
     vocab = client.get("/v1/vocabulary").json()
     assert vocab["trait_registry"]["version"] == "v0.0.2"
     assert vocab["identifier_resolution"]["prefixes"]["KPN.TRAIT"].startswith("https://")

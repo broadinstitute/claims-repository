@@ -15,13 +15,14 @@ values they take, the rows it returns, the claims it serves, and a request that 
 `GET /v1/collections/{c}/dimensions/{d}` (GraphQL: `dimensionValues`) lists every value of a param
 such as `trait`. There are no per-method GraphQL fields ([docs/collections.md](docs/collections.md)).
 
-- [api/graphql/core.graphql](api/graphql/core.graphql) — method-agnostic schema: phenotypes (the
-  KPN trait registry), claim and proposition envelopes, objects, provenance refs.
+- [api/graphql/core.graphql](api/graphql/core.graphql) — method-agnostic schema: claim and proposition
+  envelopes, objects, provenance refs. What a trait means comes from its collection, through
+  `dimensionValues`.
 - [api/graphql/collections.graphql](api/graphql/collections.graphql) — `queries`, `dimensionValues`,
   `collections`, `collection`, `collectionQueries` and `runQuery`.
 - [api/graphql/examples/](api/graphql/examples/) — the example queries the GraphiQL explorer opens
   on, one tab each with its variables (what can I run, find a trait, the validation challenge, top
-  genes only, collections, one claim, a trait).
+  genes only, collections, one claim).
 - [api/openapi.yaml](api/openapi.yaml) — REST: health, vocabulary, deposit (`POST /v1/deposits`: any DAPPER class, validated; needs a key),
   and objects only — the `/v1/objects/{id}` resolver, `/v1/objects` list, `/v1/objects/search`
   — plus the `/v1/graphql` endpoint shell. Browsable at `/v1/docs`. Deposit example:

@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-from ariadne import ObjectType, QueryType, ScalarType, graphql_sync, make_executable_schema
+from ariadne import QueryType, ScalarType, graphql_sync, make_executable_schema
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -551,7 +551,6 @@ def _phenotype_view(con, key, trait_group=None):
 # GraphQL resolvers
 
 query = QueryType()
-phenotype_type = ObjectType("Phenotype")
 json_scalar = ScalarType("JSON")
 
 
@@ -562,33 +561,6 @@ def _con(info):
 @query.field("health")
 def resolve_health(*_):
     return {"status": "ok", "contractVersion": CONTRACT_VERSION, "dapperProfile": DAPPER_PROFILE}
-
-
-@query.field("phenotype")
-def resolve_phenotype(_, info, id):
-    """Accepts a KPN.TRAIT ID, a legacy portal key (IBD), or a PIGEAN key."""
-    con = _con(info)
-    if _trait(con, id) is not None:
-        return _phenotype_view(con, id)
-    if con.execute("SELECT 1 FROM dataset_dimensions WHERE dimension = 'trait' AND value = ? LIMIT 1",
-                   (id,)).fetchone():  # a collection's trait outside the registry, kept as given
-        return _phenotype_view(con, id)
-    return None
-
-
-@phenotype_type.field("mappings")
-def resolve_trait_mappings(obj, info, ontology=None):
-    sql = ("SELECT target_id, ontology, predicate, label, confidence, justification, source "
-           "FROM kpn_trait_mappings WHERE trait_id = ?")
-    params = [obj["id"]]
-    if ontology:
-        sql += " AND ontology = ?"
-        params.append(ontology)
-    return [
-        {"targetId": r["target_id"], "ontology": r["ontology"], "predicate": r["predicate"], "label": r["label"],
-         "confidence": r["confidence"], "justification": r["justification"], "source": r["source"]}
-        for r in _con(info).execute(sql + " ORDER BY confidence DESC, target_id", params).fetchall()
-    ]
 
 
 @query.field("claim")
@@ -692,7 +664,7 @@ def resolve_run_query(_, info, collection, query, variables=None, release=None, 
 
 
 schema = make_executable_schema(
-    _load_type_defs(), query, phenotype_type, json_scalar
+    _load_type_defs(), query, json_scalar
 )
 
 # ---------------------------------------------------------------------------

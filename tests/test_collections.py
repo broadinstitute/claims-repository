@@ -232,6 +232,7 @@ def test_reveal_candidates_come_from_run_query(published):
     assert all(c["prior"] < 1.0 for c in candidates)
     assert [r["object"]["id"] for r in rows] == [c["trait"] for c in candidates]
     for field in ("pigeanValidationChallenge(phenotype: \"FIXPHENO\") { warnings }", "methods { name }",
+                  "phenotype(id: \"FIXPHENO\") { id }",
                   "gene(symbol: \"FIXG1\") { symbol }", "phenotypes { id }"):
         gone = client.post("/v1/graphql", json={"query": "{ %s }" % field}).json()
         assert gone.get("errors") and "Cannot query field" in gone["errors"][0]["message"], field
