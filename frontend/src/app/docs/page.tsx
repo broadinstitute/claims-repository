@@ -17,8 +17,8 @@ const KPN_TRAITS = "https://broadinstitute.github.io/kpn-data-models/";
 
 // A checked example from the QA API, release 2026.11.1. These are source-reported
 // values, not a live preview. Keep the release label alongside the example.
-const EXAMPLE_CLAIM = "dapper:Claim.p402DhDyUIBItVsN56yly5D5RsM2OS4u";
-const EXAMPLE_RELEASE = "2026.11.1";
+const EXAMPLE_CLAIM = "dapper:Claim.BaMUWCeSQpLVWbYSI1FcKiAAjfC1K5t2";
+const EXAMPLE_RELEASE = "2026.11.2";
 const SECTIONS = [
   ["what", "Overview"],
   ["example", "What is PIGEAN?"],
