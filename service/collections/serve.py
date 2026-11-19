@@ -14,7 +14,8 @@ when the collection is loaded.
 from __future__ import annotations
 
 import json
-from functools import lru_cache
+import threading
+from collections import OrderedDict
 
 from . import engine
 from . import identity as idn
@@ -34,17 +35,39 @@ class ClaimRenderError(RuntimeError):
 FILTER_OPS = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">=", "eq": "=", "ne": "!="}
 
 
-@lru_cache(maxsize=8192)
-def _context(activity_id: str, context_json: str) -> engine.MintContext:
-    return engine.MintContext.from_record(json.loads(context_json))
+# Parsed mint contexts by activity id. A context is immutable under its id (the id is minted from it), so the
+# id alone keys the cache; a context is read from the database only on a miss. ~2k covers every dataset of a
+# PIGEAN-sized release for one template.
+_CONTEXTS: OrderedDict[str, engine.MintContext] = OrderedDict()
+_CONTEXTS_MAX = 2048
+_CONTEXTS_LOCK = threading.Lock()
+
+
+def _cached_context(activity_id: str) -> engine.MintContext | None:
+    with _CONTEXTS_LOCK:
+        ctx = _CONTEXTS.get(activity_id)
+        if ctx is not None:
+            _CONTEXTS.move_to_end(activity_id)
+        return ctx
+
+
+def _cache_context(activity_id: str, raw) -> engine.MintContext:
+    ctx = engine.MintContext.from_record(raw if isinstance(raw, dict) else json.loads(raw))
+    with _CONTEXTS_LOCK:
+        _CONTEXTS[activity_id] = ctx
+        while len(_CONTEXTS) > _CONTEXTS_MAX:
+            _CONTEXTS.popitem(last=False)
+    return ctx
 
 
 def mint_context(con, activity_id: str) -> engine.MintContext:
+    ctx = _cached_context(activity_id)
+    if ctx is not None:
+        return ctx
     row = con.execute("SELECT context FROM mint_contexts WHERE activity_id = ?", (activity_id,)).fetchone()
     if row is None:
         raise ClaimRenderError(f"no mint context {activity_id}")
-    raw = row["context"]
-    return _context(activity_id, raw if isinstance(raw, str) else json.dumps(raw))
+    return _cache_context(activity_id, row["context"])
 
 
 def collection_of(con, rc) -> str:
@@ -111,16 +134,22 @@ def _render_group(con, ctx, dataset: dict, dataset_id, edge_kind, group_id) -> t
 def _release_contexts(con, release_id: str, dataset_ids) -> dict[str, list]:
     """dataset id -> (activity id, mint context) for the release's mint contexts over those datasets."""
     ids = sorted(set(dataset_ids))
-    out: dict[str, list] = {d: [] for d in ids}
+    pairs = []
     for i in range(0, len(ids), 500):
         chunk = ids[i:i + 500]
-        for r in con.execute(f"SELECT rm.activity_id, rm.dataset_id, mc.context FROM release_mint_contexts rm "
-                             f"JOIN mint_contexts mc ON mc.activity_id = rm.activity_id WHERE rm.release_id = ? AND "
-                             f"rm.dataset_id IN ({','.join('?' * len(chunk))}) ORDER BY rm.activity_id",
-                             [release_id, *chunk]).fetchall():
-            raw = r["context"]
-            ctx = _context(r["activity_id"], raw if isinstance(raw, str) else json.dumps(raw))
-            out[r["dataset_id"]].append((r["activity_id"], ctx))
+        pairs += [(r["activity_id"], r["dataset_id"]) for r in con.execute(
+            f"SELECT activity_id, dataset_id FROM release_mint_contexts WHERE release_id = ? AND "
+            f"dataset_id IN ({','.join('?' * len(chunk))}) ORDER BY activity_id", [release_id, *chunk]).fetchall()]
+    contexts = {a: c for a in {a for a, _ in pairs} if (c := _cached_context(a)) is not None}
+    missing = sorted({a for a, _ in pairs} - contexts.keys())
+    for i in range(0, len(missing), 200):
+        chunk = missing[i:i + 200]
+        for r in con.execute(f"SELECT activity_id, context FROM mint_contexts WHERE activity_id IN "
+                             f"({','.join('?' * len(chunk))})", chunk).fetchall():
+            contexts[r["activity_id"]] = _cache_context(r["activity_id"], r["context"])
+    out: dict[str, list] = {d: [] for d in ids}
+    for activity_id, dataset_id in pairs:
+        out[dataset_id].append((activity_id, contexts[activity_id]))
     return out
 
 
