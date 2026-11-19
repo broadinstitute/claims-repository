@@ -1,8 +1,1 @@
-{
-  "variables": {
-    "trait": "T2DadjBMI",
-    "library": "mouse_msigdb",
-    "topGenes": 10,
-    "setsPerGene": 3
-  }
-}
+{"trait": "IBD", "priorMax": 0.5, "topGenes": 20, "setsPerGene": 5}
