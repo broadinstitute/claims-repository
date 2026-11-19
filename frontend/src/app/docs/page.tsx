@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
-import { BookOpen, Bot, Compass, Database, Dna, ExternalLink, FileSearch, Fingerprint, Layers, Network, Quote, Ruler, Tags, Terminal, type LucideIcon } from "lucide-react";
+import { BookOpen, Bot, Compass, Database, Dna, ExternalLink, FileSearch, Fingerprint, Layers, Network, Quote, Ruler, Tags, Terminal, Zap, type LucideIcon } from "lucide-react";
 import { AgentPrompt } from "./agent-prompt";
 
 export const metadata: Metadata = {
@@ -15,7 +15,7 @@ const DAPPER_DOCS = "https://broadinstitute.github.io/dapper/";
 const CLAIMS_REPO = "https://github.com/broadinstitute/claims-repository";
 const KPN_TRAITS = "https://broadinstitute.github.io/kpn-data-models/";
 
-// A checked example from the QA API, release 2026.11.1. These are source-reported
+// A checked example from the QA API, release 2026.11.2. These are source-reported
 // values, not a live preview. Keep the release label alongside the example.
 const EXAMPLE_CLAIM = "dapper:Claim.BaMUWCeSQpLVWbYSI1FcKiAAjfC1K5t2";
 const EXAMPLE_RELEASE = "2026.11.2";
@@ -71,7 +71,7 @@ Check the HTTP status and any top-level GraphQL errors. The result is the JSON v
 - A table of gene identifiers, combined, log_bf and prior scores, with each measurement claim ID and resolver URL.
 - The returned gene sets for each gene and their beta and beta_uncorrected scores. Note any missing sets or response warnings.
 - The collection release ID and version, dataset dimensions and bound query parameters.
-- A brief explanation of the metric definitions, retaining provisional labels. These scores are method-specific, not probabilities or evidence of therapeutic efficacy.
+- A brief explanation of the metric definitions. These scores are method-specific, not probabilities or evidence of therapeutic efficacy.
 
 For the first gene, follow its measurement resolver URL and inspect the evidence and value locators in the query response. Report the source file ID and location of the combined score. Distinguish inspecting these references from verifying the original file bytes.
 
@@ -80,8 +80,8 @@ Use only returned results. If network access is unavailable, or a request fails,
 const PRINCIPLES: { icon: LucideIcon; title: string; text: string }[] = [
   { icon: FileSearch, title: "Traceable evidence", text: "Measurements link to source files and value locators, so a reported value can be checked against its source." },
   { icon: Fingerprint, title: "Content-derived identifiers", text: "Claim IDs depend on the fields defining their identity. The same identified content keeps its ID; revisions to those fields produce a different one." },
-  { icon: Layers, title: "A shared query model", text: "Collections describe their results, claim templates and queries through a common interface. PIGEAN is the method available in this beta." },
-  { icon: Compass, title: "A discoverable interface", text: "The query catalog declares supported questions, parameters, defaults and examples for both human and programmatic use." },
+  { icon: Zap, title: "Claims generated on request", text: "A claim is generated from its result row when a query first returns it, then stored; its ID resolves from then on. Nothing is generated in advance, so a revised template takes effect without reprocessing every result." },
+  { icon: Compass, title: "A discoverable interface", text: "Collections describe their results, claim templates and queries through a common interface, and the query catalog declares the supported questions, parameters, defaults and examples. PIGEAN is the method available in this beta." },
   { icon: Ruler, title: "Explicit score definitions", text: "Metrics retain their method-specific scales and interpretations. Evidence tiers describe a named rule, not the probability that a claim is true." },
   { icon: Tags, title: "Identifiers and aliases", text: "Genes and traits retain identifiers, with aliases and ontology mappings where available. Unmapped source names are not silently equated with other concepts." },
 ];
@@ -224,7 +224,7 @@ export default function DocsPage() {
                 ["Claim identifier", "A content-derived ID and a URL for retrieving the claim."],
               ]} />
               <p>
-                “Self-annotating” means that declared templates attach these definitions and evidence references to source results. The annotations describe the analysis; they do not add new biological inferences. A machine-readable query catalog describes the available queries, parameters and metrics so software can inspect them before requesting results.
+                “Self-annotating” means that declared templates attach these definitions and evidence references to source results. The annotations describe the analysis; they do not add new biological inferences. A claim is generated when a query first returns its result and is stored from then on, so its ID and resolver URL work for anyone you share them with. Take claim IDs from query responses; an ID is not resolvable before its result has been returned. A machine-readable query catalog describes the available queries, parameters and metrics so software can inspect them before requesting results.
               </p>
             </Section>
 
@@ -242,7 +242,7 @@ export default function DocsPage() {
                     ["Collection", "A named group of results, with its data, claim templates and queries. The collection used here is pigean."],
                     ["Release", "A version of that collection. Keep the returned release ID and version with imported results."],
                     ["Proposition", "The statement being assessed, such as an association between a gene and a trait."],
-                    ["Claim", "A particular assessment of that statement, linked to its scores, method and evidence."],
+                    ["Claim", "A particular assessment of that statement, linked to its scores, method and evidence. Generated from a result row the first time a query returns it; its ID resolves from then on."],
                     ["Provenance", "The record of where a result came from and how it was produced."],
                     ["Value locator", "A reference to the exact serialized value within a source file, including its byte position."],
                   ].map(([term, definition]) => <div key={term}><dt className="font-semibold">{term}</dt><dd className="text-muted-foreground">{definition}</dd></div>)}
@@ -265,7 +265,7 @@ export default function DocsPage() {
               <p>When importing results into a target-discovery platform or another analysis:</p>
               <ul className="list-disc space-y-3 pl-5 text-sm leading-6">
                 <li>Map gene and trait identifiers to your system&apos;s entities. The <A href={KPN_TRAITS}>Knowledge Portal Network (KPN) trait registry</A> supplies definitions and ontology mappings where available; some traits retain source names.</li>
-                <li>Retain metric definitions, the claim ID and resolver URL, dataset dimensions, collection release, query parameters and any warnings or provisional labels.</li>
+                <li>Retain metric definitions, the claim ID and resolver URL, dataset dimensions, collection release, query parameters and any warnings.</li>
                 <li>Keep the original response. Specify the returned release ID or version when repeating a query against the same release.</li>
                 <li>Use the claim&apos;s evidence references to inspect its source. File records contain checksums; value locators identify the reported numbers&apos; positions within those files.</li>
               </ul>
@@ -327,7 +327,7 @@ export default function DocsPage() {
                   [<Code key="beta">beta</Code>, "For a gene set: the effect estimated jointly with other selected gene sets."],
                   [<Code key="beta_uncorrected">beta_uncorrected</Code>, "For a gene set: its marginal effect, without adjustment for the other gene sets."],
                 ]} />
-                <p className="text-sm text-muted-foreground">These are method-specific, log-scale quantities, not probabilities. In release 2026.11.1, interpretation text is marked provisional pending method-lead confirmation.</p>
+                <p className="text-sm text-muted-foreground">These are method-specific, log-scale quantities, not probabilities.</p>
                 <p className="text-sm"><A href={`${API}/v1/objects/${EXAMPLE_CLAIM}`}>Inspect the example&apos;s full claim</A></p>
               </div>
               <details className="rounded-lg border border-border/70 p-4">
