@@ -700,8 +700,7 @@ def _activity(con) -> dict:
     events = [{"at": _ts(r["at"]), "event": r["event"], "email": r["email"], "detail": r["detail"]}
               for r in con.execute("SELECT at, event, email, detail FROM admin_auth_events ORDER BY id DESC LIMIT 50").fetchall()]
     return {"asOf": _ts(datetime.now(timezone.utc)), "telemetry": telemetry.snapshot(),
-            "recentAssertions": assertions, "authEvents": events,
-            "approvedAdmins": sorted(gateway.ADMIN_EMAILS)}
+            "recentAssertions": assertions, "authEvents": events}
 
 
 

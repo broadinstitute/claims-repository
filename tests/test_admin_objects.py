@@ -39,7 +39,6 @@ def isolated_db():
 @pytest.fixture(autouse=True)
 def gateway(monkeypatch):
     monkeypatch.setattr(admin_gateway, "SECRET", SECRET)
-    monkeypatch.setattr(admin_gateway, "ADMIN_EMAILS", {ADMIN})
 
 
 @pytest.fixture(scope="module")

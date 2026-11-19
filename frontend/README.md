@@ -28,10 +28,10 @@ cp .env.example .env.local   # fill in AUTH_SECRET and CLAIMS_ADMIN_GATEWAY_SECR
 npm run dev                  # http://localhost:3000/admin
 ```
 
-The API must run with the same gateway secret and list your email:
+The API must run with the same gateway secret:
 
 ```bash
-CLAIMS_ADMIN_GATEWAY_SECRET=<same value> CLAIMS_ADMIN_EMAILS=<you> \
+CLAIMS_ADMIN_GATEWAY_SECRET=<same value> \
   ../.venv/bin/python -m uvicorn service.app:app --port 8100 --app-dir ..
 ```
 

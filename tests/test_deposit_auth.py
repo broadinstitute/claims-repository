@@ -188,7 +188,6 @@ def test_only_the_hash_is_stored_and_the_admin_table_browser_never_serves_it(mon
     stored = _rows("SELECT * FROM api_keys WHERE key_id = ?", (depositor["key_id"],))[0]
     assert depositor["key"] not in json.dumps(stored) and len(stored["key_sha256"]) == 64
     monkeypatch.setattr(admin_gateway, "SECRET", "s" * 40)
-    monkeypatch.setattr(admin_gateway, "ADMIN_EMAILS", {"admin@example.org"})
     now = int(time.time())
     token = jwt.encode({"iss": admin_gateway.ISSUER, "aud": admin_gateway.AUDIENCE, "sub": "admin", "email": "admin@example.org",
                         "email_verified": True, "purpose": "admin_read", "iat": now, "exp": now + 120, "jti": "t"},

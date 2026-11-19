@@ -259,5 +259,4 @@ export type Activity = {
   };
   recentAssertions: { claimId: string; timesAsserted: number; mintedAt: string | null; lastAssertedAt: string | null; triple: Triple | null }[];
   authEvents: { at: string; event: string; email: string | null; detail: string | null }[];
-  approvedAdmins: string[];
 };

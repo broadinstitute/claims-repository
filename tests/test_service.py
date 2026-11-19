@@ -1692,7 +1692,6 @@ GATEWAY_SECRET = "test-gateway-secret-at-least-32-characters"
 
 def _gateway(monkeypatch, admins=("admin@example.org",)):
     monkeypatch.setattr(admin_gateway, "SECRET", GATEWAY_SECRET)
-    monkeypatch.setattr(admin_gateway, "ADMIN_EMAILS", set(admins))
 
 
 def _assertion(purpose="admin_read", secret=GATEWAY_SECRET, lifetime=120, **overrides):
@@ -1737,7 +1736,7 @@ def test_admin_api_accepts_only_the_consoles_signed_assertion(monkeypatch):
                            None, algorithm="none")
     assert _admin_get("me", unsigned).status_code == 401
     # The API's own allowlist and Google's verification both apply.
-    assert _admin_get("me", _assertion(email="intruder@example.org")).status_code == 403
+    assert _admin_get("me", _assertion(email="")).status_code == 403  # the console names a verified admin, always
     assert _admin_get("me", _assertion(email_verified=False)).status_code == 403
     # A sign-in audit assertion cannot read, and a read assertion cannot write the audit.
     assert _admin_get("me", _assertion(purpose="auth_event")).status_code == 403
@@ -1748,7 +1747,7 @@ def test_admin_api_accepts_only_the_consoles_signed_assertion(monkeypatch):
                                                     "detail": "not an approved admin"}).status_code == 204
     events = _admin_get("activity").json()["authEvents"]
     assert events[0]["event"] == "login_denied" and events[0]["email"] == "intruder@example.org"
-    assert "admin@example.org" in _admin_get("activity").json()["approvedAdmins"]
+    assert "approvedAdmins" not in _admin_get("activity").json()
 
 
 def test_admin_write_routes_take_only_write_assertions(monkeypatch, tmp_path):
@@ -1766,7 +1765,7 @@ def test_admin_write_routes_take_only_write_assertions(monkeypatch, tmp_path):
         refused = _admin_get(path, _assertion("admin_write"))
         assert refused.status_code == 403 and "not valid for this operation" in refused.json()["detail"], path
     # The write purpose has the read purpose's admin checks.
-    assert _admin_post("registration/check", body, _assertion("admin_write", email="intruder@example.org")).status_code == 403
+    assert _admin_post("registration/check", body, _assertion("admin_write", email_verified=False)).status_code == 403
     assert _admin_post("registration/check", body, _assertion("admin_write", email_verified=False)).status_code == 403
     assert client.post("/v1/admin/api/registration/check", json=body).status_code == 401
     # A write assertion that passes the gateway reaches the route (here: an empty, valid root).

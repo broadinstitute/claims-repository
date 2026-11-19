@@ -95,7 +95,6 @@ def _admin(monkeypatch):
 
     secret = "s" * 40
     monkeypatch.setattr(admin_gateway, "SECRET", secret)
-    monkeypatch.setattr(admin_gateway, "ADMIN_EMAILS", {"admin@example.org"})
 
     def token(purpose):
         now = int(time.time())

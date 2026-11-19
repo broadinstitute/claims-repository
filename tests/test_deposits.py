@@ -379,7 +379,6 @@ def _token(purpose, email="admin@example.org"):
 
 def _gateway(monkeypatch):
     monkeypatch.setattr(admin_gateway, "SECRET", SECRET)
-    monkeypatch.setattr(admin_gateway, "ADMIN_EMAILS", {"admin@example.org"})
 
 
 def test_admin_issues_lists_and_revokes_keys_with_an_audit_trail(monkeypatch):
@@ -419,10 +418,10 @@ def test_admin_key_routes_take_only_their_own_authority_and_never_expose_the_has
     keys = _count("api_keys")
     revoke = f"/v1/admin/api/keys/{depositor['key_id']}/revoke"
     for headers, status in (({}, 401), (_token("admin_read"), 403), (_token("auth_event"), 403),
-                            (_token("admin_write", "intruder@example.org"), 403), ({"X-API-Key": depositor["key"]}, 401)):
+                            (_token("admin_write", ""), 403), ({"X-API-Key": depositor["key"]}, 401)):
         assert anonymous.post("/v1/admin/api/keys", json={"name": "x"}, headers=headers).status_code == status
         assert anonymous.post(revoke, json={}, headers=headers).status_code == status
-    for headers, status in (({}, 401), (_token("admin_write"), 403), (_token("admin_read", "intruder@example.org"), 403)):
+    for headers, status in (({}, 401), (_token("admin_write"), 403), (_token("admin_read", ""), 403)):
         assert anonymous.get("/v1/admin/api/keys", headers=headers).status_code == status
     for name in ("", " " * 5, "x" * 121, 7):
         assert anonymous.post("/v1/admin/api/keys", json={"name": name}, headers=_token("admin_write")).status_code in (400, 422)

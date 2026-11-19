@@ -86,8 +86,8 @@ export default function ActivityPage() {
             <DataTable label="Admin events" data={d.authEvents} columns={eventColumns} getRowId={r => `${r.at}-${r.event}-${r.email}-${r.detail}`} empty="No admin events yet." />
           </Panel>
         </div>
-        <Panel title="Approved admins" description="The API's CLAIMS_ADMIN_EMAILS. The console's ADMIN_EMAILS must also list an account." padded>
-          <ul className="list-disc space-y-1 pl-4 text-sm">{d.approvedAdmins.map(e => <li key={e}>{e}</li>)}</ul>
+        <Panel title="Approved admins" padded>
+          <p className="text-sm leading-6 text-muted-foreground">Admins are the console&apos;s <span className="font-mono text-xs">ADMIN_EMAILS</span> environment variable on Vercel, the only list. To add or remove someone, edit it in the Vercel project settings and redeploy; the API accepts whoever the console signs in.</p>
         </Panel>
       </div>
     </>}
