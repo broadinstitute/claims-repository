@@ -1,4 +1,4 @@
-# 6. Ask your own question, in GraphQL
+# 7. Ask your own question, in GraphQL
 #
 # When no template asks it, query the rows directly. Here: genes with no direct
 # GWAS signal in T2D adjusted for BMI (log_bf 0), ranked by their gene-set

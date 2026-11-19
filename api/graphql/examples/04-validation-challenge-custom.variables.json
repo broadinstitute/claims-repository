@@ -1,0 +1,1 @@
+{"trait": "IBD", "library": "mouse_msigdb", "priorMax": 0.5, "topGenes": 20, "setsPerGene": 5}

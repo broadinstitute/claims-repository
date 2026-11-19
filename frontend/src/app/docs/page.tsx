@@ -42,7 +42,8 @@ const GRAPHQL_EXAMPLE = `query {
       topGenes: 5
       setsPerGene: 3
     }
-    claims: ["measurement"]
+    claims: ["measurement", "tier-combined", "tier-direct", "tier-indirect",
+             "tier-joint", "tier-marginal", "roster"]
   )
 }`;
 
@@ -68,7 +69,7 @@ ${GRAPHQL_EXAMPLE}
 Check the HTTP status and any top-level GraphQL errors. The result is the JSON value at data.runQuery; runQuery does not take a GraphQL field selection.
 
 4. Report:
-- A table of gene identifiers, combined, log_bf and prior scores, with each measurement claim ID and resolver URL.
+- A table of gene identifiers, combined, log_bf and prior scores, with each measurement claim ID and resolver URL, and the tier each tier claim states.
 - The returned gene sets for each gene and their beta and beta_uncorrected scores. Note any missing sets or response warnings.
 - The collection release ID and version, dataset dimensions and bound query parameters.
 - A brief explanation of the metric definitions. These scores are method-specific, not probabilities or evidence of therapeutic efficacy.
@@ -297,7 +298,7 @@ export default function DocsPage() {
               </div>
               <div className="space-y-3">
                 <h3 className="text-base font-semibold">3. Retrieve results and claims</h3>
-                <p className="text-sm text-muted-foreground">Request five genes ranked by combined support, with up to three associated gene sets per gene. Here we request measurement claims, which include the reported scores and evidence. The response also identifies the collection release used.</p>
+                <p className="text-sm text-muted-foreground">Request five genes ranked by combined support, with up to three associated gene sets per gene. Here we request every claim the results carry (listed below); leaving out <Code>claims</Code> returns the same. The response also identifies the collection release used.</p>
                 <Block label="Run the top-genes-with-sets query">{`curl -X POST '${API}/v1/collections/pigean/queries/top-genes-with-sets:run' \\
   -H 'Content-Type: application/json' \\
   -d '{
@@ -307,7 +308,8 @@ export default function DocsPage() {
       "topGenes": 5,
       "setsPerGene": 3
     },
-    "claims": ["measurement"]
+    "claims": ["measurement", "tier-combined", "tier-direct", "tier-indirect",
+               "tier-joint", "tier-marginal", "roster"]
   }'`}</Block>
               </div>
               <div id="result" className="scroll-mt-8 space-y-4">
@@ -317,9 +319,27 @@ export default function DocsPage() {
                   subject: { id: "HGNC.SYMBOL:TCF7L2", value: "TCF7L2" },
                   object: { id: "KPN.TRAIT:0000398", label: "Type 2 diabetes (T2D)" },
                   metrics: { combined: 10.9, log_bf: 5.2, prior: 5.73 },
-                  claims: { measurement: { id: EXAMPLE_CLAIM, resolverUrl: `${API}/v1/objects/${EXAMPLE_CLAIM}` } },
+                  claims: {
+                    measurement: { id: EXAMPLE_CLAIM, resolverUrl: `${API}/v1/objects/${EXAMPLE_CLAIM}` },
+                    "tier-combined": { id: "dapper:Claim.yBVEz1OdMGE4f3duBUNLzs4suVziwA7a" },
+                    "tier-direct": { id: "dapper:Claim.T8ox4qVmTtZHhTgFT74GNnhE1Fj1RwNu" },
+                    "tier-indirect": { id: "dapper:Claim.-JuFBKptdwGgTibyYmrVSjyUdorUHM0U" },
+                  },
                 }, null, 2)}</Block>
-                <p className="text-sm text-muted-foreground">This excerpt omits the full claim envelope and associated gene sets. In the full response, <Code>claims.measurement</Code> also includes the statement, score interpretations, evidence and source references. Joined gene-set results appear under <Code>sets</Code>.</p>
+                <p className="text-sm text-muted-foreground">This excerpt omits the full claim envelopes and the associated gene sets. In the full response each claim also includes its statement, scores with their interpretations, evidence and source references. Joined gene-set results appear under <Code>sets</Code>, each with its own claims and the roster claim on its edge.</p>
+                <h3 className="pt-2 text-base font-semibold">The claims each result carries</h3>
+                <p className="text-sm text-muted-foreground">A measurement claim states the reported numbers, with evidence pointing to each one in its source file. A tier claim reads one score against a named rule and states the tier it falls in; it adds no data beyond the score and the rule, and the rule is the collection&apos;s, not a probability. The statements below are TCF7L2&apos;s for type 2 diabetes, and those of mp_polyphagia, one of its gene sets.</p>
+                <Table head={["Claim key", "For", "What it states"]} rows={[
+                  [<span key="m" className="whitespace-nowrap"><Code>measurement</Code></span>, "gene", "PIGEAN assessed the association of TCF7L2 with type 2 diabetes (combined 10.9; log BF 5.2; prior 5.73)."],
+                  [<span key="tc" className="whitespace-nowrap"><Code>tier-combined</Code></span>, "gene", "TCF7L2 is relevant to type 2 diabetes with very strong evidence, because its combined score is 10.9."],
+                  [<span key="td" className="whitespace-nowrap"><Code>tier-direct</Code></span>, "gene", "… genetically relevant … with very strong evidence, because its direct (log Bayes factor) score is 5.2."],
+                  [<span key="ti" className="whitespace-nowrap"><Code>tier-indirect</Code></span>, "gene", "… functionally relevant … with very strong evidence, because its indirect (gene-set prior) score is 5.73."],
+                  [<span key="ms" className="whitespace-nowrap"><Code>measurement</Code></span>, "gene set", "PIGEAN assessed the association of gene set mp_polyphagia with type 2 diabetes (beta 3.06e-05; beta_uncorrected 2.25)."],
+                  [<span key="tj" className="whitespace-nowrap"><Code>tier-joint</Code></span>, "gene set", "mp_polyphagia is relevant to type 2 diabetes with not significant evidence, because its joint effect (beta) is 3.06e-05."],
+                  [<span key="tm" className="whitespace-nowrap"><Code>tier-marginal</Code></span>, "gene set", "… with extremely significant evidence, because its marginal effect (beta_uncorrected) is 2.25."],
+                  [<span key="r" className="whitespace-nowrap"><Code>roster</Code></span>, "gene set membership", "The mouse_msigdb library defines the membership of mp_polyphagia: 76 genes."],
+                ]} />
+                <p className="text-sm text-muted-foreground">Gene tiers: very strong at 3 or more, strongly suggestive at 2 or more, nominally significant at 1 or more, otherwise not significant. Gene-set tiers: extremely significant at 1 or more, strongly significant at 0.1 or more, significant at 0.01 or more, otherwise not significant.</p>
                 <Table head={["Metric", "How to read it"]} rows={[
                   [<Code key="combined">combined</Code>, "Combined gene–trait support, on a log posterior odds scale. The query uses it to rank genes; higher means stronger support under PIGEAN."],
                   [<Code key="log_bf">log_bf</Code>, "Direct genetic support, on a log Bayes factor scale. Keep it separate from evidence contributed by gene sets."],
@@ -334,7 +354,7 @@ export default function DocsPage() {
                 <summary className="cursor-pointer font-medium">Repeat the example against a named release</summary>
                 <div className="mt-4 space-y-3">
                   <p className="text-sm text-muted-foreground">Add <Code>release</Code> beside <Code>variables</Code> in the request body. For your own integration, use the release returned by your first query.</p>
-                  <Block label="Request body pinned to the example release">{JSON.stringify({ release: EXAMPLE_RELEASE, variables: { trait: "T2D", library: "mouse_msigdb", topGenes: 5, setsPerGene: 3 }, claims: ["measurement"] }, null, 2)}</Block>
+                  <Block label="Request body pinned to the example release">{JSON.stringify({ release: EXAMPLE_RELEASE, variables: { trait: "T2D", library: "mouse_msigdb", topGenes: 5, setsPerGene: 3 }, claims: ["measurement", "tier-combined", "tier-direct", "tier-indirect", "tier-joint", "tier-marginal", "roster"] }, null, 2)}</Block>
                 </div>
               </details>
               <details id="own" className="scroll-mt-8 rounded-lg border border-border/70 p-4">

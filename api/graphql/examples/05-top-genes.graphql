@@ -1,6 +1,6 @@
-# 4. Just the ranking
+# 5. Just the ranking
 #
-# The same query for T2D with setsPerGene 0: the top genes by combined score,
+# Example 3's template for T2D, with no prior filter and setsPerGene 0: the top genes by combined score,
 # with no gene sets. Every row comes with its claims (the measurement and the
 # evidence tiers), so each number has an id to cite. Pass claims: ["measurement"]
 # for the measurement only.

@@ -1,0 +1,27 @@
+# 3. The PIGEAN validation challenge, as the collection's query template
+#
+# pigean/top-genes-with-sets with the challenge's settings, written out in the
+# query: IBD genes whose gene-set prior is below 0.5 (mostly direct GWAS
+# support), top 20 by combined score, each with its 5 gene sets of largest
+# marginal effect (beta_uncorrected). What each setting means, its default and
+# its bounds are in example 1 (`queries` -> top-genes-with-sets -> params).
+#
+# Every claim the results carry:
+#   genes      measurement (combined, log_bf and prior, with the evidence for
+#              each), tier-combined, tier-direct, tier-indirect (each score
+#              read as an evidence tier: very strong >= 3, strongly suggestive
+#              >= 2, nominally significant >= 1, else not significant)
+#   gene sets  measurement (beta and beta_uncorrected), tier-joint,
+#              tier-marginal (extremely >= 1, strongly >= 0.1, significant
+#              >= 0.01, else not significant)
+#   membership roster (the gene set's members, on each gene-to-set edge)
+# Leave `claims` out for the same: by default every claim is served.
+query ValidationChallengeTemplate {
+  runQuery(
+    collection: "pigean"
+    query: "top-genes-with-sets"
+    variables: {trait: "IBD", library: "mouse_msigdb", priorMax: 0.5, topGenes: 20, setsPerGene: 5}
+    claims: ["measurement", "tier-combined", "tier-direct", "tier-indirect",
+             "tier-joint", "tier-marginal", "roster"]
+  )
+}

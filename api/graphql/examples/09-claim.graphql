@@ -1,6 +1,6 @@
-# 8. One claim, in full
+# 9. One claim, in full
 #
-# Look up any claim by its id, for example one returned by example 3 or 4 (this
+# Look up any claim by its id, for example one returned by examples 3 to 5 (this
 # one is PIGEAN's measurement of NOD2 in IBD). You get the scores, and the
 # evidence for each: which result file, and the exact bytes of the number in
 # it (a value locator you can check against the file's sha256).
