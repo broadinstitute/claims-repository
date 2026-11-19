@@ -82,6 +82,13 @@ def _attribute_columns(fields: list[str]) -> list[str]:
     return [f for f in fields if f not in ("key", "id", "label", "score") and not f.startswith("suggested_")]
 
 
+def _label(row: dict) -> str:
+    """A row's label exactly as written (a dataset's label is part of its identity, so surrounding spaces in
+    an upstream name are kept), or "" when it is blank."""
+    label = row.get("label") or ""
+    return label if label.strip() else ""
+
+
 def read_mapping(path: Path) -> dict[str, tuple[str, str]]:
     """{key: (id, label)} from a TSV with a header row: key, id, and optionally
     label (more columns describe the id; suggested_* columns and score are
@@ -99,7 +106,7 @@ def read_mapping(path: Path) -> dict[str, tuple[str, str]]:
             raise MappingError(f"{path} line {n}: id {ident!r} for {key!r} is not a CURIE")
         if key in out and out[key][0] != ident:
             raise MappingError(f"{path} line {n}: {key!r} is mapped twice, to {out[key][0]} and {ident}")
-        out[key] = (ident, (r.get("label") or "").strip() or key)
+        out[key] = (ident, _label(r) or key)
     return out
 
 
@@ -112,7 +119,7 @@ def read_entries(path: Path) -> dict[str, dict]:
     for r in rows:
         ident = (r.get("id") or "").strip()
         if ident and ident not in out:
-            entry = {"label": (r.get("label") or "").strip() or None}
+            entry = {"label": _label(r) or None}
             entry.update({a: (r.get(a) or "").strip() for a in attrs if (r.get(a) or "").strip()})
             out[ident] = entry
     return out

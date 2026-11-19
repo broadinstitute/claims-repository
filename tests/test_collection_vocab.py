@@ -158,6 +158,13 @@ def test_mapping_files_are_checked(tmp_path):
         load_collection(col)
 
 
+def test_labels_are_kept_exactly_as_written(tmp_path):
+    # A dataset's label is part of its id: trimming an upstream name with stray spaces re-addresses its dataset.
+    p = tmp_path / "m.tsv"
+    p.write_text("key\tid\tlabel\nA\tX:1\t Spaced name \nB\tX:2\t  \n")
+    assert read_mapping(p) == {"A": ("X:1", " Spaced name "), "B": ("X:2", "B")}
+
+
 def test_suggestions_and_value_checks():
     class Registry:
         names = {"KPN.TRAIT:1": ("migraine disorder", "gcat_trait"), "KPN.TRAIT:2": ("Autism", "KPN"),
