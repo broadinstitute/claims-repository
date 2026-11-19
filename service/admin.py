@@ -125,11 +125,10 @@ UNCOLLECTED = "NOT EXISTS (SELECT 1 FROM result_claims x WHERE x.claim_id = c.cl
 
 
 def _release_claims(con, release_id) -> dict:
-    r = con.execute(
-        "SELECT COUNT(*) AS n, COUNT(o.id) AS minted FROM result_claims rc JOIN release_mint_contexts rm "
-        "ON rm.activity_id = rc.activity_id AND rm.release_id = ? LEFT JOIN dapper_objects o ON o.id = rc.claim_id",
-        (release_id,)).fetchone()
-    return {"mintable": int(r["n"]), "minted": int(r["minted"])}
+    """Claims of the release served so far (each recorded in result_claims when first served)."""
+    r = con.execute("SELECT COUNT(*) AS n FROM result_claims rc JOIN release_mint_contexts rm "
+                    "ON rm.activity_id = rc.activity_id AND rm.release_id = ?", (release_id,)).fetchone()
+    return {"minted": int(r["n"])}
 
 
 def _summaries(con, key=None) -> list[dict]:
@@ -179,9 +178,6 @@ def _overview(con) -> dict:
         "SELECT COUNT(*) AS n FROM dapper_objects WHERE class_name = 'Claim' AND COALESCE(last_seen_at, created_at) >= ?",
         (day,),
     ).fetchone()["n"]
-    mintable = con.execute(
-        "SELECT COUNT(*) AS n FROM result_claims WHERE activity_id IN (SELECT activity_id FROM release_mint_contexts)"
-    ).fetchone()["n"]
     uncollected = con.execute(
         f"SELECT COUNT(*) AS n FROM claims c JOIN dapper_objects o ON o.id = c.claim_id WHERE {UNCOLLECTED}"
     ).fetchone()["n"]
@@ -211,7 +207,7 @@ def _overview(con) -> dict:
                      "name": db.MYSQL_DATABASE if not con.dialect.sqlite else Path(db.DB_PATH).name,
                      "pingMs": db_ms},
         "claims": {
-            "mintable": int(mintable), "minted": int(stored["n"]), "uncollected": int(uncollected),
+            "minted": int(stored["n"]), "uncollected": int(uncollected),
             "assertions": int(stored["s"]), "lastAssertedAt": _ts(stored["last_at"]),
             "minted24h": int(minted_24h), "asserted24h": int(asserted_24h),
         },
@@ -291,12 +287,11 @@ def _collection(con, key, release) -> dict:
         for r in con.execute(f"SELECT dataset_id, kind, COUNT(*) AS n FROM {table} WHERE {in_release} "
                              "GROUP BY dataset_id, kind", (rid,)).fetchall():
             counts[r["dataset_id"]][r["kind"]] = int(r["n"])
-    ds_claims = {r["dataset_id"]: {"mintable": int(r["n"]), "minted": int(r["minted"])} for r in con.execute(
-        "SELECT rc.dataset_id, COUNT(*) AS n, COUNT(o.id) AS minted FROM result_claims rc JOIN release_mint_contexts rm "
-        "ON rm.activity_id = rc.activity_id AND rm.release_id = ? LEFT JOIN dapper_objects o ON o.id = rc.claim_id "
-        "GROUP BY rc.dataset_id", (rid,)).fetchall()}
+    ds_claims = {r["dataset_id"]: {"minted": int(r["n"])} for r in con.execute(
+        "SELECT rc.dataset_id, COUNT(*) AS n FROM result_claims rc JOIN release_mint_contexts rm "
+        "ON rm.activity_id = rc.activity_id AND rm.release_id = ? GROUP BY rc.dataset_id", (rid,)).fetchall()}
     datasets = [{"id": d, "dimensions": dims[d], "files": files[d], "counts": counts[d],
-                 "claims": ds_claims.get(d, {"mintable": 0, "minted": 0})} for d in ids]
+                 "claims": ds_claims.get(d, {"minted": 0})} for d in ids]
 
     # Templates: per claim key, counts over this release's mint contexts.
     activities: dict[str, list[str]] = {}
@@ -305,19 +300,18 @@ def _collection(con, key, release) -> dict:
         activities.setdefault(r["template_file_id"], []).append(r["activity_id"])
     by_key: dict[tuple, dict] = {}
     for r in con.execute(
-            "SELECT mc.template_file_id AS tf, rc.claim_key, COUNT(*) AS n, COUNT(o.id) AS minted, "
+            "SELECT mc.template_file_id AS tf, rc.claim_key, COUNT(o.id) AS minted, "
             "COALESCE(SUM(o.times_seen), 0) AS assertions FROM result_claims rc JOIN release_mint_contexts rm "
             "ON rm.activity_id = rc.activity_id AND rm.release_id = ? JOIN mint_contexts mc "
             "ON mc.activity_id = rc.activity_id LEFT JOIN dapper_objects o ON o.id = rc.claim_id "
             "GROUP BY mc.template_file_id, rc.claim_key", (rid,)).fetchall():
-        by_key[(r["tf"], r["claim_key"])] = {"mintable": int(r["n"]), "minted": int(r["minted"]),
-                                             "assertions": int(r["assertions"])}
+        by_key[(r["tf"], r["claim_key"])] = {"minted": int(r["minted"]), "assertions": int(r["assertions"])}
     templates = []
     for t in record["templates"]:
         doc, fid = t["doc"], t["file_id"]
         claims = []
         for c in doc["claims"]:
-            n = by_key.get((fid, c["key"]), {"mintable": 0, "minted": 0, "assertions": 0})
+            n = by_key.get((fid, c["key"]), {"minted": 0, "assertions": 0})
             example = None
             if n["minted"] and activities.get(fid):
                 acts = activities[fid]
@@ -409,7 +403,7 @@ def _claim_parts(con, columns, f, *, ids=None) -> tuple[str, list]:
     marks = ",".join("?" * len(ids)) if ids else ""
     if f["origin"] != "uncollected":
         need_row = ids is not None or "subject" in columns or "kind" in columns
-        need_obj = ids is not None or f["status"] or {"times_seen", "minted_at", "last_asserted_at"} & set(columns)
+        need_obj = ids is not None or {"times_seen", "minted_at", "last_asserted_at"} & set(columns)
         where, sub = [], []
         if ids is not None:
             where.append(f"rc.claim_id IN ({marks})")
@@ -420,8 +414,6 @@ def _claim_parts(con, columns, f, *, ids=None) -> tuple[str, list]:
                 if value:
                     where.append(f"{col} = ?")
                     sub.append(value)
-            if f["status"]:
-                where.append("o.id IS NOT NULL" if f["status"] == "minted" else "o.id IS NULL")
             if f["q"]:
                 # Rows first, then their claims: cheaper than matching every claim's joined subject.
                 where.append(f"(rc.row_id IN (SELECT row_id FROM result_rows WHERE {con.dialect.like_ci('subject_value')}) "
@@ -436,8 +428,7 @@ def _claim_parts(con, columns, f, *, ids=None) -> tuple[str, list]:
             + (" LEFT JOIN dapper_objects o ON o.id = rc.claim_id" if need_obj else "")
             + (f" WHERE {' AND '.join(where)}" if where else ""))
         params += sub
-    only_collected = f["collection"] or f["claim_key"] or f["dataset"] or f["origin"] == "collection" \
-        or f["status"] == "unminted"
+    only_collected = f["collection"] or f["claim_key"] or f["dataset"] or f["origin"] == "collection"
     if not only_collected:
         where, sub = [UNCOLLECTED], []
         if ids is not None:
@@ -453,9 +444,9 @@ def _claim_parts(con, columns, f, *, ids=None) -> tuple[str, list]:
     return " UNION ALL ".join(parts), params
 
 
-def _claims(con, q, collection, claim_key, dataset, origin, status, sort, page, page_size) -> dict:
+def _claims(con, q, collection, claim_key, dataset, origin, sort, page, page_size) -> dict:
     f = {"q": q, "pattern": f"%{db.like_escape(q)}%" if q else None, "collection": collection,
-         "claim_key": claim_key, "dataset": dataset, "origin": origin, "status": status}
+         "claim_key": claim_key, "dataset": dataset, "origin": origin}
     union, params = _claim_parts(con, ["claim_id"], f)
     total = con.execute(f"SELECT COUNT(*) AS n FROM ({union}) u", params).fetchone()["n"]
     key, order = CLAIM_SORTS[sort]
@@ -1024,14 +1015,13 @@ async def claims(
     claim_key: str | None = Query(None, max_length=64),
     dataset: str | None = Query(None, max_length=128),
     origin: str | None = Query(None, pattern="^(collection|uncollected)$"),
-    status: str | None = Query(None, pattern="^(minted|unminted)$"),
     sort: str = Query("recent", pattern="^(recent|asserted|minted|subject)$"),
     page: int = Query(1, ge=1, le=100_000),
     page_size: int = Query(25, ge=1, le=100),
 ):
     def clean(v):
         return (v or "").strip() or None
-    return _json(await _read(_claims, clean(q), clean(collection), clean(claim_key), clean(dataset), origin, status,
+    return _json(await _read(_claims, clean(q), clean(collection), clean(claim_key), clean(dataset), origin,
                              sort, page, page_size))
 
 
@@ -1039,7 +1029,7 @@ async def claims(
 async def claim_detail(claim_id: str, _: dict = Depends(gateway.require_admin)):
     detail = await _read(_claim_detail, claim_id)
     if detail is None:
-        raise HTTPException(status_code=404, detail="No claim with this ID is stored or mintable.")
+        raise HTTPException(status_code=404, detail="No claim with this ID is stored.")
     return _json(detail)
 
 

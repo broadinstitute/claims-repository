@@ -1,7 +1,7 @@
 """The Parquet result store against the SQL one: the same release published to
-each gives the same claim ids, the same query results (ties included), and
-the same served claims. With the Parquet store a claim's propositions, scores
-and evidence are stored the first time it is served."""
+each implies the same claim ids, gives the same query results (ties
+included), and serves the same claims. With either store a claim, its
+propositions, scores and evidence are stored the first time it is served."""
 from __future__ import annotations
 
 import json
@@ -19,6 +19,8 @@ from service.collections import serve as cserve
 from service.collections import store as cstore
 from service.collections.manifest import load_collection
 from service.collections.publish import publish
+
+from collection_claims import implied_claims
 
 pytest.importorskip("duckdb")
 
@@ -96,13 +98,8 @@ def _claim_ids(dep) -> set[tuple]:
     with _deployment(dep["db"], dep["index"]):
         con = service_db.connect()
         try:
-            store = cstore.get_store(con)
-            if store.kind == "sql":
-                rows = store.query("SELECT claim_id, claim_key, dataset_id, proposition_id FROM result_claims", [])
-            else:
-                rows = store.query(f"SELECT claim_id, claim_key, dataset_id, proposition_id FROM "
-                                   f"read_parquet('{store.root}/lookup/claims.parquet')", [])
-            return {tuple(r.values()) for r in rows}
+            return {(r["claim_id"], r["claim_key"], r["dataset_id"], r["proposition_id"])
+                    for r in implied_claims(con)}
         finally:
             con.close()
 
@@ -119,10 +116,10 @@ def _run(dep, variables):
 def test_both_stores_publish_the_same_release_and_claims(deployments):
     sql, pq = deployments["sql"]["result"], deployments["parquet"]["result"]
     assert sql.release_id == pq.release_id
-    assert sql.stats["claims"] == pq.stats["claims"] > 0
+    assert sql.stats["mint_contexts_recorded"] == pq.stats["mint_contexts_recorded"] > 0
     assert (sql.stats["rows"], sql.stats["edges"]) == (pq.stats["rows"], pq.stats["edges"])
     ids = _claim_ids(deployments["sql"])
-    assert ids == _claim_ids(deployments["parquet"]) and len(ids) == sql.stats["claims"]
+    assert ids == _claim_ids(deployments["parquet"]) and len(ids) == 40
 
 
 @pytest.mark.parametrize("variables", [
@@ -149,7 +146,7 @@ def test_describe_counts_agree(deployments):
                 d = cserve.describe(con, "pigean")
             finally:
                 con.close()
-        out[name] = ([ds["counts"] for ds in d["datasets"]], d["claims"]["mintable"])
+        out[name] = ([ds["counts"] for ds in d["datasets"]], d["claims"])
     assert out["sql"] == out["parquet"]
 
 
@@ -187,16 +184,24 @@ def test_parquet_store_serves_claims_and_stores_their_objects_on_first_serve(dep
         assert again["rows"][0]["claims"]["measurement"]["claim"] == claim
 
 
-def test_parquet_store_resolves_an_unserved_claim_by_id(deployments):
+def test_a_claim_resolves_by_id_once_served(deployments):
+    """Nothing records a claim before it is served: its id resolves from its first serve on."""
     dep = deployments["parquet"]
-    sql_ids = {c[0] for c in _claim_ids(deployments["sql"])}
+    body = {"variables": {"trait": "OTHERPHENO", "library": "fixture-v1", "topGenes": 1, "setsPerGene": 0}}
     with _deployment(dep["db"], dep["index"]):
+        top = client.post(f"/v1/collections/pigean/queries/{QUERY}:run", json={**body, "claims": []}).json()
+        subject = top["rows"][0]["subject"]["id"]
         con = service_db.connect()
         try:
-            stored = {r["id"] for r in con.execute("SELECT id FROM dapper_objects WHERE id LIKE 'dapper:Claim.%'")}
+            store = cstore.get_store(con)
+            unserved = next(c["claim_id"] for c in implied_claims(con) if c["claim_key"] == "measurement"
+                            and store.row(c["dataset_id"], c["row_id"])["subject_id"] == subject
+                            and c["dataset_id"] == top["rows"][0]["dataset"]["id"])
         finally:
             con.close()
-        unserved = sorted(sql_ids - stored)[0]
-        got = client.post("/v1/graphql", json={"query": f'{{ claim(id: "{unserved}") {{ id triple {{ subject }} }} }}'})
+        query = f'{{ claim(id: "{unserved}") {{ id triple {{ subject }} }} }}'
+        assert client.post("/v1/graphql", json={"query": query}).json()["data"]["claim"] is None
+        client.post(f"/v1/collections/pigean/queries/{QUERY}:run", json=body)
+        got = client.post("/v1/graphql", json={"query": query})
         assert got.status_code == 200 and "errors" not in got.json(), got.text
         assert got.json()["data"]["claim"]["id"] == unserved

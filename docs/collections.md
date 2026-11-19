@@ -457,7 +457,8 @@ Built, beside the PIGEAN path rather than replacing it:
   (`scripts/publish_collection.py`). A release becomes a DAPPER
   `ResultCollection` with its Datasets, Files and Activities, and that document
   passes dapper's linter. Publishing the IBD release takes about 100 s and
-  yields 23,321 rows, 143,508 edges and 92,135 mintable claims. Claim ids
+  yields 23,321 rows, 143,508 edges and 92,135 mintable claims (counted when publishing still rendered
+  every claim; since 2026-11-18 it renders none). Claim ids
   depend only on the template, the file and the manifest's minting semantics,
   so a new release of unchanged data re-addresses nothing.
 - **Partial releases and files by location** (2026-11-17). A release specification may carry `where`
@@ -471,8 +472,16 @@ Built, beside the PIGEAN path rather than replacing it:
   checks the sha256 and removes it. Each dataset is stored in its own transaction and the release is
   recorded last, so an interrupted publish resumes. Edge files are read with a bare Python `None` as
   null (some aggregator runs write their membership file that way); row files stay strict.
-- **Serving and discovery.** Claims are re-rendered and checked on every serve
-  (a drifted row is refused). Endpoints: `GET /v1/collections`,
+- **Claims render on serve, never ahead** (2026-11-18). Publishing records one mint context per
+  template and result file and renders no claim. A query renders the claims of the rows it returns
+  under the release's mint contexts; the first serve stores the claim (with its proposition, scores
+  and evidence) and records it in `result_claims`, which is how its id resolves afterwards. A
+  template or wording change therefore costs one mint context per dataset instead of a pass over
+  every row (the PIGEAN republish of 2026-11-18 was re-rendering about 1.6 million claims). A claim
+  that has never been served has no record, so its id does not resolve and its address cannot be
+  reserved against a deposit until it is first served.
+- **Serving and discovery.** Claims are rendered on every serve; one already served is checked
+  against its record (a drifted row is refused). Endpoints: `GET /v1/collections`,
   `/v1/collections/{c}`, `/v1/collections/{c}/queries`,
   `/v1/collections/{c}/releases/{version}/document` and
   `POST /v1/collections/{c}/queries/{name}:run`, plus the query catalog

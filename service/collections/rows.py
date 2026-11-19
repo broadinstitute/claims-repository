@@ -13,8 +13,8 @@ them.
 """
 from __future__ import annotations
 
-from .serve import (CollectionNotFound, _datasets_matching, _json, _resolve_value, _row_view, release_row,
-                    release_scope)
+from .serve import (CollectionNotFound, _datasets_matching, _json, _resolve_value, _row_view,
+                    implied_group_claims, implied_row_claims, release_row)
 from .store import FILTER_OPS, get_store
 
 MAX_ROWS = 500
@@ -77,7 +77,7 @@ def rows(con, collection: str, kind: str, *, order: dict, first: int = 20, relea
         raise ValueError(f"subject takes at most {MAX_SUBJECTS} values")
     dataset_ids = _datasets_matching(con, rel["release_id"], dims)
     found = get_store(con).anchor(dataset_ids, kind, conds, metric, direction, first, subjects)
-    root = {"release_id": rel["release_id"], "manifest": manifest, "activities": None, "groups": {}}
+    root = {"release_id": rel["release_id"], "manifest": manifest, "groups": {}}
     out = _batch(con, found, root)
     warnings = [] if out else [
         f"No {kind} rows in {collection} release {rel['version']} match. Check dimension values with "
@@ -124,23 +124,14 @@ def joined(con, row: dict, via: str, kind: str, *, order: dict, first: int = 10,
              "row": v} for r, v in zip(found, views)]
 
 
-def _activities(con, root) -> set:
-    if root["activities"] is None:
-        root["activities"] = release_scope(con, root["release_id"])[1]
-    return root["activities"]
-
-
 def row_claims(con, row: dict) -> dict:
-    """{claim key: result_claims row} for one row, loading its whole batch at once."""
+    """{claim key: claim record} for one row, rendering its whole batch's claims at once."""
     batch = row["_batch"]
     if batch["claims"] is None:
-        activities = _activities(con, batch["root"])
-        ids = [r["_row_id"] for r in batch["rows"]]
-        datasets = sorted({r["dataset"]["id"] for r in batch["rows"]})
+        unique = {r["_row_id"]: r["_raw"] for r in batch["rows"]}
         batch["claims"] = {}
-        for rc in get_store(con).claims_for_rows(ids, datasets):
-            if rc["activity_id"] in activities:
-                batch["claims"].setdefault(rc["row_id"], {})[rc["claim_key"]] = rc
+        for rc in implied_row_claims(con, batch["root"]["release_id"], [unique[i] for i in sorted(unique)]):
+            batch["claims"].setdefault(rc["row_id"], {})[rc["claim_key"]] = rc
     return batch["claims"].get(row["_row_id"], {})
 
 
@@ -148,9 +139,7 @@ def edge_claims(con, edge: dict) -> dict:
     root = edge["_root"]
     key = (edge["dataset_id"], edge["kind"], edge["to"]["id"])
     if key not in root["groups"]:
-        activities = _activities(con, root)
-        root["groups"][key] = {rc["claim_key"]: rc for rc in get_store(con).claims_for_group(*key)
-                               if rc["activity_id"] in activities}
+        root["groups"][key] = {rc["claim_key"]: rc for rc in implied_group_claims(con, root["release_id"], *key)}
     return root["groups"][key]
 
 

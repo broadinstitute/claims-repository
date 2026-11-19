@@ -1784,10 +1784,10 @@ def test_admin_api_reports_overview_claims_tables_and_activity(monkeypatch):
 
     ov = _admin_get("overview").json()
     assert "families" not in ov and "phenotypes" not in ov
-    assert set(ov["claims"]) == {"mintable", "minted", "uncollected", "assertions", "lastAssertedAt",
+    assert set(ov["claims"]) == {"minted", "uncollected", "assertions", "lastAssertedAt",
                                  "minted24h", "asserted24h"}
     # No collection is published in this database: every stored claim is uncollected.
-    assert ov["collections"] == [] and ov["claims"]["mintable"] == 0
+    assert ov["collections"] == []
     assert ov["claims"]["uncollected"] >= 1
     assert len(ov["mintTimeline"]) == 30 and ov["database"]["backend"] == "sqlite"
     assert ov["registration"] == {"enabled": False, "roots": []}
@@ -1799,9 +1799,9 @@ def test_admin_api_reports_overview_claims_tables_and_activity(monkeypatch):
     found = _admin_get("claims", q=deposited[-14:].lower()).json()  # search matches ids, case-insensitively
     assert [r["claimId"] for r in found["rows"]] == [deposited]
     everything = _admin_get("claims", page_size=1).json()
-    assert everything["total"] == ov["claims"]["mintable"] + ov["claims"]["uncollected"]
+    assert everything["total"] == ov["claims"]["uncollected"]  # no collection published here
     assert _admin_get("claims", collection="pigean").json()["total"] == 0
-    for bad in ({"origin": "nope"}, {"status": "nope"}, {"sort": "nope"}, {"page_size": 101}):
+    for bad in ({"origin": "nope"}, {"sort": "nope"}, {"page_size": 101}):
         assert _admin_get("claims", **bad).status_code == 422, bad
 
     before = _times_seen(deposited)

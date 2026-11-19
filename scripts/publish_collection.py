@@ -7,7 +7,8 @@
 
 Checks the manifest, templates and queries (api/collections/*.schema.json),
 reads each dataset's result files, and records a DAPPER ResultCollection
-release with its rows, edges, metrics and mintable claims. Load the KPN trait
+release with its rows, edges, metrics and mint contexts (claims are rendered
+when they are served, not here). Load the KPN trait
 registry first (scripts/load_kpn_traits.py) if a dimension declares `resolve: kpn-traits`; a collection
 with its own mappings/<dimension>.tsv (as pigean has) needs no registry.
 --document writes the release's DAPPER document, which dapper's linter can

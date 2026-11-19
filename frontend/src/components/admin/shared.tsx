@@ -13,7 +13,6 @@ import type { DimensionValues } from "@/lib/admin/api";
 const nf = new Intl.NumberFormat("en-US");
 export const number = (value: number | null | undefined) => (value === null || value === undefined ? "—" : nf.format(value));
 export const plural = (n: number, one: string, many = `${one}s`) => `${number(n)} ${n === 1 ? one : many}`;
-export const percent = (part: number, whole: number) => (whole ? `${Math.round((part / whole) * 1000) / 10}%` : "—");
 export const ms = (v: number | null | undefined) => (v === null || v === undefined ? "—" : v < 10 ? `${v.toFixed(1)} ms` : `${Math.round(v)} ms`);
 export const bytes = (v: number | null | undefined) => {
   if (v === null || v === undefined) return "—";
@@ -151,11 +150,6 @@ export function Dimensions({ value, className = "" }: { value: DimensionValues |
   );
 }
 
-/** Minted out of mintable, as a meter with the percentage. */
-export function Coverage({ minted, mintable }: { minted: number; mintable: number }) {
-  return <div className="flex items-center gap-2"><Meter part={minted} whole={mintable} /><span className="w-12 text-right text-xs tabular-nums text-muted-foreground">{percent(minted, mintable)}</span></div>;
-}
-
 export const Mono = ({ children, className = "" }: { children: ReactNode; className?: string }) => <span className={`break-all font-mono text-xs ${className}`}>{children}</span>;
 
 /** A sha256 shortened to 12 characters, with a copy button for the full value. */
@@ -177,15 +171,6 @@ export function Pagination({ page, total, pageSize, onPage, fetching }: { page: 
         <Button size="sm" variant="outline" disabled={page <= 1 || fetching} onClick={() => onPage(page - 1)}>Previous</Button>
         <Button size="sm" variant="outline" disabled={page >= pages || fetching} onClick={() => onPage(page + 1)}>Next</Button>
       </div>
-    </div>
-  );
-}
-
-export function Meter({ part, whole }: { part: number; whole: number }) {
-  const width = whole ? Math.min(100, (part / whole) * 100) : 0;
-  return (
-    <div className="h-1.5 min-w-16 flex-1 overflow-hidden rounded-full bg-muted" role="meter" aria-valuemin={0} aria-valuemax={whole} aria-valuenow={part} aria-label={percent(part, whole)}>
-      <span className="block h-full rounded-full bg-bar" style={{ width: `${width}%` }} />
     </div>
   );
 }

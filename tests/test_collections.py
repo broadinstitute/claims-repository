@@ -21,6 +21,8 @@ from service.collections import identity as idn
 from service.collections.manifest import ManifestError, bind_params, load_collection, load_release
 from service.collections.publish import PublishError, publish
 
+from collection_claims import implied_claims, implied_ids
+
 ROOT = Path(__file__).resolve().parent.parent
 FIX = ROOT / "tests" / "fixtures"
 COLLECTION = FIX / "collections" / "pigean"
@@ -152,7 +154,13 @@ def test_query_variables_are_checked():
 def test_publish_records_a_dapper_release(published):
     assert idn.class_of(published.release_id) == "ResultCollection"
     assert published.stats["rows"] == 5 and published.stats["edges"] == 3
-    assert published.stats["claims"] == 20  # 3 genes x 4 + 2 sets x 3 + 2 rosters
+    assert published.stats["mint_contexts_recorded"] == 3 and "claims" not in published.stats  # nothing rendered
+    con = service_db.connect()
+    try:
+        assert len(implied_ids(con)) == 20  # 3 genes x 4 + 2 sets x 3 + 2 rosters, rendered when served
+        assert con.execute("SELECT COUNT(*) AS n FROM result_claims").fetchone()["n"] == 0
+    finally:
+        con.close()
     doc = published.document
     release = doc["result_collections"][0]
     assert release["collection_key"] == "pigean" and release["dataset_dimensions"] == ["trait", "library"]
@@ -179,21 +187,21 @@ def test_every_stored_collection_object_is_a_true_dapper_address(published):
 def test_republishing_a_version_is_a_no_op(published):
     again = _publish()
     assert again.release_id == published.release_id
-    assert again.stats["datasets_ingested"] == 0 and again.stats["mint_contexts_rendered"] == 0
+    assert again.stats["datasets_ingested"] == 0 and again.stats["mint_contexts_recorded"] == 0
 
 
 def test_a_new_version_chains_and_keeps_claim_ids(published):
     con = service_db.connect()
-    before = {r["claim_id"] for r in con.execute("SELECT claim_id FROM result_claims")}
+    before = implied_ids(con, published.release_id)
     con.close()
     second = _publish(version="0.0.2-test")
     assert second.release_id != published.release_id
     assert second.document["result_collections"][0]["was_revision_of"] == published.release_id
-    assert second.stats["claims"] == 0  # same templates, same files: nothing to render
+    assert second.stats["mint_contexts_recorded"] == 0  # same templates, same files: the same mint contexts
     con = service_db.connect()
-    after = {r["claim_id"] for r in con.execute("SELECT claim_id FROM result_claims")}
+    after = implied_ids(con, second.release_id)
     con.close()
-    assert after == before
+    assert after == before and len(after) == 20
 
 
 def test_a_file_in_the_wrong_dataset_is_refused(tmp_path, published):
@@ -273,17 +281,21 @@ def test_serving_mints_claims_once_and_counts_reassertions(published):
 
 
 def test_served_claims_are_refused_when_the_row_drifts(published):
+    """A claim served once resolves by id afterwards, rendered again from its row: if the row no longer renders
+    that claim, it is refused rather than served."""
+    body = _run({"trait": "FIXPHENO", "library": "fixture-v1", "priorMax": 100.0, "topGenes": 20, "setsPerGene": 0},
+                claims=["measurement"]).json()
+    claim_id = body["rows"][0]["claims"]["measurement"]["id"]
     con = service_db.connect()
     try:
-        r = con.execute("SELECT row_id, row_json FROM result_rows WHERE kind = 'gene_phenotype' "
-                        "ORDER BY row_id LIMIT 1").fetchone()
-        row = json.loads(r["row_json"])
-        tampered = {**row, "trait_group": "tampered"}
+        r = con.execute("SELECT rr.row_id, rr.row_json FROM result_claims rc JOIN result_rows rr ON rr.row_id = rc.row_id "
+                        "WHERE rc.claim_id = ?", (claim_id,)).fetchone()
+        tampered = {**json.loads(r["row_json"]), "trait_group": "tampered"}
         with con:
             con.execute("UPDATE result_rows SET row_json = ? WHERE row_id = ?", (idn.canonical(tampered), r["row_id"]))
-        response = _run({"trait": "FIXPHENO", "library": "fixture-v1", "priorMax": 100.0, "topGenes": 20,
-                         "setsPerGene": 0})
-        assert response.status_code == 400 and "template drift" in response.json()["detail"]
+        got = client.post("/v1/graphql", json={"query": "query($id: ID!) { claim(id: $id) { id } }",
+                                               "variables": {"id": claim_id}}).json()
+        assert "template drift" in json.dumps(got.get("errors")), got
     finally:
         with con:
             con.execute("UPDATE result_rows SET row_json = ? WHERE row_id = ?", (r["row_json"], r["row_id"]))
@@ -305,7 +317,7 @@ def test_discovery_describes_the_collection(published):
     assert d["datasets"][0]["counts"] == {"gene_phenotype": 3, "gene_set_phenotype": 2, "member_of": 3}
     assert d["metrics"]["combined"]["score_kind"] == "SCORE"
     assert {t["name"] for t in d["templates"]} == {"gene", "gene_set", "roster"}
-    assert d["claims"]["mintable"] == 20
+    assert set(d["claims"]) == {"minted"}
     queries = {q["name"]: q for q in client.get("/v1/collections/pigean/queries").json()["queries"]}
     assert queries[QUERY]["run"]["rest"]["body"]["variables"]["trait"] == "IBD"
     assert d["datasets_page"] == {"total": 1, "offset": 0, "first": 50, "returned": 1, "next_offset": None}
@@ -359,12 +371,17 @@ def test_a_collection_claims_address_is_reserved_on_deposit(published):
     rule and differ is one that changes a slot identity ignores.)"""
     from service.collections import serve as cserve
 
+    # Served once (its address is recorded), then removed from the store as if never minted.
+    body = _run({"trait": "FIXPHENO", "library": "fixture-v1", "priorMax": 10.0, "topGenes": 1, "setsPerGene": 0},
+                claims=["tier-direct"]).json()
+    claim_id = body["rows"][0]["claims"]["tier-direct"]["id"]
     con = service_db.connect()
     try:
-        rc = con.execute(
-            "SELECT * FROM result_claims rc WHERE NOT EXISTS (SELECT 1 FROM dapper_objects o WHERE o.id = rc.claim_id) LIMIT 1"
-        ).fetchone()
-        genuine = cserve.render_claim(con, rc)
+        with con:
+            con.execute("DELETE FROM claims WHERE claim_id = ?", (claim_id,))
+            con.execute("DELETE FROM object_refs WHERE from_id = ?", (claim_id,))
+            con.execute("DELETE FROM dapper_objects WHERE id = ?", (claim_id,))
+        genuine = cserve.render_claim(con, cserve.served_claim(con, claim_id))
     finally:
         con.close()
     assert _fetch(genuine["id"]) == (None, None)
@@ -437,11 +454,11 @@ def test_where_bounds_ingest_kept_rows_and_whole_rosters(tmp_path):
         dataset = out.document["datasets"][0]
         assert "combined > 2" in dataset["description"] and "beta_uncorrected > 1" in dataset["description"]
         # Claim ids do not depend on the bounds: the same rows give the same claims unbounded.
-        bounded = {r["claim_id"] for r in con.execute("SELECT claim_id FROM result_claims")}
+        bounded = implied_ids(con, out.release_id)
         other = _fresh_db()
         try:
-            publish(other, col, _spec(folder), tmp_path)
-            assert bounded < {r["claim_id"] for r in other.execute("SELECT claim_id FROM result_claims")}
+            whole = publish(other, col, _spec(folder), tmp_path)
+            assert bounded < implied_ids(other, whole.release_id)
         finally:
             other.close()
         # The same files under other bounds cannot be a second dataset.

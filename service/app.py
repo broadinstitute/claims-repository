@@ -39,7 +39,6 @@ from .collections import identity as cidn
 from .collections import objects as cobjects
 from .collections import rows as crows
 from .collections import serve as cserve
-from .collections import store as cstore
 from .collections.manifest import ManifestError
 from .refs import DAPPER_ID_RE, MAX_ID_LENGTH, dapper_refs
 
@@ -220,7 +219,7 @@ CLAIM_SOURCES = (
 def _index_source(con, claim_id, families=None):
     """The template-backed index row that implies this claim, or None."""
     if not families or "collection" in families:
-        rc = cstore.get_store(con).claim(claim_id)
+        rc = cserve.served_claim(con, claim_id)
         if rc is not None:
             return "collection", rc
     for family, table in CLAIM_SOURCES:
@@ -340,6 +339,7 @@ def envelope(con, claim_id, assert_claim=True, source=None):
         assertions = getattr(con, "assertions", None)
         if assertions is None:
             assertions = con.assertions = {}
+        index = tuple(source[1][f] for f in cserve.CLAIM_FIELDS) if collection else None
         if claim_id not in assertions:
             if len(assertions) >= MAX_ASSERTIONS_PER_REQUEST:
                 raise ValueError(
@@ -352,9 +352,11 @@ def envelope(con, claim_id, assert_claim=True, source=None):
                     "identity_profile": cidn.PROFILE if collection else tpl.IDENTITY_PROFILE,
                     "method": cserve.collection_of(con, source[1]) if collection else tpl.METHOD,
                     "proposition": synthesized["proposition"], "refs": sorted(dapper_refs(synthesized)),
+                    "index": index,
                 }
             else:
-                assertions[claim_id] = {"new": False, "payload": row["payload"], "identity_profile": "unverified"}
+                assertions[claim_id] = {"new": False, "payload": row["payload"], "identity_profile": "unverified",
+                                        "index": index}
         claim = synthesized if row is None else json.loads(row["payload"])
         now = _now_ts()
         times = (row["times_seen"] if row is not None else 0) + 1
@@ -489,6 +491,11 @@ def _flush_assertions(con):
         con.dialect.upsert_object,
         [(cid, "Claim", a["identity_profile"], a["payload"]) for cid, a in items],
     )
+    # A collection claim's record: how its id resolves (and re-renders) once it has been served.
+    indexed = [a["index"] for _, a in items if a.get("index")]
+    if indexed:
+        con.executemany(f"{con.dialect.insert_or_ignore} result_claims ({', '.join(cserve.CLAIM_FIELDS)}) "
+                        f"VALUES ({', '.join('?' * len(cserve.CLAIM_FIELDS))})", indexed)
     new = [(cid, a) for cid, a in items if a["new"]]
     if new:
         con.executemany(
@@ -636,7 +643,7 @@ def resolve_proposition(_, info, id):
             (id,),
         ).fetchall():
             sources[r["claim_id"]] = (family, r)
-    for r in cstore.get_store(con).claims_for_proposition(id):
+    for r in cserve.served_claims_for_proposition(con, id):
         sources[r["claim_id"]] = ("collection", r)
     envelopes = [e for e in (envelope(con, cid, source=src) for cid, src in sorted(sources.items())) if e]
     return {

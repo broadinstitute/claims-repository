@@ -7,7 +7,7 @@ import type { ColumnDef } from "@tanstack/react-table";
 import { Button } from "@/components/ui/button";
 import { BarChart } from "@/components/admin/bar-chart";
 import { DataTable } from "@/components/admin/data-table";
-import { Coverage, KeyValues, Metric, PageHeading, Panel, QueryFeedback, Status, When, clock, ms, number, percent, plural, uptime } from "@/components/admin/shared";
+import { KeyValues, Metric, PageHeading, Panel, QueryFeedback, Status, When, clock, ms, number, plural, uptime } from "@/components/admin/shared";
 import { adminGet, type CollectionSummary, type Overview } from "@/lib/admin/api";
 
 const collectionColumns: ColumnDef<CollectionSummary, unknown>[] = [
@@ -17,10 +17,7 @@ const collectionColumns: ColumnDef<CollectionSummary, unknown>[] = [
   </div> },
   { id: "version", accessorFn: r => r.currentRelease?.version ?? "", header: "Current release", cell: ({ row }) => row.original.currentRelease
     ? <span className="font-mono text-xs">{row.original.currentRelease.version}</span> : <span className="text-muted-foreground">None</span> },
-  { id: "mintable", accessorFn: r => r.claims.mintable, header: "Mintable", meta: { align: "right" }, cell: ({ row }) => number(row.original.claims.mintable) },
-  { id: "minted", accessorFn: r => r.claims.minted, header: "Minted", meta: { align: "right" }, cell: ({ row }) => number(row.original.claims.minted) },
-  { id: "coverage", accessorFn: r => (r.claims.mintable ? r.claims.minted / r.claims.mintable : 0), header: "Served", meta: { width: 160 },
-    cell: ({ row }) => <Coverage minted={row.original.claims.minted} mintable={row.original.claims.mintable} /> },
+  { id: "minted", accessorFn: r => r.claims.minted, header: "Claims served", meta: { align: "right" }, cell: ({ row }) => number(row.original.claims.minted) },
 ];
 
 type ClassCount = Overview["objectsByClass"][number];
@@ -36,22 +33,21 @@ export default function OverviewPage() {
   const subtitle = d
     ? `Updated ${clock(d.asOf)} · ${d.database.backend === "mysql" ? "Aurora MySQL" : "SQLite"} ${d.database.name} · ping ${ms(d.database.pingMs)}`
     : query.error ? "Snapshot unavailable" : "Loading snapshot…";
-  const collectedMinted = d ? d.claims.minted - d.claims.uncollected : 0;
   return <>
     <PageHeading title="System overview" subtitle={query.error && d ? `Last refresh failed; showing ${clock(d.asOf)} data` : subtitle}
       actions={<Button variant="outline" size="sm" onClick={() => void query.refetch()} disabled={query.isFetching}>Refresh</Button>} />
     {!d ? <QueryFeedback pending={query.isPending} error={query.error} onRetry={() => void query.refetch()} /> : <>
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Metric title="Mintable claims" value={number(d.claims.mintable)} hint={`Claims the registered collections' templates produce, across ${plural(d.collections.length, "collection")}`} href="/admin/claims?origin=collection" />
-        <Metric title="Minted" value={number(d.claims.minted)} hint={`${percent(collectedMinted, d.claims.mintable)} of mintable served at least once · ${number(d.claims.uncollected)} with no collection`} href="/admin/claims?status=minted" />
+        <Metric title="Collections" value={number(d.collections.length)} hint={`Claims are rendered from their rows when a query serves them`} href="/admin/collections" />
+        <Metric title="Minted" value={number(d.claims.minted)} hint={`Claims served at least once · ${number(d.claims.uncollected)} with no collection`} href="/admin/claims" />
         <Metric title="Assertions" value={number(d.claims.assertions)} hint={`In 24h: ${plural(d.claims.asserted24h, "claim")} asserted, ${number(d.claims.minted24h)} first minted`} href="/admin/claims?sort=asserted" />
         <Metric title="API requests" value={number(d.api.requests)} hint={`Up ${uptime(d.api.uptimeSeconds)} · ${number(d.api.errors5xx)} server errors · ${number(d.api.graphql.requests)} GraphQL`} href="/admin/activity" />
       </div>
       <div className="grid gap-4 xl:grid-cols-3">
         <div className="xl:col-span-2">
-          <Panel title="Collections" description="Each collection is a released set of result files with the templates that mint claims from them. Counts are for the current release; served is the share of mintable claims minted so far."
+          <Panel title="Collections" description="Each collection is a released set of result files with the templates that mint claims from them. Counts are for the current release: claims served so far."
             action={<Button asChild variant="outline" size="sm"><Link href="/admin/collections">All collections</Link></Button>}>
-            <DataTable label="Collections" data={d.collections} columns={collectionColumns} defaultSort={{ id: "mintable", desc: true }}
+            <DataTable label="Collections" data={d.collections} columns={collectionColumns} defaultSort={{ id: "minted", desc: true }}
               getRowId={r => r.key} onRowClick={r => router.push(`/admin/collections/${encodeURIComponent(r.key)}`)} rowLabel={r => `Open collection ${r.title}`}
               empty="No collections are registered yet." />
           </Panel>

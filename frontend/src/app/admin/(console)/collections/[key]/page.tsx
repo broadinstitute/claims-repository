@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { ClaimSheet } from "@/components/admin/claim-sheet";
 import { DataTable } from "@/components/admin/data-table";
 import {
-  Callout, CopyButton, Coverage, Dimensions, Hash, Json, KeyValues, Mono, PageHeading, Panel, Pre, QueryFeedback, Status, When, bytes, number, plural,
+  Callout, CopyButton, Dimensions, Hash, Json, KeyValues, Mono, PageHeading, Panel, Pre, QueryFeedback, Status, When, bytes, number, plural,
 } from "@/components/admin/shared";
 import { useUrlState } from "@/components/admin/use-url-state";
 import {
@@ -128,10 +128,7 @@ function Dataset({ d, ds }: { d: CollectionDetail; ds: CollectionDataset }) {
       </div>
       <div className="flex flex-wrap gap-x-6 gap-y-2 text-xs">
         {Object.entries(ds.counts).map(([kind, n]) => <span key={kind}><span className="tabular-nums font-medium">{number(n)}</span> <Mono className="text-muted-foreground">{kind}</Mono> {kindLabel(kind)}</span>)}
-        <span className="flex min-w-56 items-center gap-2">
-          <span className="whitespace-nowrap"><span className="tabular-nums font-medium">{number(ds.claims.minted)}</span> of {number(ds.claims.mintable)} mintable claims minted</span>
-          <Coverage minted={ds.claims.minted} mintable={ds.claims.mintable} />
-        </span>
+        <span><span className="tabular-nums font-medium">{number(ds.claims.minted)}</span> claims served</span>
       </div>
       <div className="rounded-lg border border-border/50">
         <DataTable label="Dataset files" data={ds.files} columns={fileColumns} getRowId={f => `${f.role}-${f.fileId}`} empty="This dataset lists no files." />
@@ -153,7 +150,6 @@ function TemplateKey({ d, claim, onOpen }: { d: CollectionDetail; claim: Templat
           {claim.classify && <Status tone="info">tiers: {claim.classify}</Status>}
         </div>
         <div className="flex flex-wrap gap-x-4 text-xs text-muted-foreground">
-          <span><span className="font-medium tabular-nums text-foreground">{number(claim.mintable)}</span> mintable</span>
           <span><span className="font-medium tabular-nums text-foreground">{number(claim.minted)}</span> minted</span>
           <span><span className="font-medium tabular-nums text-foreground">{number(claim.assertions)}</span> assertions</span>
         </div>
@@ -380,7 +376,7 @@ function CollectionView() {
   return <>
     <div className="text-xs"><Link href="/admin/collections" className="text-muted-foreground underline-offset-4 hover:text-foreground hover:underline">Collections</Link></div>
     <PageHeading title={d?.title ?? key}
-      subtitle={d ? <span className="inline-flex flex-wrap items-center gap-x-2"><Mono>{d.key}</Mono>· release {d.release.version} · {plural(d.datasets.length, "dataset")} · {number(d.claims.mintable)} mintable claims, {number(d.claims.minted)} minted</span> : undefined}
+      subtitle={d ? <span className="inline-flex flex-wrap items-center gap-x-2"><Mono>{d.key}</Mono>· release {d.release.version} · {plural(d.datasets.length, "dataset")} · {number(d.claims.minted)} claims served</span> : undefined}
       actions={d && <>{picker}<Button asChild size="sm" variant="outline"><Link href={claimsHref(d.key)}>View claims</Link></Button></>} />
     {!d ? <QueryFeedback pending={query.isPending} error={query.error} onRetry={() => void query.refetch()} /> : <>
       {!d.release.isCurrent && <Callout tone="warn" role="status">

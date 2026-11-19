@@ -40,7 +40,7 @@ export type DimensionValues = Record<string, { value: string; label: string | nu
 export type CollectionSummary = {
   key: string; title: string; description: string | null; methods: string[]; owners: string[];
   currentRelease: Release | null; releases: number; datasets: number;
-  claims: { mintable: number; minted: number }; updatedAt: string | null;
+  claims: { minted: number }; updatedAt: string | null;
 };
 
 export type TraitRegistry = { version: string; commit: string | null; published: boolean; traits: number; mappings: number; loadedAt: string | null; rows: number };
@@ -48,7 +48,7 @@ export type TraitRegistry = { version: string; commit: string | null; published:
 export type Overview = {
   asOf: string;
   database: { backend: "sqlite" | "mysql"; name: string; pingMs: number };
-  claims: { mintable: number; minted: number; uncollected: number; assertions: number; lastAssertedAt: string | null; minted24h: number; asserted24h: number };
+  claims: { minted: number; uncollected: number; assertions: number; lastAssertedAt: string | null; minted24h: number; asserted24h: number };
   collections: CollectionSummary[];
   objectsByClass: { className: string; count: number }[];
   mintTimeline: { date: string; minted: number }[];
@@ -62,13 +62,13 @@ export type Spec = Record<string, unknown>;
 export type DatasetFile = { role: string; fileId: string; filename: string | null; sha256: string | null; sizeBytes: number | null; location: string | null };
 export type CollectionDataset = {
   id: string; dimensions: DimensionValues; files: DatasetFile[];
-  counts: Record<string, number>; claims: { mintable: number; minted: number };
+  counts: Record<string, number>; claims: { minted: number };
 };
 export type TemplateClaim = {
   key: string; statement: string;
   proposition: { statement?: string; subject?: string; relation?: string; object?: string; kind?: string };
   classify: string | null; scores: string[];
-  mintable: number; minted: number; assertions: number;
+  minted: number; assertions: number;
   example: { claimId: string; statement: string | null } | null;
 };
 export type CollectionTemplate = {

@@ -924,7 +924,7 @@ def cmd_release_publish(args):
               f"({out['seconds']:.0f}s); {r.warnings[-1]}")
         return
     print(f"recorded     {s['datasets']} datasets as {r.release_id} ({out['seconds']:.0f}s)")
-    for k in ("rows", "edges", "claims", "claim_lookup", "index_bytes"):
+    for k in ("rows", "edges", "mint_contexts_recorded", "index_bytes"):
         if k in s:
             print(f"  {k}: {_fmt_bytes(s[k]) if k == 'index_bytes' else f'{s[k]:,}'}")
     for w in r.warnings:
@@ -945,7 +945,7 @@ def cmd_release_status(args):
         vocabulary = _vocab(col, collection_dir)
         recorded = con.execute("SELECT release_id FROM collection_releases WHERE collection_key = ? AND version = ?",
                                (col.key, args.version)).fetchone()
-        done, rows, edges, claims = 0, 0, 0, 0
+        done, rows, edges = 0, 0, 0
         store = get_store(con)
         for ds in spec["datasets"]:
             params, sql = [], "SELECT f.dataset_id FROM dataset_files f"
@@ -960,13 +960,11 @@ def cmd_release_status(args):
                 c = store.counts(hit["dataset_id"])
                 rows += sum(v for k, v in c.items() if k in col.doc["row_kinds"])
                 edges += sum(v for k, v in c.items() if k not in col.doc["row_kinds"])
-                p = store.dataset_dir(hit["dataset_id"]) / "counts.json"
-                claims += sum(json.loads(p.read_text())["claims"].values()) if p.exists() else 0
     finally:
         con.close()
     state = "published" if recorded else ("ingesting" if done else "planned")
     print(f"{col.key} {args.version}   {state:10s} {done:,} / {len(spec['datasets']):,} datasets   "
-          f"{rows:,} rows, {edges:,} edges, {claims:,} claims")
+          f"{rows:,} rows, {edges:,} edges")
     if not recorded:
         print("             not served yet: the release is recorded when every dataset is in")
     else:

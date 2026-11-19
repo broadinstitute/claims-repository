@@ -7,7 +7,7 @@ import type { ColumnDef } from "@tanstack/react-table";
 import { Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { DataTable } from "@/components/admin/data-table";
-import { Coverage, PageHeading, Panel, QueryFeedback, Status, When, number } from "@/components/admin/shared";
+import { PageHeading, Panel, QueryFeedback, Status, When, number } from "@/components/admin/shared";
 import { adminGet, type CollectionSummary } from "@/lib/admin/api";
 
 const columns: ColumnDef<CollectionSummary, unknown>[] = [
@@ -22,10 +22,7 @@ const columns: ColumnDef<CollectionSummary, unknown>[] = [
     <div className="mt-0.5 text-xs text-muted-foreground">{number(row.original.releases)} {row.original.releases === 1 ? "release" : "releases"}</div>
   </div> : <span className="text-muted-foreground">None</span> },
   { id: "datasets", accessorKey: "datasets", header: "Datasets", meta: { align: "right" }, cell: ({ row }) => number(row.original.datasets) },
-  { id: "mintable", accessorFn: r => r.claims.mintable, header: "Mintable", meta: { align: "right" }, cell: ({ row }) => number(row.original.claims.mintable) },
-  { id: "minted", accessorFn: r => r.claims.minted, header: "Minted", meta: { align: "right" }, cell: ({ row }) => number(row.original.claims.minted) },
-  { id: "coverage", accessorFn: r => (r.claims.mintable ? r.claims.minted / r.claims.mintable : 0), header: "Served", meta: { width: 160 },
-    cell: ({ row }) => <Coverage minted={row.original.claims.minted} mintable={row.original.claims.mintable} /> },
+  { id: "minted", accessorFn: r => r.claims.minted, header: "Claims served", meta: { align: "right" }, cell: ({ row }) => number(row.original.claims.minted) },
   { id: "publishedAt", accessorFn: r => r.currentRelease?.publishedAt ?? "", header: "Last published", meta: { muted: true },
     cell: ({ row }) => <When value={row.original.currentRelease?.publishedAt} empty="Never" /> },
 ];
@@ -47,7 +44,7 @@ export default function CollectionsPage() {
             <div>{addButton}</div>
           </div>
         </Panel>
-      : <Panel title="Registered collections" description="Counts are for each collection's current release. Served is the share of mintable claims that have been minted. Select a collection to see how it is built.">
+      : <Panel title="Registered collections" description="Counts are for each collection's current release; a claim is counted once it has been served. Select a collection to see how it is built.">
           <DataTable label="Collections" data={d.collections} columns={columns} defaultSort={{ id: "title", desc: false }} getRowId={r => r.key}
             onRowClick={r => router.push(`/admin/collections/${encodeURIComponent(r.key)}`)} rowLabel={r => `Open collection ${r.title}`} />
         </Panel>}

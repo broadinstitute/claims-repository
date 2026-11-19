@@ -1,13 +1,15 @@
 """Publish a collection release: manifest + release spec + result files in,
-a DAPPER ResultCollection and its datasets, rows, edges, metrics and
-mintable claims out.
+a DAPPER ResultCollection and its datasets, rows, edges, metrics and mint
+contexts out.
 
-Claims are not stored. Every claim a row implies is rendered once here to
-learn its id; result_claims records that id with the mint context that
-re-renders it, and the service mints the claim when it first serves it.
-What IS stored is the data plane the claims reference: Files, Activities,
-Datasets, the ResultCollection, GeneSet entities, Propositions, ClaimScores,
-ValueLocators and EvidenceItems.
+No claim is rendered here. A mint context (one template over one result
+file) is all a release records about its claims: the service renders a
+row's claims from it when the row is served, and stores a claim (with the
+propositions, scores and evidence it references) the first time it is
+served. A template or wording change therefore costs one mint context per
+dataset, not a pass over every row. What publishing stores is the data
+plane rows come from: Files, Activities, Datasets, the ResultCollection and
+GeneSet entities.
 
 Datasets are content-addressed and shared by every release that lists them:
 a dataset already ingested is not read again, and a (template, file) pairing
@@ -443,7 +445,7 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
         release, document, existing, previous_id = build_release()
 
     stats = {"datasets": len(datasets), "datasets_ingested": 0, "rows": 0, "edges": 0,
-             "mint_contexts_rendered": 0, "claims": 0}
+             "mint_contexts_recorded": 0}
     if dry_run:
         if vocab.unresolved:
             warnings.append(_unresolved_warning(vocab))
@@ -493,27 +495,25 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
         if store.kind == "parquet":
             try:
                 step(f"Ingesting dataset {n} of {len(datasets)} into the Parquet index")
-                n_rows, n_edges, n_claims = _ingest_parquet(con, col, ds, pending, vocab, store, ingest)
+                n_rows, n_edges = _ingest_parquet(con, col, ds, pending, vocab, store, ingest)
             finally:
                 _remove(fetched)
             stats["datasets_ingested"] += int(ingest)
             stats["rows"] += n_rows
             stats["edges"] += n_edges
-            stats["claims"] += n_claims
-            stats["mint_contexts_rendered"] += len(pending)
+            stats["mint_contexts_recorded"] += len(pending)
             continue
         try:
             for attempt in range(1, 4):
                 ds_objects: dict[str, tuple[str, dict]] = {}
-                n_rows = n_edges = n_claims = 0
+                n_rows = n_edges = 0
                 try:
                     with con:
                         if ingest:
                             step(f"Ingesting dataset {n} of {len(datasets)}")
                             n_rows, n_edges = _ingest_dataset(con, col, ds, ds_objects, vocab)
                         for ctx in pending:
-                            step(f"Rendering template {ctx.template['template']} (dataset {n} of {len(datasets)})")
-                            n_claims += _render_context(con, col, ctx, ds, ds_objects)
+                            _record_context(con, ctx)
                         _store_objects(con, ds_objects)
                     break
                 except Exception as exc:
@@ -527,8 +527,7 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
         stats["datasets_ingested"] += int(ingest)
         stats["rows"] += n_rows
         stats["edges"] += n_edges
-        stats["claims"] += n_claims
-        stats["mint_contexts_rendered"] += len(pending)
+        stats["mint_contexts_recorded"] += len(pending)
         stats["objects"] += len(ds_objects)
     if unfinished:
         warnings.append(f"{unfinished} of {len(datasets)} dataset(s) are not stored yet (outside this call's shard "
@@ -538,9 +537,6 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
     if release is None:
         release, document, existing, previous_id = build_release()
     if store.kind == "parquet":
-        step("Rebuilding the claim lookup")
-        stats["claim_lookup"] = store.rebuild_lookup(
-            sorted({r["dataset_id"] for r in con.execute("SELECT DISTINCT dataset_id FROM dataset_files").fetchall()}))
         stats["index_bytes"] = store.size_bytes()
     with con:
         step("Storing objects")
@@ -867,34 +863,10 @@ def group_inputs(con, minting: dict, dataset_id: str, kind: str, group_id: str,
     return {"id": group_id, "label": label, "count": count, "parent": parent}
 
 
-def _render_context(con, col: Collection, ctx: engine.MintContext, ds: dict, objects: dict) -> int:
-    """Render every claim of one (template, file) pairing over one dataset."""
-    dataset_id = ds["doc"]["id"]
-    kind = ctx.template["for"]
-    dataset = dataset_ns(con, dataset_id)
-    claim_rows = []
-    if kind in col.doc["row_kinds"]:
-        for r in con.execute("SELECT * FROM result_rows WHERE dataset_id = ? AND kind = ? ORDER BY row_id",
-                             (dataset_id, kind)).fetchall():
-            out = engine.render_row(ctx, dataset=dataset, **row_inputs(ctx.minting, kind, r))
-            objects.update(out.objects)
-            claim_rows.extend((c["id"], ctx.activity["id"], key, dataset_id, r["row_id"], None, None,
-                               out.propositions[key]) for key, c in out.claims.items())
-    else:
-        side = "to_id" if ctx.template["group_by"] == "to" else "from_id"
-        for g in con.execute(f"SELECT DISTINCT {side} AS gid FROM result_edges WHERE dataset_id = ? AND kind = ? "
-                             f"ORDER BY {side}", (dataset_id, kind)).fetchall():
-            out = engine.render_group(ctx, dataset=dataset,
-                                      group=group_inputs(con, ctx.minting, dataset_id, kind, g["gid"]))
-            objects.update(out.objects)
-            claim_rows.extend((c["id"], ctx.activity["id"], key, dataset_id, None, kind, g["gid"],
-                               out.propositions[key]) for key, c in out.claims.items())
-    con.executemany(
-        f"{con.dialect.insert_or_ignore} result_claims (claim_id, activity_id, claim_key, dataset_id, row_id, "
-        "edge_kind, group_id, proposition_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", claim_rows)
+def _record_context(con, ctx: engine.MintContext) -> None:
+    """Record one (template, file) pairing: what the service renders the dataset's claims from."""
     con.execute("INSERT INTO mint_contexts (activity_id, template_file_id, result_file_id, context) VALUES (?, ?, ?, ?)",
                 (ctx.activity["id"], ctx.template_file_id, ctx.result_file_id, json.dumps(ctx.as_record())))
-    return len(claim_rows)
 
 
 # Parquet ingest ------------------------------------------------------------
@@ -904,27 +876,25 @@ def _render_context(con, col: Collection, ctx: engine.MintContext, ds: dict, obj
 EAGER_CLASSES = {"File", "Activity", "Dataset", "ResultCollection", "GeneSetCollection"}
 
 
-def _ingest_parquet(con, col: Collection, ds: dict, pending: list, vocab, store, ingest: bool) -> tuple[int, int, int]:
-    """Ingest one dataset into the Parquet index: rows, metrics, edges and the
-    claims each pending mint context implies, written whole; then its control
-    rows (dimensions, files, mint contexts) in the service database. Data-plane
-    objects (propositions, scores, evidence, gene sets) are not stored here:
-    the service stores them the first time one of their claims is served."""
+def _ingest_parquet(con, col: Collection, ds: dict, pending: list, vocab, store, ingest: bool) -> tuple[int, int]:
+    """Ingest one dataset into the Parquet index (rows, metrics and edges,
+    written whole), then record its control rows (dimensions, files, pending
+    mint contexts) in the service database. Gene sets are not stored here: the
+    service rebuilds and stores one the first time a claim naming it is served."""
     from .store import stable_row_id
 
     doc = col.doc
     dataset_id = ds["doc"]["id"]
-    ns = {"id": dataset_id, **{n: d["value"] for n, d in ds["dims"].items()}}
     objects: dict[str, tuple[str, dict]] = {}
+    rows, edge_rows = [], []
     if ingest:
         ents, edges = dataset_entities(col, ds, objects, vocab)
-        edge_rows = []
         for kind, pairs in edges.items():
             spec = doc["edge_kinds"][kind]
             for (from_value, to_value), (from_id, _, _) in sorted(pairs.items()):
                 to_id, _ = ents.ident(spec["to"]["entity"], to_value)
                 edge_rows.append((dataset_id, kind, from_id, to_id, from_value, to_value))
-        rows, metrics = [], []
+        metrics = []
         for kind, rk in doc["row_kinds"].items():
             if col.role_for(kind) not in ds["files"]:
                 continue
@@ -934,41 +904,7 @@ def _ingest_parquet(con, col: Collection, ds: dict, pending: list, vocab, store,
                 rows.append(row)
                 values = json.loads(row["row_json"])
                 metrics.extend((row["row_id"], m, idn.num(values[m])) for m in rk["metrics"])
-    else:
-        rows_t, _, edges_t = store.tables([dataset_id])
-        rows = store.query(f"SELECT * FROM {rows_t} r", [])
-        metrics = []
-        edge_rows = [tuple(e[k] for k in ("dataset_id", "kind", "from_id", "to_id", "from_value", "to_value"))
-                     for e in store.query(f"SELECT * FROM {edges_t} e", [])]
-    claims: dict[str, list[tuple]] = {}
-    for ctx in pending:
-        kind = ctx.template["for"]
-        items = claims.setdefault(ctx.activity["id"], [])
-        if kind in doc["row_kinds"]:
-            for r in rows:
-                if r["kind"] != kind:
-                    continue
-                out = engine.render_row(ctx, dataset=ns, **row_inputs(ctx.minting, kind, r))
-                items.extend((c["id"], ctx.activity["id"], key, dataset_id, r["row_id"], None, None,
-                              out.propositions[key]) for key, c in out.claims.items())
-        else:
-            side = 3 if ctx.template["group_by"] == "to" else 2
-            groups: dict[str, list] = {}
-            for e in edge_rows:
-                if e[1] == kind:
-                    groups.setdefault(e[side], []).append(e)
-            entity = ctx.minting["entities"][ctx.minting["edge_kinds"][kind]["to"]["entity"]]
-            library = ns.get(entity.get("library_dimension", ""), None)
-            for gid, members in sorted(groups.items()):
-                group = group_inputs(con, ctx.minting, dataset_id, kind, gid,
-                                     found=(members[0][5 if side == 3 else 4], len(members)), library=library)
-                out = engine.render_group(ctx, dataset=ns, group=group)
-                items.extend((c["id"], ctx.activity["id"], key, dataset_id, None, kind, gid,
-                              out.propositions[key]) for key, c in out.claims.items())
-    if ingest:
-        store.write_dataset(dataset_id, rows, metrics, edge_rows, claims)
-    else:
-        store.add_claims(dataset_id, claims)
+        store.write_dataset(dataset_id, rows, metrics, edge_rows)
     with con:
         if ingest:
             con.executemany("INSERT INTO dataset_dimensions (dataset_id, dimension, value, label) VALUES (?, ?, ?, ?)",
@@ -976,11 +912,9 @@ def _ingest_parquet(con, col: Collection, ds: dict, pending: list, vocab, store,
             con.executemany("INSERT INTO dataset_files (dataset_id, role, file_id) VALUES (?, ?, ?)",
                             [(dataset_id, role, f["doc"]["id"]) for role, f in ds["files"].items()])
         for ctx in pending:
-            con.execute("INSERT INTO mint_contexts (activity_id, template_file_id, result_file_id, context) "
-                        "VALUES (?, ?, ?, ?)",
-                        (ctx.activity["id"], ctx.template_file_id, ctx.result_file_id, json.dumps(ctx.as_record())))
+            _record_context(con, ctx)
         _store_objects(con, {oid: v for oid, v in objects.items() if v[0] in EAGER_CLASSES})
-    return (len(rows) if ingest else 0), (len(edge_rows) if ingest else 0), sum(len(v) for v in claims.values())
+    return len(rows), len(edge_rows)
 
 
 def _store_objects(con, objects: dict) -> None:

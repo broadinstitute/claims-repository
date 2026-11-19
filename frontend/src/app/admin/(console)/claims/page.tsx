@@ -35,7 +35,6 @@ function Claims() {
   const claimKey = params.get("claim_key") ?? "";
   const dataset = params.get("dataset") ?? "";
   const origin = params.get("origin") ?? "";
-  const status = params.get("status") ?? "";
   const sort = params.get("sort") ?? "";
   const page = Math.max(1, Number(params.get("page")) || 1);
   const claim = params.get("claim");
@@ -54,8 +53,8 @@ function Claims() {
   const claimKeys = useMemo(() => Array.from(new Set((detail.data?.templates ?? []).flatMap(t => t.claims.map(c => c.key)))), [detail.data]);
   const datasetLabel = useMemo(() => detail.data?.datasets.find(ds => ds.id === dataset)?.dimensions, [detail.data, dataset]);
 
-  const filters = useMemo(() => ({ q, collection, claim_key: claimKey, dataset, origin, status, sort: sort || "recent", page, page_size: PAGE_SIZE }),
-    [q, collection, claimKey, dataset, origin, status, sort, page]);
+  const filters = useMemo(() => ({ q, collection, claim_key: claimKey, dataset, origin, sort: sort || "recent", page, page_size: PAGE_SIZE }),
+    [q, collection, claimKey, dataset, origin, sort, page]);
   const query = useQuery({ queryKey: ["admin", "claims", filters], queryFn: () => adminGet<ClaimList>("claims", filters), placeholderData: keepPreviousData });
 
   const select = (key: string, value: string, label: string, options: [string, string][], extra: Record<string, undefined> = {}, disabled = false) => (
@@ -81,7 +80,6 @@ function Claims() {
       })}>
         <option value="">Any origin</option><option value="collection">From a collection</option><option value="uncollected">No collection</option>
       </select>
-      {select("status", status, "Status", [["", "Minted and not minted"], ["minted", "Minted"], ["unminted", "Not minted yet"]])}
       {select("sort", sort, "Sort", [["", "Recently asserted"], ["asserted", "Most asserted"], ["minted", "Recently minted"], ["subject", "Subject A–Z"]])}
     </div>
     {(dataset || (origin === "uncollected" && (collection || claimKey))) && <div className="flex flex-wrap items-center gap-2 text-xs">

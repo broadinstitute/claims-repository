@@ -329,7 +329,7 @@ def test_the_git_check_runs_no_repository_configured_command(monkeypatch, tmp_pa
 
 def test_check_then_publish_job_records_exactly_the_sampled_claims(monkeypatch):
     monkeypatch.setenv(reg.ENV, str(FIX))
-    before = _sql("SELECT COUNT(*) AS n FROM result_claims")[0]["n"]
+    before = _sql("SELECT COUNT(*) AS n FROM collection_releases")[0]["n"]
     tables = _table_counts()
     body = {"collectionDir": str(COLLECTION), "releaseFile": str(RELEASE), "sample": 10}
     checked = _post("registration/check", body)
@@ -361,8 +361,9 @@ def test_check_then_publish_job_records_exactly_the_sampled_claims(monkeypatch):
     assert job["releaseId"] == report["release"]["releaseId"] and job["version"] == "0.0.1-test"
     assert job["collection"] == "pigean" and job["startedBy"] == ADMIN and job["finishedAt"]
     assert job["phase"] == "Done" and job["error"] is None and isinstance(job["stats"], dict)
-    recorded = {r["claim_id"] for r in _sql("SELECT claim_id FROM result_claims")}
-    assert sampled <= recorded and len(recorded) == 20
+    assert _sql("SELECT COUNT(*) AS n FROM result_claims")[0]["n"] == 0  # publishing renders no claim
+    _serve_all()
+    assert sampled == {r["claim_id"] for r in _sql("SELECT claim_id FROM result_claims")}
     assert _get("registration/jobs").json()["jobs"][0]["id"] == job["id"]
 
     events = [(e["event"], e["email"], e["detail"]) for e in _get("activity").json()["authEvents"]]
@@ -414,13 +415,14 @@ def test_one_job_at_a_time_and_failures_are_reported(monkeypatch, published):
 
 def test_overview_and_collection_summary(published):
     ov = _get("overview").json()
-    assert ov["claims"]["mintable"] == 20
+    assert "mintable" not in ov["claims"] and ov["claims"]["minted"] >= 0
     [summary] = ov["collections"]
     assert summary["key"] == "pigean" and summary["methods"] == ["PIGEAN"]
     assert summary["owners"] == ["dig-aggregator-pipeline"]
     assert summary["currentRelease"]["id"] == published.release_id
     assert summary["currentRelease"]["version"] == "0.0.1-test"
-    assert summary["releases"] == 1 and summary["datasets"] == 1 and summary["claims"]["mintable"] == 20
+    served = _sql("SELECT COUNT(*) AS n FROM result_claims")[0]["n"]
+    assert summary["releases"] == 1 and summary["datasets"] == 1 and summary["claims"] == {"minted": served}
     assert _get("collections").json() == {"collections": ov["collections"]}
 
 
@@ -436,7 +438,7 @@ def test_collection_detail(published):
     [ds] = d["datasets"]
     assert ds["dimensions"]["trait"] == {"value": "FIXPHENO", "label": "FIXPHENO"}
     assert ds["counts"] == {"gene_phenotype": 3, "gene_set_phenotype": 2, "member_of": 3}
-    assert ds["claims"]["mintable"] == 20
+    assert set(ds["claims"]) == {"minted"}
     files = {f["role"]: f for f in ds["files"]}
     assert set(files) == {"gene_stats", "gene_set_stats", "membership"}
     gene = files["gene_stats"]
@@ -444,10 +446,11 @@ def test_collection_detail(published):
     assert gene["filename"] == "combined_gene_stats.json" and gene["sizeBytes"] == len(data)
     assert len(gene["sha256"]) == 64 and gene["fileId"].startswith("dapper:File.") and gene["location"]
     templates = {t["name"]: t for t in d["templates"]}
-    assert {c["key"]: c["mintable"] for c in templates["gene"]["claims"]} == {
-        "measurement": 3, "tier-combined": 3, "tier-direct": 3, "tier-indirect": 3}
-    assert [c["mintable"] for c in templates["gene_set"]["claims"]] == [2, 2, 2]
-    assert templates["roster"]["groupBy"] == "to" and templates["roster"]["claims"][0]["mintable"] == 2
+    assert [c["key"] for c in templates["gene"]["claims"]] == ["measurement", "tier-combined", "tier-direct",
+                                                               "tier-indirect"]
+    assert all({"minted", "assertions"} <= set(c) and "mintable" not in c for c in templates["gene"]["claims"])
+    assert len(templates["gene_set"]["claims"]) == 3
+    assert templates["roster"]["groupBy"] == "to" and templates["roster"]["claims"][0]["key"] == "roster"
     measurement = templates["gene"]["claims"][0]
     assert "{" in measurement["statement"] and measurement["proposition"]["relation"]
     q = next(q for q in d["queries"] if q["name"] == QUERY)
@@ -493,6 +496,14 @@ def test_example_query_asserts_nothing(monkeypatch, tmp_path, published):
     assert _get(f"collections/nope/queries/{QUERY}/example").status_code == 404
 
 
+def _serve_all():
+    """Serve every claim of the fixture through the public query surface: nothing lists a claim before then."""
+    body = client.post(f"/v1/collections/pigean/queries/{QUERY}:run", json={"variables": {
+        "trait": "FIXPHENO", "library": "fixture-v1", "topGenes": 20, "setsPerGene": 50}})
+    assert body.status_code == 200, body.text
+    assert _sql("SELECT COUNT(*) AS n FROM result_claims")[0]["n"] == 20
+
+
 def _mint_one():
     """Serve (and so mint) FIXG1's claims through the public query surface."""
     body = client.post(f"/v1/collections/pigean/queries/{QUERY}:run", json={"variables": {
@@ -502,6 +513,7 @@ def _mint_one():
 
 
 def test_claims_list_filters(published):
+    _serve_all()
     uncollected = _get("overview").json()["claims"]["uncollected"]
     everything = _get("claims", page_size=100).json()
     assert everything["total"] == 20 + uncollected
@@ -528,25 +540,26 @@ def test_claims_list_filters(published):
     assert _get("claims", dataset=dataset).json()["total"] == 20
 
     minted_id = _mint_one()
-    assert _get("claims", status="minted", collection="pigean").json()["rows"][0]["claimId"] == minted_id
-    assert _get("claims", status="unminted").json()["total"] == 19
+    again = {r["claimId"]: r for r in _get("claims", collection="pigean", page_size=100).json()["rows"]}
+    assert again[minted_id]["timesAsserted"] >= 2  # served once by _serve_all, again by _mint_one
     first = _get("claims", sort="recent", page_size=1).json()["rows"][0]
     assert first["minted"] and first["timesAsserted"] >= 1 and first["lastAssertedAt"].endswith("Z")
     assert _get("claims", page=2, page_size=15, origin="collection").json()["rows"].__len__() == 5
 
 
 def test_claim_detail_never_mints_or_asserts(published):
-    unminted = _get("claims", status="unminted", claim_key="tier-combined", page_size=1).json()["rows"][0]
+    _serve_all()
+    served = _get("claims", claim_key="tier-combined", page_size=1).json()["rows"][0]
     before = _claim_counts()
-    d = _get(f"claims/{unminted['claimId']}").json()
-    assert d["minted"] is False and d["timesAsserted"] == 0 and d["identityProfile"] == "DAPPER-ID-1"
-    assert d["verification"] == {"collectionBacked": True, "renders": True, "storedMatches": None, "error": None}
-    assert d["claim"]["id"] == unminted["claimId"] and d["statement"] == d["claim"]["statement"]
+    d = _get(f"claims/{served['claimId']}").json()
+    assert d["minted"] is True and d["identityProfile"] == "DAPPER-ID-1"
+    assert d["verification"] == {"collectionBacked": True, "renders": True, "storedMatches": True, "error": None}
+    assert d["claim"]["id"] == served["claimId"] and d["statement"] == d["claim"]["statement"]
     assert d["collection"] == "pigean" and d["claimKey"] == "tier-combined" and d["method"] == "pigean"
     assert d["proposition"]["id"] == d["claim"]["proposition"] and d["triple"]["subject"].startswith("HGNC.SYMBOL:")
     src = d["source"]
     assert src["template"]["name"] == "gene" and src["releases"] == ["0.0.1-test"] and src["group"] is None
-    assert src["row"]["kind"] == "gene_phenotype" and src["row"]["subject"]["value"] == unminted["subject"]
+    assert src["row"]["kind"] == "gene_phenotype" and src["row"]["subject"]["value"] == served["subject"]
     assert "combined" in src["row"]["columns"] and src["dataset"]["dimensions"]["trait"]["value"] == "FIXPHENO"
     assert _claim_counts() == before
 
@@ -564,15 +577,16 @@ def test_claim_detail_never_mints_or_asserts(published):
 
 
 def test_claim_detail_reports_drift_instead_of_failing(published):
-    unminted = _get("claims", status="unminted", claim_key="tier-direct", page_size=1).json()["rows"][0]
+    _serve_all()
+    served = _get("claims", claim_key="tier-direct", page_size=1).json()["rows"][0]
     row = _sql("SELECT rc.row_id, rr.row_json FROM result_claims rc JOIN result_rows rr ON rr.row_id = rc.row_id "
-               "WHERE rc.claim_id = ?", (unminted["claimId"],))[0]
+               "WHERE rc.claim_id = ?", (served["claimId"],))[0]
     con = service_db.connect()
     try:
         with con:
             con.execute("UPDATE result_rows SET row_json = ? WHERE row_id = ?",
                         (json.dumps({**json.loads(row["row_json"]), "trait_group": "tampered"}), row["row_id"]))
-        d = _get(f"claims/{unminted['claimId']}")
+        d = _get(f"claims/{served['claimId']}")
         assert d.status_code == 200
         v = d.json()["verification"]
         assert v["collectionBacked"] and v["renders"] is False and "template drift" in v["error"]
@@ -590,7 +604,6 @@ def test_uncollected_claims(published):
     listed = _get("claims", origin="uncollected", page_size=100).json()
     assert claim_id in {r["claimId"] for r in listed["rows"]}
     assert all(r["collection"] is None and r["dimensions"] is None for r in listed["rows"])
-    assert _get("claims", status="unminted", q=claim_id[-14:].lower()).json()["total"] == 0
     d = _get(f"claims/{claim_id}").json()
     assert d["verification"]["collectionBacked"] is False and d["verification"]["renders"] is None
     assert d["source"] is None and d["collection"] is None and d["claimKey"] is None

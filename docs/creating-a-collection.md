@@ -593,7 +593,7 @@ pins         none: versioning is OFF; 4,300 files recorded by sha256 + ETag only
 rows         gene_phenotype       14,700,532 in the files ->    323,622 kept (combined > 0.5)
              gene_set_phenotype      445,137 in the files ->    167,855 kept (beta_uncorrected > 0.01)
 edges        member_of            74,367,043 in the files -> 22,032,760 kept (every kept set keeps its full roster)
-claims       1,965,802 mintable   (measurement, 3 gene tiers, 2 gene-set tiers, roster)
+templates    3 mint contexts per dataset (claims render when a query serves their rows)
 index        ~0.9 GB derived Parquet
 
 warnings     294 key(s) resolve through no mapping and were kept as given (unmapped: keep-raw)
@@ -642,7 +642,7 @@ claims release publish pigean 2026.11.1 --continue --workers 4
 ```
 
 ```text
-[ 1444/1444]  done in about 3 hours   323,622 + 167,855 rows, 22,032,760 edges, 1,965,802 mintable claims
+[ 1444/1444]  done in about 3 hours   323,622 + 167,855 rows, 22,032,760 edges
 recorded      pigean 2026.11.1 = dapper:ResultCollection.SKUyDk5Kn0YmVaQ4qiFJFDqwIY-VNa8x
 ```
 

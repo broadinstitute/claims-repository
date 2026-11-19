@@ -1,9 +1,11 @@
-"""Serving collections: re-rendering claims on serve, discovery, and the
+"""Serving collections: rendering claims on serve, discovery, and the
 query plan executor.
 
-A collection claim is re-rendered from its row (or edge group) and its mint
-context every time it is served, and refused unless the result has the id the
-ingester recorded. The executor runs a query template's bounded plan: an
+A collection claim is rendered from its row (or edge group) and a mint
+context of the release every time it is served; nothing about it is computed
+ahead. The first serve stores it and records it in result_claims (claim id ->
+mint context, row or group), which is how its id resolves afterwards; a later
+render from that record must reproduce the id, or the claim is refused. The executor runs a query template's bounded plan: an
 anchor step (filter, order and limit rows of one kind before anything else),
 then a join through an edge kind with a per-anchor window. Each step filters
 and orders only on its own kind's metrics, which the manifest checker enforces
@@ -32,7 +34,7 @@ class ClaimRenderError(RuntimeError):
 FILTER_OPS = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">=", "eq": "=", "ne": "!="}
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=8192)
 def _context(activity_id: str, context_json: str) -> engine.MintContext:
     return engine.MintContext.from_record(json.loads(context_json))
 
@@ -49,42 +51,129 @@ def collection_of(con, rc) -> str:
     return mint_context(con, rc["activity_id"]).minting["collection"]
 
 
+CLAIM_FIELDS = ("claim_id", "activity_id", "claim_key", "dataset_id", "row_id", "edge_kind", "group_id",
+                "proposition_id")
+
+
 def render_claim(con, rc) -> dict:
-    """The claim a claim-index row names, re-rendered and checked."""
+    """The claim a claim record names, rendered and checked."""
     return render_claim_full(con, rc)[0]
 
 
 def render_claim_full(con, rc) -> tuple[dict, dict]:
-    """(claim, the data-plane objects it references) for a claim-index row,
-    re-rendered and checked. With a lazy store (Parquet) the objects are
-    stored the first time the claim is served; a gene set it names is rebuilt
-    from the dataset's edges."""
+    """(claim, the data-plane objects it references) for a claim record: one
+    implied_*_claims just rendered (returned as it is), or one read back from
+    result_claims (rendered again and checked against its id)."""
+    if "_rendered" in rc:
+        return rc["_rendered"][0][rc["claim_key"]], rc["_rendered"][1]
     store = get_store(con)
     ctx = mint_context(con, rc["activity_id"])
-    dataset = dataset_ns(con, rc["dataset_id"])
     if rc["row_id"] is not None:
         r = store.row(rc["dataset_id"], rc["row_id"])
         if r is None:
             raise ClaimRenderError(f"row {rc['row_id']} behind {rc['claim_id']} is gone")
-        out = engine.render_row(ctx, dataset=dataset, **row_inputs(ctx.minting, r["kind"], r))
-        gene_sets = [r["subject_id"]] if r["subject_id"].startswith("dapper:GeneSet.") else []
+        claims, _, objects = _render_row(con, ctx, dataset_ns(con, rc["dataset_id"]), r)
     else:
-        out = engine.render_group(ctx, dataset=dataset, group=group_inputs(
-            con, ctx.minting, rc["dataset_id"], rc["edge_kind"], rc["group_id"]))
-        gene_sets = [rc["group_id"]]
-    claim = out.claims.get(rc["claim_key"])
+        claims, _, objects = _render_group(con, ctx, dataset_ns(con, rc["dataset_id"]), rc["dataset_id"],
+                                           rc["edge_kind"], rc["group_id"])
+    claim = claims.get(rc["claim_key"])
     if claim is None or claim["id"] != rc["claim_id"]:
         raise ClaimRenderError(
             f"template drift: {rc['claim_id']} is recorded for this row, but its template now renders "
             f"{claim['id'] if claim else 'no such claim'}; refusing to serve it")
-    objects = {}
-    if store.lazy_objects:
-        objects = {oid: doc for oid, (_, doc) in out.objects.items()}
+    return claim, objects
+
+
+def _objects(con, ctx, dataset_id, out, gene_sets) -> dict:
+    """The data-plane objects a render references (stored when one of its claims is first served). A lazy
+    store (Parquet) stores no gene sets at ingest, so the ones named here are rebuilt from the edges."""
+    objects = {oid: doc for oid, (_, doc) in out.objects.items()}
+    if get_store(con).lazy_objects:
         for gid in gene_sets:
-            doc = rebuild_gene_set(con, ctx.minting, rc["dataset_id"], gid)
+            doc = rebuild_gene_set(con, ctx.minting, dataset_id, gid)
             if doc is not None:
                 objects[doc["id"]] = doc
-    return claim, objects
+    return objects
+
+
+def _render_row(con, ctx, dataset: dict, r) -> tuple[dict, dict, dict]:
+    out = engine.render_row(ctx, dataset=dataset, **row_inputs(ctx.minting, r["kind"], r))
+    gene_sets = [r["subject_id"]] if r["subject_id"].startswith("dapper:GeneSet.") else []
+    return out.claims, out.propositions, _objects(con, ctx, dataset["id"], out, gene_sets)
+
+
+def _render_group(con, ctx, dataset: dict, dataset_id, edge_kind, group_id) -> tuple[dict, dict, dict]:
+    out = engine.render_group(ctx, dataset=dataset, group=group_inputs(con, ctx.minting, dataset_id, edge_kind,
+                                                                       group_id))
+    return out.claims, out.propositions, _objects(con, ctx, dataset_id, out, [group_id])
+
+
+def _release_contexts(con, release_id: str, dataset_ids) -> dict[str, list]:
+    """dataset id -> (activity id, mint context) for the release's mint contexts over those datasets."""
+    ids = sorted(set(dataset_ids))
+    out: dict[str, list] = {d: [] for d in ids}
+    for i in range(0, len(ids), 500):
+        chunk = ids[i:i + 500]
+        for r in con.execute(f"SELECT rm.activity_id, rm.dataset_id, mc.context FROM release_mint_contexts rm "
+                             f"JOIN mint_contexts mc ON mc.activity_id = rm.activity_id WHERE rm.release_id = ? AND "
+                             f"rm.dataset_id IN ({','.join('?' * len(chunk))}) ORDER BY rm.activity_id",
+                             [release_id, *chunk]).fetchall():
+            raw = r["context"]
+            ctx = _context(r["activity_id"], raw if isinstance(raw, str) else json.dumps(raw))
+            out[r["dataset_id"]].append((r["activity_id"], ctx))
+    return out
+
+
+def _record(ctx_id, key, dataset_id, row_id, edge_kind, group_id, claims, propositions, objects) -> dict:
+    return {"claim_id": claims[key]["id"], "activity_id": ctx_id, "claim_key": key, "dataset_id": dataset_id,
+            "row_id": row_id, "edge_kind": edge_kind, "group_id": group_id, "proposition_id": propositions[key],
+            "_rendered": (claims, objects)}
+
+
+def implied_row_claims(con, release_id: str, rows, keys=None) -> list[dict]:
+    """The claims the release's templates make of these stored result rows, rendered now (each row once per
+    mint context): claim records carrying their rendered claim, for envelope() to serve."""
+    wanted = None if keys is None else set(keys)
+    contexts = _release_contexts(con, release_id, [r["dataset_id"] for r in rows])
+    datasets: dict[str, dict] = {}
+    out = []
+    for r in rows:
+        for activity_id, ctx in contexts[r["dataset_id"]]:
+            if ctx.template["for"] != r["kind"]:
+                continue
+            if r["dataset_id"] not in datasets:
+                datasets[r["dataset_id"]] = dataset_ns(con, r["dataset_id"])
+            claims, props, objects = _render_row(con, ctx, datasets[r["dataset_id"]], r)
+            out += [_record(activity_id, key, r["dataset_id"], r["row_id"], None, None, claims, props, objects)
+                    for key in sorted(claims) if wanted is None or key in wanted]
+    return out
+
+
+def implied_group_claims(con, release_id: str, dataset_id: str, edge_kind: str, group_id: str,
+                         keys=None) -> list[dict]:
+    """The claims the release's templates make of one edge group (every edge of a kind ending at group_id)."""
+    wanted = None if keys is None else set(keys)
+    out = []
+    dataset = None
+    for activity_id, ctx in _release_contexts(con, release_id, [dataset_id])[dataset_id]:
+        if ctx.template["for"] != edge_kind or ctx.template.get("group_by") != "to":
+            continue
+        dataset = dataset or dataset_ns(con, dataset_id)
+        claims, props, objects = _render_group(con, ctx, dataset, dataset_id, edge_kind, group_id)
+        out += [_record(activity_id, key, dataset_id, None, edge_kind, group_id, claims, props, objects)
+                for key in sorted(claims) if wanted is None or key in wanted]
+    return out
+
+
+def served_claim(con, claim_id: str) -> dict | None:
+    """The record of a collection claim that has been served (result_claims), or None."""
+    r = con.execute("SELECT * FROM result_claims WHERE claim_id = ?", (claim_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def served_claims_for_proposition(con, proposition_id: str) -> list[dict]:
+    return [dict(r) for r in con.execute("SELECT * FROM result_claims WHERE proposition_id = ?",
+                                         (proposition_id,)).fetchall()]
 
 
 def rebuild_gene_set(con, minting: dict, dataset_id: str, gene_set_id: str) -> dict | None:
@@ -198,15 +287,8 @@ def describe(con, collection: str, release: str | None = None, *, first: int = 5
         datasets.append({"id": d["dataset_id"], "dimensions": dims, "files": files,
                          "counts": store.counts(d["dataset_id"]),
                          **({"provenance": runs[d["dataset_id"]]} if d["dataset_id"] in runs else {})})
-    dataset_ids, activity_ids = release_scope(con, rel["release_id"])
-    claims = store.claim_count(dataset_ids, activity_ids)
-    if store.kind == "sql":
-        minted = con.execute(
-            "SELECT COUNT(*) AS n FROM result_claims rc JOIN release_mint_contexts rm ON rm.activity_id = rc.activity_id "
-            "AND rm.release_id = ? JOIN dapper_objects o ON o.id = rc.claim_id", (rel["release_id"],)).fetchone()["n"]
-    else:  # served collection claims are recorded with the collection's handle as their method
-        minted = con.execute("SELECT COUNT(*) AS n FROM claims WHERE method = ?",
-                             (m["collection"],)).fetchone()["n"]
+    minted = con.execute("SELECT COUNT(*) AS n FROM result_claims rc JOIN release_mint_contexts rm "
+                         "ON rm.activity_id = rc.activity_id AND rm.release_id = ?", (rel["release_id"],)).fetchone()["n"]
     return {
         "id": collection,
         "title": m["title"],
@@ -228,7 +310,7 @@ def describe(con, collection: str, release: str | None = None, *, first: int = 5
                        "file_id": t["file_id"], "claims": [c["key"] for c in t["doc"]["claims"]]}
                       for t in record["templates"]],
         "queries": sorted(record["queries"]),
-        "claims": {"mintable": claims, "minted": minted},
+        "claims": {"minted": minted},
         "provenance": provenance_sources(record),
         "dapper_document": f"/v1/collections/{collection}/releases/{rel['version']}/document",
     }
@@ -351,6 +433,7 @@ def _row_view(r, manifest, dims_cache, con):
         "metrics": {m: idn.num(row[m]) for m in kind["metrics"]},
         "columns": {c: row.get(c) for c in kind.get("keep", [])},
         "_row_id": r["row_id"],
+        "_raw": r,
     }
 
 
@@ -434,6 +517,7 @@ def run_plan(con, collection: str, qdoc: dict, bound: dict, *, release: str | No
         _attach_claims(con, rel["release_id"], rows, qdoc, claims, envelope, dataset_ids)
     for row in _walk_rows(rows, qdoc):
         row.pop("_row_id", None)
+        row.pop("_raw", None)
     return {"collection": collection, "release": {"id": rel["release_id"], "version": rel["version"]},
             "query": name, "variables": bound, "rows": rows, "warnings": warnings}
 
@@ -454,18 +538,13 @@ def _walk_rows(rows, qdoc):
 
 
 def _attach_claims(con, release_id, rows, qdoc, keys, envelope, dataset_ids=None):
-    """Serve (and assert) each row's claims and each edge group's claims,
-    limited to the release's mint contexts and the requested keys."""
-    store = get_store(con)
-    _, activities = release_scope(con, release_id)
+    """Render, serve (and assert) each row's claims and each edge group's
+    claims under the release's mint contexts, limited to the requested keys."""
     all_rows = list(_walk_rows(rows, qdoc))
-    wanted = None if keys is None else set(keys)
+    unique = {r["_row_id"]: r["_raw"] for r in all_rows}
     by_row: dict[int, dict] = {}
-    ids = sorted({r["_row_id"] for r in all_rows})
-    row_datasets = sorted({r["dataset"]["id"] for r in all_rows})
-    for rc in sorted(store.claims_for_rows(ids, row_datasets), key=lambda x: x["claim_key"]):
-        if rc["activity_id"] in activities and (wanted is None or rc["claim_key"] in wanted):
-            by_row.setdefault(rc["row_id"], {})[rc["claim_key"]] = rc
+    for rc in implied_row_claims(con, release_id, [unique[i] for i in sorted(unique)], keys):
+        by_row.setdefault(rc["row_id"], {})[rc["claim_key"]] = rc
     for r in all_rows:
         r["claims"] = {k: envelope(con, rc["claim_id"], ("collection", rc))
                        for k, rc in sorted(by_row.get(r["_row_id"], {}).items())}
@@ -476,9 +555,7 @@ def _attach_claims(con, release_id, rows, qdoc, keys, envelope, dataset_ids=None
                 e = item["edge"]
                 key = (e["dataset_id"], e["kind"], e["to"]["id"])
                 if key not in groups:
-                    groups[key] = {}
-                    for rc in sorted(store.claims_for_group(*key), key=lambda x: x["claim_key"]):
-                        if rc["activity_id"] in activities and (wanted is None or rc["claim_key"] in wanted):
-                            groups[key][rc["claim_key"]] = envelope(con, rc["claim_id"], ("collection", rc))
+                    groups[key] = {rc["claim_key"]: envelope(con, rc["claim_id"], ("collection", rc))
+                                   for rc in implied_group_claims(con, release_id, *key, keys=keys)}
                 e["claims"] = groups[key]
 
