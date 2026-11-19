@@ -111,13 +111,16 @@ Everything that asks a *result-table-shaped question* — filter by a metric,
 order by a metric, take top-N, join edges — goes through
 `POST /v1/graphql`:
 
-- per-method typed fields (`pigeanGeneAssociations`, `beta_uncorrected`
-  ordering, …) generated from the method's claim template, so claim
-  generation and query surface share one source of truth;
-- the persisted CFDE validation-challenge query, where researchers edit
-  **variables, never query text** — the constrained-query guarantee;
-- no cross-method order-by exists in the schema, so unlike scores **cannot**
-  be blended, by construction.
+- every query is a collection's query template, run with `runQuery`; the
+  catalog (`queries`, `GET /v1/queries`) says what each takes and returns.
+  Callers edit **variables, never query text** — the constrained-query
+  guarantee (the CFDE validation challenge is pigean's `top-genes-with-sets`).
+  For a question no template asks, a caller writes ordinary GraphQL
+  (`rows`, `Row.joined`, `Row.claim`), which the service checks against the
+  manifest and bounds exactly like a template, so the guarantee holds;
+- each plan step filters and orders on its own row kind's metrics only, so
+  unlike scores **cannot** be blended, by construction. (Superseded on
+  2026-11-18: there are no per-method typed fields.)
 
 ### Why there is no REST API over PIGEAN results / the index tables
 
@@ -255,6 +258,8 @@ with no endpoint tied to claims or propositions:
 | `GET /v1/objects/{id}` | Dereference ANY dapper ID (the resolver): consistent presentation for every class; JSON, or a browser landing page whose references are resolver links |
 | `GET /v1/objects` | Browse stored objects, optionally one `class_name` |
 | `GET /v1/objects/search` | `references=<id>` (objects pointing at it: the claims assessing a proposition, everything about a GeneSet, ...), `q` (statement/name/description text), `match=slot:value` (exact string slot) — **no metric filters** |
+| `POST /v1/objects:batchGet` | Many objects by id in one call (up to 500): `{"objects": {id: document}, "missing": [id]}`. A plain read; an implied claim nothing has asserted is missing, not minted |
+| `GET /v1/objects/{id}/lineage?depth=N` | One object's lineage as nodes and edges: what it references (its slots and its deposited edges such as `used_edges`), to depth 1–3, and what references it (depth 1). Edges name the slot or edge class; at most 500 nodes, with `truncated` |
 | `GET /v1/vocabulary` | What can be asked: categories, predicates, methods, metric semantics, identifier resolution (prefixes + resolver template) |
 | `GET /v1/docs`, `/v1/openapi.yaml` | The browsable REST contract |
 
@@ -274,6 +279,55 @@ constrained-query guarantee (§3). The **dereferenced claim envelope**
 full envelopes** live in GraphQL (`claim(id)`, `proposition(id)`), next to
 the queries that produce them; GraphQL also mirrors the resolver
 (`dapperObject(id)`).
+
+### Examples
+
+```bash
+curl -X POST "$API/v1/objects:batchGet" -H 'Content-Type: application/json' \
+  -d '{"ids": ["dapper:KnowledgeGap.zNV20nhHamt-a4CeAktQQPoAivOJe6xk", "dapper:Mechanism.kEJMDzCkDYE94DpWaXrQg-eC4gFGQyuX"]}'
+# {"objects": {"dapper:KnowledgeGap.zNV2...": {...}}, "missing": ["dapper:Mechanism.kEJM..."]}
+
+curl "$API/v1/objects/dapper:KnowledgeGap.zNV20nhHamt-a4CeAktQQPoAivOJe6xk/lineage?depth=2"
+# {"id": ..., "nodes": [{"id", "class_name", "name", "stored", "direction", "depth"}, ...],
+#  "edges": [{"from", "to", "label": "about_entities" | "Used" | ..., "kind": "reference" | "edge"}, ...], "truncated": false}
+```
+
+## 4.5 Deposits into a collection, and catalog releases (2026-11-18)
+
+A deposit names no collection by default, and then behaves as above: REVEAL's
+job results go in this way. A deposit may instead name an **object
+collection** (a collection whose releases are built from deposits, not from
+result files; docs/collections.md §13) and one of its open releases. Its
+objects are stored exactly as they would be without a collection (same ids,
+same receipt: `stored_differs`, `unresolved_references`), and also become
+members of that release, which the collection's named queries read once the
+release is closed.
+
+- **Grants.** A key may write into a collection only if it was granted that
+  collection in the admin console (Deposit keys → Collections). Without the
+  grant it gets 403 for the collection, and can still deposit with none.
+- **Parts.** A catalog over 1,000 objects or 16 MB goes in several deposits:
+
+```bash
+# 1. Open the release (a key granted dismech).
+curl -X POST "$API/v1/collections/dismech/releases" -H "X-API-Key: $KEY" \
+  -H 'Content-Type: application/json' -d '{"version": "2026.11.0"}'
+# 2. Send the parts. Each is an ordinary deposit naming the collection and release; resending one is safe.
+curl -X POST "$API/v1/deposits" -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"collection": "dismech", "release": "2026.11.0", "document": {"knowledge_gaps": [...], "mechanisms": [...]}}'
+# 3. Close it: its ResultCollection is minted and its named queries read it.
+curl -X POST "$API/v1/collections/dismech/releases/2026.11.0:close" -H "X-API-Key: $KEY"
+# Then query it like any collection.
+curl -X POST "$API/v1/collections/dismech/queries/gaps-by-disease:run" \
+  -H 'Content-Type: application/json' -d '{"variables": {"diseaseName": "coronary"}}'
+```
+
+- **Receipts.** A deposit into a collection reports `collection: {key,
+  release, state, objects}`; `GET /v1/deposits/{id}` and `GET /v1/deposits`
+  report `{key, release, release_id, state}` (null without a collection).
+- A deposit that names a collection with no open release is refused (409).
+  A job that wants its result in a collection must therefore deposit while a
+  release of it is open.
 
 ## 5. The rule of thumb
 

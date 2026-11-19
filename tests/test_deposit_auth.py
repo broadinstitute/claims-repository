@@ -97,7 +97,8 @@ def test_a_deposit_is_recorded_with_its_depositor_and_every_object(depositor):
     listed = anonymous.get("/v1/deposits", params={"object": claim["id"]}).json()
     assert listed["total"] == 2
     assert [d["depositor"]["name"] for d in listed["deposits"]] == ["second depositor", "test-suite depositor"]   # newest first
-    assert all(d["object_count"] == 3 and set(d) == {"deposit_id", "received_at", "object_count", "depositor"} for d in listed["deposits"])
+    assert all(d["object_count"] == 3 and set(d) == {"deposit_id", "received_at", "object_count", "depositor", "collection"}
+               and d["collection"] is None for d in listed["deposits"])
     mine = anonymous.get("/v1/deposits", params={"deposited_by": other["key_id"]}).json()
     assert mine["total"] == 1 and mine["deposits"][0]["deposit_id"] == again.json()["deposit_id"]
 

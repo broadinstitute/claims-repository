@@ -1,0 +1,14 @@
+# 2. Find the value to pass for a parameter, and what it means
+#
+# A query's dimension params (pigean's `trait` and `library`) take the values
+# the collection's datasets have. dimensionValues lists them from the
+# collection's own vocabulary: each value's label, the keys a query accepts
+# for it (a trait's PIGEAN key, e.g. T2D), its category, type and primary
+# concept, and its cross-references to other ontologies (EFO, MONDO, MESH,
+# DOID, ...). `search` matches value, label, key or cross-reference. T2D finds
+# type 2 diabetes (KPN.TRAIT:0000398) and T2D adjusted for BMI
+# (KPN.TRAIT:0000406). Try dimension "library" too.
+# The same list is at GET /v1/collections/pigean/dimensions/trait?search=T2D
+query FindATrait($search: String) {
+  dimensionValues(collection: "pigean", dimension: "trait", search: $search, first: 10)
+}

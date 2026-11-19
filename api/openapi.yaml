@@ -17,8 +17,7 @@ info:
     join). All examples are synthetic fixtures: the deposit example's objects
     are valid DAPPER at their real addresses, the File, Activity and Agent it
     references (.SYNTH… ids) are placeholders, and no example value is a
-    scientific result. Metric interpretations are provisional until the method
-    leads confirm them (Day-2 decision).
+    scientific result.
 servers:
   - url: http://127.0.0.1:8100
     description: Local development server.
@@ -266,6 +265,17 @@ paths:
         claim its data implies, else 400. Requires the
         depositor's X-API-Key, checked before the body is read; the accepted
         bundle is recorded as one deposit by that key.
+
+        A deposit may name an object collection (`collection`) and one of its
+        open releases (`release`; it may be left out while exactly one is
+        open). Its objects are then stored exactly as without a collection,
+        and also become members of that release, which the collection's named
+        queries read once the release is closed. The key must have been
+        granted the collection in the admin console (403 otherwise; a key
+        without the grant can still deposit with no collection). A closed or
+        unopened release answers 409. A catalog larger than one deposit goes
+        in several: open the release, send the parts, close it; resending a
+        part changes nothing. The receipt names the collection and release.
       security:
         - ApiKeyHeader: []
       requestBody:
@@ -276,6 +286,19 @@ paths:
               pigeanGeneClaim:
                 summary: Synthetic PIGEAN gene-phenotype claim bundle (real DAPPER-ID-1 objects, an index hint)
                 externalValue: ./examples/deposit-bundle.request.json
+              catalogPart:
+                summary: One part of a catalog release
+                value:
+                  collection: dismech
+                  release: "2026.11.0"
+                  document:
+                    knowledge_gaps:
+                      - id: dapper:KnowledgeGap.zNV20nhHamt-a4CeAktQQPoAivOJe6xk
+                        text: Are the CAD PGS x context interactions causal, or readouts?
+                        gap_description: Contexts may be downstream readouts of disease.
+                        gap_kind: KNOWLEDGE_GAP
+                        scope: Coronary Artery Disease
+                        about_entities: ["http://purl.obolibrary.org/obo/MONDO_0021661"]
             schema:
               type: object
               description: Exactly one of `document` and `objects`.
@@ -294,9 +317,19 @@ paths:
                     $ref: '#/components/schemas/DapperObject'
                 index_hints:
                   $ref: '#/components/schemas/IndexHints'
+                collection:
+                  type: string
+                  description: An object collection whose open release these objects also join. Needs a grant.
+                  example: dismech
+                release:
+                  type: string
+                  description: The open release (version) of `collection`; optional while exactly one is open.
+                  example: "2026.11.0"
       responses:
         '200':
-          description: Bundle accepted; per-object outcome reported.
+          description: >-
+            Bundle accepted; per-object outcome reported. With a collection, the receipt's
+            `collection` is {key, release, state, objects}; otherwise null.
           content:
             application/json:
               schema:
@@ -372,6 +405,10 @@ paths:
       operationId: getDeposit
       tags: [Deposit]
       summary: One deposit and the objects it carried
+      description: >-
+        The depositor, when it was received, every object it carried (created or exists, and
+        stored_differs), its edges, and `collection`: {key, release, release_id, state} when the
+        deposit named an object collection, else null. GET /v1/deposits lists the same `collection`.
       parameters:
         - { name: deposit_id, in: path, required: true, schema: { type: string, pattern: '^dep_[0-9a-f]{32}$' } }
       responses:
@@ -406,6 +443,69 @@ paths:
                             subject: { type: string }
                             predicate: { type: string }
                             object: { type: string }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/objects:batchGet:
+    post:
+      operationId: batchGetObjects
+      tags: [Objects]
+      summary: Many stored objects in one call
+      description: >-
+        Up to 500 distinct ids (duplicates are counted once). Found documents come back keyed by id,
+        presented as GET /v1/objects/{id} presents them; ids with no stored object are listed in
+        `missing`. A plain read: a claim the loaded data implies but nothing has asserted is missing, and
+        this call does not mint it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids: { type: array, maxItems: 500, items: { type: string } }
+            example:
+              ids: ["dapper:KnowledgeGap.zNV20nhHamt-a4CeAktQQPoAivOJe6xk", "dapper:Mechanism.kEJMDzCkDYE94DpWaXrQg-eC4gFGQyuX"]
+      responses:
+        '200':
+          description: '{objects: {id: document}, missing: [id]}'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  objects: { type: object, additionalProperties: { $ref: '#/components/schemas/DapperObject' } }
+                  missing: { type: array, items: { type: string } }
+        '400':
+          description: Not a list of ids, empty, or more than 500.
+  /v1/objects/{object_id}/lineage:
+    get:
+      operationId: objectLineage
+      tags: [Objects]
+      summary: An object's lineage as nodes and edges
+      description: >-
+        What the object references, followed to `depth` (1 to 3): every dapper id in its slots
+        (was_derived_from, was_generated_by, has_evidence, ...) and the deposited edges it is the subject
+        of (used_edges and other edge groups); and what references it, depth 1, from the reference
+        index. Each edge names the slot or edge class it comes from (`kind` reference or edge). Nodes
+        carry class, name, direction (self, outgoing, incoming), depth, and whether the object is stored.
+        At most 500 nodes; `truncated` says the graph was cut. A plain read.
+        Example: GET /v1/objects/dapper:KnowledgeGap.zNV20nhHamt-a4CeAktQQPoAivOJe6xk/lineage?depth=2
+      parameters:
+        - name: object_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: depth
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 3, default: 3 }
+      responses:
+        '200':
+          description: '{id, depth, nodes: [{id, class_name, name, stored, direction, depth}], edges: [{from, to, label, kind}], truncated}'
+          content:
+            application/json:
+              schema: { type: object }
         '404':
           $ref: '#/components/responses/NotFoundProblem'
   /v1/objects/{object_id}:
@@ -479,6 +579,8 @@ paths:
         the collection's claims have been minted.
       parameters:
         - $ref: '#/components/parameters/Collection'
+        - { name: first, in: query, required: false, description: 'Datasets per page (0 to 500).', schema: { type: integer, minimum: 0, maximum: 500, default: 50 } }
+        - { name: offset, in: query, required: false, description: 'First dataset of the page; datasets_page.next_offset gives the next.', schema: { type: integer, minimum: 0, default: 0 } }
         - name: release
           in: query
           required: false
@@ -492,11 +594,197 @@ paths:
               schema: { type: object }
         '404':
           $ref: '#/components/responses/NotFoundProblem'
+  /v1/queries:
+    get:
+      operationId: queryCatalog
+      tags: [Collections]
+      summary: Every query the repository answers, described for runQuery (start here)
+      description: >-
+        Returns {guide, queries}. `guide` explains how to call runQuery (GraphQL
+        or REST), its arguments, and the shape of a result row, join item and
+        claim envelope. Each entry in `queries` names a collection's query
+        template and gives its params (type, default, bounds; a dimension param
+        also gives a sample of its values and the URL that lists them all), the
+        rows it returns (kinds, entities, metrics with their meaning, joins),
+        the claim keys `claims` accepts, its plan, and a GraphQL and a REST
+        request that run as given. Derived from each collection's current
+        release manifest. GraphQL: `queries`.
+      parameters:
+        - name: collection
+          in: query
+          required: false
+          description: Only this collection's queries.
+          schema: { type: string }
+        - name: release
+          in: query
+          required: false
+          description: With `collection`, a version or release id instead of the current release.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The guide and the query entries.
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/collections/{collection}/dimensions/{dimension}:
+    get:
+      operationId: collectionDimensionValues
+      tags: [Collections]
+      summary: The values a dataset dimension takes (what to pass for a dimension param)
+      description: >-
+        Each value with its label, the other keys a query accepts for it (a
+        trait's legacy or PIGEAN key), and its number of datasets.
+        GraphQL: `dimensionValues`.
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: dimension
+          in: path
+          required: true
+          schema: { type: string }
+        - name: search
+          in: query
+          required: false
+          description: Case-insensitive match on value, label or accepted key.
+          schema: { type: string }
+        - name: first
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+        - name: release
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: '{collection, release, dimension, count, values: [{value, label, datasets, also_accepts}], truncated}'
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/collections/{collection}/releases:
+    post:
+      operationId: openObjectRelease
+      tags: [Collections]
+      summary: Open a release of an object collection
+      description: >-
+        An object collection (kind: objects) is registered from its directory
+        (scripts/publish_collection.py). A key granted the collection opens a release here, deposits
+        into it (POST /v1/deposits with `collection` and `release`, in as many parts as needed), then
+        closes it. 201 when opened; 200 when it was already open. 409 if the version is closed.
+      security:
+        - ApiKeyHeader: []
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                version: { type: string }
+            example: { version: "2026.11.0" }
+      responses:
+        '201':
+          description: '{collection, version, state: open, release_id: null, opened_at, closed_at: null}'
+          content:
+            application/json:
+              schema: { type: object }
+        '200':
+          description: Already open; returned unchanged.
+          content:
+            application/json:
+              schema: { type: object }
+        '403':
+          description: The key was not granted this collection.
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+        '409':
+          description: That version is closed (or a file-based release of it exists).
+  /v1/collections/{collection}/releases/{version}:
+    get:
+      operationId: objectReleaseStatus
+      tags: [Collections]
+      summary: An object collection release's state and contents
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: version
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: '{collection, version, state, release_id, opened_at, closed_at, objects, classes: {class: n}, deposits}'
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/collections/{collection}/releases/{version}:close:
+    post:
+      operationId: closeObjectRelease
+      tags: [Collections]
+      summary: Close an object collection release
+      description: >-
+        Mints the release's DAPPER ResultCollection (one Dataset per class of member objects, each with
+        a File listing their ids, plus the manifest and query template Files), records it, and makes it
+        the collection's current release: its named queries now read it. Closing again returns it
+        unchanged. The response adds `unresolved_references`: ids the members reference that this
+        repository does not hold (the first 100).
+        Example: POST /v1/collections/dismech/releases/2026.11.0:close
+      security:
+        - ApiKeyHeader: []
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: version
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The release status, closed, with its release_id.
+          content:
+            application/json:
+              schema: { type: object }
+        '403':
+          description: The key was not granted this collection.
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+        '409':
+          description: The release holds no objects.
+  /v1/collections/{collection}/releases/{version}/members:
+    get:
+      operationId: objectReleaseMembers
+      tags: [Collections]
+      summary: The member ids of one class in a closed object release
+      description: The bytes of the release's members File for that class (one id per line); its sha256 is in the release document.
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: version
+          in: path
+          required: true
+          schema: { type: string }
+        - name: class
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: One dapper id per line.
+          content:
+            text/plain:
+              schema: { type: string }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
   /v1/collections/{collection}/queries:
     get:
       operationId: listCollectionQueries
       tags: [Collections]
-      summary: A collection's query templates, each with a runnable example
+      summary: A collection's entries from GET /v1/queries
       parameters:
         - $ref: '#/components/parameters/Collection'
         - name: release
@@ -505,7 +793,7 @@ paths:
           schema: { type: string }
       responses:
         '200':
-          description: Description, parameters, plan and an example REST body and GraphQL call per query.
+          description: '{collection, queries}: the same entries as GET /v1/queries, for one collection.'
           content:
             application/json:
               schema: { type: object }
@@ -592,17 +880,14 @@ paths:
     post:
       operationId: graphql
       tags: [GraphQL]
-      summary: The query surface (GraphQL over composed method modules)
+      summary: The query surface (GraphQL)
       description: >-
-        Standard GraphQL-over-HTTP endpoint executing the schema composed from
-        api/graphql/core.graphql plus every registered method module in
-        api/graphql/methods/ (design: docs/method-modules.md). Introspection is
-        enabled; standard depth/complexity limits apply. Execution semantics
-        (anchor limits before joins, deterministic ties, empty-vs-missing
-        distinction, no score blending) are documented on the schema fields
-        themselves. The Day-10 CFDE validation challenge is the persisted query
-        api/graphql/queries/ibd-validation-challenge.graphql with its
-        researcher-editable variables. Clients cannot write through GraphQL (no
+        Standard GraphQL-over-HTTP endpoint executing api/graphql/core.graphql
+        plus api/graphql/collections.graphql. Results are read only through
+        collections: `queries` lists every query template with what it takes
+        and returns, and `runQuery` runs one (the CFDE validation challenge is
+        the pigean collection's top-genes-with-sets). There are no per-method
+        fields. Introspection is enabled. Clients cannot write through GraphQL (no
         Mutation type; deposit stays on POST /v1/deposits), but serving a result
         MINTS the claim it implies: the claim is synthesized from its index row,
         verified, and recorded with every assertion in one batch after the whole
@@ -720,6 +1005,8 @@ components:
       description: >-
         Optional. Each declares the graph edge of one Claim (in this deposit or already stored) for the PIGEAN
         index, so indexing never guesses entity categories from proposition text. A hint may not overwrite a loaded row.
+        Legacy: since 2026-11-18 no query reads the PIGEAN index (results are read through collections), so a
+        hint only records the edge; the deposited claim itself is served by claim(id) and /v1/objects either way.
       items:
         type: object
         required: [claim_id, method, predicate, subject, object]
@@ -741,16 +1028,13 @@ components:
         id: { type: string, description: 'Canonical ID for the category: HGNC symbol, portal trait key, or full gene-set name.' }
     MetricSemantics:
       type: object
-      required: [score_kind, scale, better, confirmed, description]
+      required: [score_kind, scale, better, description]
       properties:
         score_kind:
           type: string
           enum: [PROBABILITY, POSTERIOR_PROBABILITY, EFFECT_ESTIMATE, LOADING, SCORE]
         scale: { type: string, examples: ['log posterior odds'] }
-        better: { type: string, enum: [higher, lower, n/a, unconfirmed] }
-        confirmed:
-          type: boolean
-          description: False until the method leads confirm the interpretation; UIs must surface unconfirmed semantics as provisional.
+        better: { type: string, enum: [higher, lower] }
         description: { type: string }
     Depositor:
       type: object

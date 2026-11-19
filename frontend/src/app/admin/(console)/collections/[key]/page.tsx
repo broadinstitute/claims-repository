@@ -203,7 +203,6 @@ const metricColumns: ColumnDef<MetricInfo, unknown>[] = [
   { id: "scoreKind", accessorKey: "scoreKind", header: "Score kind", cell: ({ row }) => <Mono>{row.original.scoreKind}</Mono> },
   { id: "scale", accessorKey: "scale", header: "Scale" },
   { id: "better", accessorKey: "better", header: "Better" },
-  { id: "confirmed", accessorFn: r => (r.confirmed ? 1 : 0), header: "Status", cell: ({ row }) => row.original.confirmed ? <Status tone="good">confirmed</Status> : <Status tone="warn">provisional</Status> },
   { id: "interpretation", header: "Meaning", enableSorting: false, meta: { width: 380 }, cell: ({ row }) => <div className="min-w-64 space-y-1 text-xs">
     {row.original.description && <div>{row.original.description}</div>}
     {row.original.interpretation && <div className="text-muted-foreground">{row.original.interpretation}</div>}
@@ -217,13 +216,12 @@ function tierRange(t: Tier) {
 }
 
 function TierRule({ name, spec }: { name: string; spec: Spec }) {
-  const { version, status, description, tiers, ...rest } = spec as { version?: string; status?: string; description?: string; tiers?: Tier[]; [k: string]: unknown };
+  const { version, description, tiers, ...rest } = spec as { version?: string; description?: string; tiers?: Tier[]; [k: string]: unknown };
   return (
     <div className="space-y-2 py-4 first:pt-0 last:pb-0">
       <div className="flex flex-wrap items-center gap-2">
         <Mono className="text-sm font-medium">{name}</Mono>
         {version && <span className="text-xs text-muted-foreground">v{String(version)}</span>}
-        {status && <Status tone={status === "provisional" ? "warn" : "neutral"}>{String(status)}</Status>}
       </div>
       {description && <p className="text-xs text-muted-foreground">{String(description)}</p>}
       {Array.isArray(tiers) && <ol className="space-y-0.5 text-xs">
@@ -399,7 +397,7 @@ function CollectionView() {
         {d.templates.length ? <div className="divide-y divide-border/50">{d.templates.map(t => <Template key={t.name} d={d} t={t} onOpen={open} />)}</div>
           : <p className="px-5 py-4 text-sm text-muted-foreground">This release has no claim templates.</p>}
       </Panel>
-      <Panel title="Metrics" description="What each score means. Provisional interpretations are marked as such in the claims until the method's owners confirm them.">
+      <Panel title="Metrics" description="What each score means, as every claim of this collection states it.">
         <DataTable label="Metrics" data={d.metrics} columns={metricColumns} getRowId={m => m.name} empty="This collection declares no metrics." />
       </Panel>
       <Panel title="Tier rules" padded description="Declared thresholds that classify a score into an evidence tier. Tiers are checked top-down and the first match wins.">

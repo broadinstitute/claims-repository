@@ -36,9 +36,21 @@ relations:
 
 # Each dataset is one (trait, library) slice.
 dataset_dimensions:
-  - name: trait
-    resolve: kpn-traits     # IBD -> KPN.TRAIT:0000505, labelled from the registry
-  - name: library           # gene-set library, e.g. cfde-inc-v2
+  - name: trait             # a PIGEAN key, mapped by mappings/trait.tsv: IBD -> KPN.TRAIT:0000505
+  - name: library           # gene-set library, e.g. mouse_msigdb
+
+# The collection's own vocabulary: PIGEAN trait keys -> KPN trait ids, with
+# each id's label, category, type and primary concept (mappings/trait.tsv),
+# and its cross-references to other ontologies (mappings/trait.sssom.tsv).
+# Written by `claims vocab check --write-template` from a kpn-data-models
+# trait release; the service reads nothing else. A key the file does not map
+# keeps its value as given.
+mappings:
+  trait: mappings/trait.tsv
+xrefs:
+  trait: mappings/trait.sssom.tsv
+unmapped:
+  trait: keep-raw
 
 # How a file value becomes an identifier. Values are taken as the files give
 # them (gene symbols today); only the prefix is declared here.
@@ -94,56 +106,62 @@ metrics:
     score_kind: SCORE
     scale: log posterior odds
     better: higher
-    confirmed: false
-    description: Combined gene-phenotype support from direct GWAS evidence plus gene-set prior evidence. Not a probability.
+    description: >-
+      Combined gene-trait support: direct GWAS evidence (log_bf) plus gene-set
+      evidence (prior). Not a probability. Rank genes by this.
     interpretation: >-
-      PIGEAN combined log posterior odds of gene-phenotype association (direct
-      GWAS plus gene-set prior evidence); log scale, larger is stronger.
-      PROVISIONAL interpretation pending method-lead confirmation.
+      PIGEAN combined log posterior odds of gene-trait association: direct
+      GWAS evidence plus gene-set prior evidence; log scale, larger is stronger.
   log_bf:
     score_kind: SCORE
     scale: log Bayes factor
     better: higher
-    confirmed: false
-    description: Direct GWAS support for the gene-phenotype association. Not a probability.
+    description: >-
+      Direct GWAS support for the gene-trait association. Runs from 0 to 5.2: 0
+      means no direct GWAS signal (most genes), and the strongest direct support
+      is reported as 5.2, so top genes often tie there; order them by combined
+      or prior.
     interpretation: >-
       PIGEAN log Bayes factor from direct GWAS evidence; log scale, larger is
-      stronger. PROVISIONAL.
+      stronger. 0 means no direct GWAS signal near the gene; values are reported
+      between 0 and 5.2.
   prior:
     score_kind: SCORE
     scale: log prior odds
     better: higher
-    confirmed: false
-    description: Indirect support contributed by gene-set membership evidence.
+    description: >-
+      Indirect support from the gene sets the gene belongs to. Can be negative:
+      below 0, the gene's sets lower its odds relative to a typical gene.
     interpretation: >-
       PIGEAN log prior odds contributed by gene-set membership evidence; log
-      scale. PROVISIONAL.
+      scale, larger is stronger, negative when the gene's sets lower its odds.
   beta:
     score_kind: EFFECT_ESTIMATE
     scale: log-odds effect
     better: higher
-    confirmed: false
-    description: Gene-set effect estimated jointly with the other selected gene sets (corrected).
+    description: >-
+      Gene-set effect estimated jointly with the other selected gene sets
+      (corrected). Near 0 when other sets explain the same signal.
     interpretation: >-
-      PIGEAN gene-set effect estimated jointly with other selected gene sets
-      (corrected); log-odds scale. PROVISIONAL.
+      PIGEAN gene-set effect estimated jointly with the other selected gene
+      sets (corrected); log-odds scale.
   beta_uncorrected:
     score_kind: EFFECT_ESTIMATE
     scale: log-odds effect
     better: higher
-    confirmed: false
-    description: Marginal gene-set effect, uncorrected for other gene sets.
+    description: >-
+      Marginal gene-set effect, not corrected for other gene sets. A set with a
+      large marginal effect and a joint beta near 0 shares its signal with
+      other sets.
     interpretation: >-
       PIGEAN marginal gene-set effect, not corrected for other gene sets;
-      log-odds scale. PROVISIONAL.
+      log-odds scale.
 
 # Declared threshold rules. Tiers evaluate top-down, first match wins; `min` is
-# inclusive and a tier without `min` is the catch-all. Provisional until the
-# PIGEAN method leads sign off on the boundaries and the scores' log base.
+# inclusive and a tier without `min` is the catch-all.
 tier_rules:
   gene-evidence-tiers:
     version: 0.1.0
-    status: provisional
     description: Evidence tiers for PIGEAN gene-level scores (combined, log_bf, prior).
     tiers:
       - {label: very strong, min: 3}
@@ -153,7 +171,6 @@ tier_rules:
     direction: {supports_min: 1, otherwise: NEUTRAL}
   gene-set-effect-tiers:
     version: 0.1.0
-    status: provisional
     description: Effect-size tiers for PIGEAN gene-set scores (beta, beta_uncorrected).
     tiers:
       - {label: extremely significant, min: 1}
@@ -163,9 +180,6 @@ tier_rules:
     direction: {supports_min: 0.01, otherwise: NEUTRAL}
 
 assumptions:
-  - >-
-    Tier boundaries and the scores' log base are provisional until confirmed by
-    the PIGEAN method leads.
   - >-
     PIGEAN scores are method-specific log-scale quantities, not probabilities;
     a tier classifies evidence strength under the named rule, not truth.
@@ -177,3 +191,5 @@ templates:
 
 queries:
   - queries/top-genes-with-sets.yaml
+  - queries/gene-across-traits.yaml
+  - queries/gene-set-across-traits.yaml

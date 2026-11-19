@@ -1,0 +1,21 @@
+query: gene-sets-in-collection
+description: Gene-set collections whose name contains a text, each with its largest gene sets.
+params:
+  name:
+    type: string
+    required: true
+    description: Part of the collection's name, any case.
+  setsPerCollection:
+    type: integer
+    default: 10
+    min: 0
+    max: 200
+plan:
+  - anchor:
+      class: GeneSetCollection
+      where: {name: {contains: $name}}
+      order: {field: name}
+      limit: 5
+  - referenced_by: {as: sets, class: GeneSet, link: collection, order: {field: size, dir: desc}, limit_per_anchor: $setsPerCollection}
+example:
+  name: cfde

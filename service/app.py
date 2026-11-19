@@ -21,7 +21,6 @@ from pathlib import Path
 from urllib.parse import quote
 
 from ariadne import ObjectType, QueryType, ScalarType, graphql_sync, make_executable_schema
-from ariadne.explorer import ExplorerGraphiQL
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -29,19 +28,25 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
 from . import api_keys
+from . import explorer
+from . import objects as obj_reads
 from . import dapper_validation as dval
 from . import db
 from . import pigean_template as tpl
 from . import telemetry
+from .collections import catalog as ccatalog
 from .collections import identity as cidn
+from .collections import objects as cobjects
+from .collections import rows as crows
 from .collections import serve as cserve
+from .collections import store as cstore
 from .collections.manifest import ManifestError
 from .refs import DAPPER_ID_RE, MAX_ID_LENGTH, dapper_refs
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_VERSION = "0.2.0"
 DAPPER_PROFILE = "0.2.0-a1"
-DEFAULT_COLLECTION = "cfde-inc-v2"
+DEFAULT_COLLECTION = "cfde-inc-v2"  # deposit hints' default gene-set collection
 
 # Identity vs location (design decision 2026-11-09, per Chase): the
 # content-addressed CURIE (dapper:{Class}.{digest}) is the canonical,
@@ -86,58 +91,55 @@ PIGEAN_METRICS = {
         "score_kind": "SCORE",
         "scale": "log posterior odds",
         "better": "higher",
-        "confirmed": False,
         "description": "Combined gene-phenotype support from direct GWAS evidence plus gene-set prior evidence. Not a probability.",
     },
     "log_bf": {
         "score_kind": "SCORE",
         "scale": "log Bayes factor",
         "better": "higher",
-        "confirmed": False,
         "description": "Direct GWAS support for the gene-phenotype association. Not a probability.",
     },
     "prior": {
         "score_kind": "SCORE",
         "scale": "log prior odds",
         "better": "higher",
-        "confirmed": False,
         "description": "Indirect support contributed by gene-set membership evidence.",
     },
     "beta": {
         "score_kind": "EFFECT_ESTIMATE",
         "scale": "log-odds effect",
         "better": "higher",
-        "confirmed": False,
         "description": "Gene-set effect estimated jointly with the other selected gene sets (corrected).",
     },
     "beta_uncorrected": {
         "score_kind": "EFFECT_ESTIMATE",
         "scale": "log-odds effect",
         "better": "higher",
-        "confirmed": False,
         "description": "Marginal gene-set effect, uncorrected for other gene sets.",
     },
 }
 
-GENE_FILTER_COLS = {"prior": "prior", "combined": "combined", "logBf": "log_bf"}
-GENE_ORDER_COLS = {"COMBINED": "combined", "LOG_BF": "log_bf", "PRIOR": "prior"}
-SET_FILTER_COLS = {"beta": "beta", "betaUncorrected": "beta_uncorrected"}
-SET_ORDER_COLS = {"BETA": "beta", "BETA_UNCORRECTED": "beta_uncorrected"}
-FILTER_OPS = {"lt": "<", "lte": "<=", "gt": ">", "gte": ">=", "eq": "=", "ne": "!="}
-
-
 def _load_type_defs() -> str:
-    parts = [(ROOT / "api" / "graphql" / name).read_text() for name in ("core.graphql", "collections.graphql")]
-    for mod in sorted((ROOT / "api" / "graphql" / "methods").glob("*.graphql")):
-        parts.append(mod.read_text())
-    return "\n".join(parts)
+    return "\n".join((ROOT / "api" / "graphql" / name).read_text() for name in ("core.graphql", "collections.graphql"))
 
 
 # ---------------------------------------------------------------------------
 # Shared fetch/view helpers
 
 
+def _pending(con) -> dict:
+    """Objects rendered for a claim served in this request and not stored yet
+    (a lazy store stores them with the claim at the end of the request)."""
+    pending = getattr(con, "pending_objects", None)
+    if pending is None:
+        pending = con.pending_objects = {}
+    return pending
+
+
 def _fetch_payload(con, object_id):
+    pending = getattr(con, "pending_objects", None) or {}
+    if object_id in pending:
+        return pending[object_id]
     row = con.execute("SELECT payload FROM dapper_objects WHERE id = ?", (object_id,)).fetchone()
     return json.loads(row["payload"]) if row else None
 
@@ -159,14 +161,16 @@ def _present_object(payload: dict) -> dict:
 def _fetch_payloads(con, object_ids):
     """Batch dereference: one IN query instead of one round trip per object
     (the difference between ~1 ms and ~25 ms per object against Aurora)."""
-    ids = [i for i in object_ids if i]
+    pending = getattr(con, "pending_objects", None) or {}
+    found = {i: pending[i] for i in object_ids if i and i in pending}
+    ids = [i for i in object_ids if i and i not in found]
     if not ids:
-        return {}
+        return found
     marks = ",".join("?" * len(ids))
     rows = con.execute(
         f"SELECT id, payload FROM dapper_objects WHERE id IN ({marks})", ids
     ).fetchall()
-    return {r["id"]: json.loads(r["payload"]) for r in rows}
+    return {**found, **{r["id"]: json.loads(r["payload"]) for r in rows}}
 
 
 def _id_list(value) -> list:
@@ -216,7 +220,7 @@ CLAIM_SOURCES = (
 def _index_source(con, claim_id, families=None):
     """The template-backed index row that implies this claim, or None."""
     if not families or "collection" in families:
-        rc = con.execute("SELECT * FROM result_claims WHERE claim_id = ?", (claim_id,)).fetchone()
+        rc = cstore.get_store(con).claim(claim_id)
         if rc is not None:
             return "collection", rc
     for family, table in CLAIM_SOURCES:
@@ -319,7 +323,9 @@ def envelope(con, claim_id, assert_claim=True, source=None):
         synthesized = None
         if collection:
             try:
-                synthesized = cserve.render_claim(con, source[1])
+                synthesized, data_plane = cserve.render_claim_full(con, source[1])
+                if data_plane:
+                    _stage_objects(con, data_plane)
             except (cserve.ClaimRenderError, cserve.engine.TemplateError, cidn.MintError) as exc:
                 raise ClaimSynthesisError(str(exc)) from exc
         elif source is not None and _inputs_of(source[1]) is not None:
@@ -377,11 +383,14 @@ def envelope(con, claim_id, assert_claim=True, source=None):
     refs_to_resolve = gene_set_refs + file_refs
     resolution = "UNRESOLVED"
     if refs_to_resolve:
-        placeholders = ",".join("?" * len(refs_to_resolve))
-        found = con.execute(
-            f"SELECT COUNT(*) AS c FROM dapper_objects WHERE id IN ({placeholders})",
-            refs_to_resolve,
-        ).fetchone()["c"]
+        pending = getattr(con, "pending_objects", None) or {}
+        unstored = [r for r in refs_to_resolve if r not in pending]
+        found = len(refs_to_resolve) - len(unstored)
+        if unstored:
+            placeholders = ",".join("?" * len(unstored))
+            found += con.execute(
+                f"SELECT COUNT(*) AS c FROM dapper_objects WHERE id IN ({placeholders})", unstored,
+            ).fetchone()["c"]
         resolution = "RESOLVED" if found == len(refs_to_resolve) else "UNRESOLVED"
     triple = _triple_of(proposition)
     evidence = []
@@ -444,11 +453,34 @@ def _well_formed_score(s) -> bool:
     )
 
 
+def _stage_objects(con, objects: dict) -> None:
+    """Queue a served claim's data-plane objects that are not stored yet."""
+    pending = _pending(con)
+    missing = [oid for oid in objects if oid not in pending]
+    if not missing:
+        return
+    stored = set()
+    for i in range(0, len(missing), 500):
+        chunk = missing[i:i + 500]
+        stored |= {r["id"] for r in con.execute(
+            f"SELECT id FROM dapper_objects WHERE id IN ({','.join('?' * len(chunk))})", chunk).fetchall()}
+    for oid in missing:
+        if oid not in stored:
+            pending[oid] = objects[oid]
+
+
 def _flush_assertions(con):
     """Write the request's recorded assertions in one batch, sorted by claim
     id (deterministic lock order). Upserts mint new claims and count
     re-assertions (times_seen += 1) alike; a claim minted concurrently by
     another request is simply counted."""
+    pending = getattr(con, "pending_objects", None) or {}
+    if pending:
+        items = sorted(pending.items())
+        con.executemany(f"{con.dialect.insert_or_ignore} dapper_objects (id, class_name, identity_profile, payload) "
+                        "VALUES (?, ?, ?, ?)",
+                        [(oid, cidn.class_of(oid), cidn.PROFILE, cidn.canonical(doc)) for oid, doc in items])
+        con.executemany(con.dialect.insert_ref, sorted({(oid, ref) for oid, doc in items for ref in dapper_refs(doc)}))
     assertions = getattr(con, "assertions", None) or {}
     if not assertions:
         return
@@ -539,7 +571,7 @@ def _in(keys):
     return "IN (" + ",".join("?" * len(keys)) + ")"
 
 
-def _phenotype_view(con, key, trait_group):
+def _phenotype_view(con, key, trait_group=None):
     rec = _trait(con, key)
     if rec is None:
         return {"id": key, "legacyId": None, "name": None, "traitGroup": trait_group, "category": None,
@@ -556,94 +588,10 @@ def _phenotype_view(con, key, trait_group):
     }
 
 
-def _gene_assoc_view(con, row):
-    return {
-        "gene": {"symbol": row["gene"]},
-        "phenotype": _phenotype_view(con, row["phenotype"], row["trait_group"]),
-        "collection": row["collection"],
-        "combined": row["combined"],
-        "logBf": row["log_bf"],
-        "prior": row["prior"],
-        # Serving a result row asserts the claim it implies (minted on first serve).
-        "claim": envelope(con, row["claim_id"], source=("gene", row)),
-    }
-
-
-def _dapper_gene_set_id(con, collection, name):
-    row = con.execute(
-        "SELECT dapper_id FROM gene_set_entities WHERE collection = ? AND name = ?",
-        (collection, name),
-    ).fetchone()
-    return row["dapper_id"] if row else None
-
-
-def _set_view(con, row):
-    # Prefer the entity this row's claim was built against (its synthesis
-    # inputs) over the latest-entity lookup, which a later load may move.
-    inputs = _inputs_of(row) if "synthesis_inputs" in row.keys() else None
-    subject = (inputs or {}).get("subject")
-    if not (isinstance(subject, str) and subject.startswith("dapper:GeneSet.")):
-        subject = _dapper_gene_set_id(con, row["collection"], row["gene_set"])
-    return {
-        "name": row["gene_set"],
-        "source": row["source"] or "",
-        "collection": row["collection"],
-        "dapperGeneSetId": subject,
-    }
-
-
-def _set_assoc_view(con, row):
-    return {
-        "geneSet": _set_view(con, row),
-        "phenotype": _phenotype_view(con, row["phenotype"], row["trait_group"]),
-        "collection": row["collection"],
-        "beta": row["beta"],
-        "betaUncorrected": row["beta_uncorrected"],
-        "claim": envelope(con, row["claim_id"], source=("gene_set", row)),
-    }
-
-
-def _where_sql(where, colmap):
-    frags, params = [], []
-    for field, conds in (where or {}).items():
-        col = colmap[field]
-        for op, value in (conds or {}).items():
-            frags.append(f"AND {col} {FILTER_OPS[op]} ?")
-            params.append(value)
-    return " ".join(frags), params
-
-
-def _gene_assoc_rows(con, phenotype, collection, where, order_by, limit):
-    where_sql, params = _where_sql(where, GENE_FILTER_COLS)
-    field = (order_by or {}).get("field", "COMBINED")
-    direction = "DESC" if (order_by or {}).get("dir", "DESC") == "DESC" else "ASC"
-    keys = _phenotype_keys(con, phenotype)
-    sql = (
-        f"SELECT * FROM pigean_gene_associations WHERE phenotype {_in(keys)} AND collection = ? "
-        f"{where_sql} ORDER BY {GENE_ORDER_COLS[field]} {direction}, gene ASC LIMIT ?"
-    )
-    return con.execute(sql, [*keys, collection, *params, limit]).fetchall()
-
-
-def _set_assoc_rows(con, phenotype, collection, where, order_by, limit):
-    where_sql, params = _where_sql(where, SET_FILTER_COLS)
-    field = (order_by or {}).get("field", "BETA_UNCORRECTED")
-    direction = "DESC" if (order_by or {}).get("dir", "DESC") == "DESC" else "ASC"
-    keys = _phenotype_keys(con, phenotype)
-    sql = (
-        f"SELECT * FROM pigean_gene_set_associations WHERE phenotype {_in(keys)} AND collection = ? "
-        f"{where_sql} ORDER BY {SET_ORDER_COLS[field]} {direction}, gene_set ASC LIMIT ?"
-    )
-    return con.execute(sql, [*keys, collection, *params, limit]).fetchall()
-
-
 # ---------------------------------------------------------------------------
 # GraphQL resolvers
 
 query = QueryType()
-phenotype_type = ObjectType("Phenotype")
-gene_type = ObjectType("Gene")
-gene_set_type = ObjectType("GeneSet")
 json_scalar = ScalarType("JSON")
 
 
@@ -651,129 +599,9 @@ def _con(info):
     return info.context["con"]
 
 
-# Argument bounds: one read request must not be able to mint / assert an
-# unbounded number of claims (each served row asserts its claim).
-MAX_ROWS = 500
-MAX_TOP_GENES = 200
-MAX_SETS_PER_GENE = 50
-
-
-def _bounded(name, value, upper, lower=0):
-    if value is None or not (lower <= value <= upper):
-        raise ValueError(f"{name} must be between {lower} and {upper}, got {value}")
-    return value
-
-
 @query.field("health")
 def resolve_health(*_):
     return {"status": "ok", "contractVersion": CONTRACT_VERSION, "dapperProfile": DAPPER_PROFILE}
-
-
-@query.field("methods")
-def resolve_methods(*_):
-    return [
-        {
-            "name": "pigean",
-            "metrics": [
-                {
-                    "metric": name,
-                    "scoreKind": sem["score_kind"],
-                    "scale": sem["scale"],
-                    "better": sem["better"].upper(),
-                    "confirmed": sem["confirmed"],
-                    "description": sem["description"],
-                }
-                for name, sem in PIGEAN_METRICS.items()
-            ],
-        }
-    ]
-
-
-@query.field("phenotype")
-def resolve_phenotype(_, info, id):
-    """Accepts a KPN.TRAIT ID, a legacy portal key (IBD), or a PIGEAN key."""
-    con = _con(info)
-    keys = _phenotype_keys(con, id)
-    row = con.execute(
-        f"SELECT phenotype, trait_group FROM pigean_gene_associations WHERE phenotype {_in(keys)} "
-        f"UNION SELECT phenotype, trait_group FROM pigean_gene_set_associations WHERE phenotype {_in(keys)} "
-        "LIMIT 1",
-        (*keys, *keys),
-    ).fetchone()
-    if row is not None:
-        return _phenotype_view(con, row["phenotype"], row["trait_group"])
-    if _trait(con, id) is not None:  # registered trait without loaded results
-        return _phenotype_view(con, id, None)
-    return None
-
-
-@query.field("phenotypes")
-def resolve_phenotypes(_, info, search=None, first=20):
-    """Phenotypes with loaded results; `search` matches the trait ID, legacy
-    key, or name (case-insensitive)."""
-    _bounded("first", first, MAX_ROWS)
-    con = _con(info)
-    rows = con.execute(
-        "SELECT DISTINCT phenotype, trait_group FROM pigean_gene_associations ORDER BY phenotype"
-    ).fetchall()
-    views, seen = [], set()
-    needle = (search or "").lower()
-    for r in rows:
-        view = _phenotype_view(con, r["phenotype"], r["trait_group"])
-        if view["id"] in seen:
-            continue
-        haystack = " ".join(str(view.get(k) or "") for k in ("id", "legacyId", "name")).lower()
-        if needle in haystack:
-            seen.add(view["id"])
-            views.append(view)
-    return views[:first]
-
-
-@phenotype_type.field("mappings")
-def resolve_trait_mappings(obj, info, ontology=None):
-    sql = ("SELECT target_id, ontology, predicate, label, confidence, justification, source "
-           "FROM kpn_trait_mappings WHERE trait_id = ?")
-    params = [obj["id"]]
-    if ontology:
-        sql += " AND ontology = ?"
-        params.append(ontology)
-    return [
-        {"targetId": r["target_id"], "ontology": r["ontology"], "predicate": r["predicate"], "label": r["label"],
-         "confidence": r["confidence"], "justification": r["justification"], "source": r["source"]}
-        for r in _con(info).execute(sql + " ORDER BY confidence DESC, target_id", params).fetchall()
-    ]
-
-
-@query.field("gene")
-def resolve_gene(_, info, symbol):
-    row = info.context["con"].execute(
-        "SELECT 1 FROM pigean_gene_associations WHERE gene = ? LIMIT 1", (symbol,)
-    ).fetchone()
-    return {"symbol": symbol} if row else None
-
-
-@query.field("geneSet")
-def resolve_gene_set(_, info, name, collection=None, phenotype=None):
-    """With `phenotype`, the set as that phenotype's PIGEAN run observed it
-    (its GeneSet entity, and members default to that phenotype); without it,
-    the first observation in (collection, phenotype) order."""
-    con = _con(info)
-    sql = "SELECT * FROM pigean_gene_set_associations WHERE gene_set = ?"
-    params = [name]
-    if collection:
-        sql += " AND collection = ?"
-        params.append(collection)
-    if phenotype:
-        keys = _phenotype_keys(con, phenotype)
-        sql += f" AND phenotype {_in(keys)}"
-        params.extend(keys)
-    row = con.execute(sql + " ORDER BY collection, phenotype LIMIT 1", params).fetchone()
-    if row is None:
-        return None
-    view = _set_view(con, row)
-    if phenotype:
-        view["_phenotype"] = phenotype
-    return view
 
 
 @query.field("claim")
@@ -808,7 +636,7 @@ def resolve_proposition(_, info, id):
             (id,),
         ).fetchall():
             sources[r["claim_id"]] = (family, r)
-    for r in con.execute("SELECT * FROM result_claims WHERE proposition_id = ?", (id,)).fetchall():
+    for r in cstore.get_store(con).claims_for_proposition(id):
         sources[r["claim_id"]] = ("collection", r)
     envelopes = [e for e in (envelope(con, cid, source=src) for cid, src in sorted(sources.items())) if e]
     return {
@@ -817,193 +645,6 @@ def resolve_proposition(_, info, id):
         "triple": _triple_of(payload),
         "claims": envelopes,
     }
-
-
-@phenotype_type.field("pigeanGeneAssociations")
-def resolve_pheno_gene_assocs(obj, info, collection=DEFAULT_COLLECTION, where=None, orderBy=None, first=20):
-    _bounded("first", first, MAX_ROWS)
-    con = _con(info)
-    return [_gene_assoc_view(con, r) for r in _gene_assoc_rows(con, obj["id"], collection, where, orderBy, first)]
-
-
-@phenotype_type.field("pigeanGeneSetAssociations")
-def resolve_pheno_set_assocs(obj, info, collection=DEFAULT_COLLECTION, where=None, orderBy=None, first=20):
-    _bounded("first", first, MAX_ROWS)
-    con = _con(info)
-    return [_set_assoc_view(con, r) for r in _set_assoc_rows(con, obj["id"], collection, where, orderBy, first)]
-
-
-@gene_type.field("pigeanAssociation")
-def resolve_gene_assoc(obj, info, phenotype, collection=DEFAULT_COLLECTION):
-    con = _con(info)
-    keys = _phenotype_keys(con, phenotype)
-    row = con.execute(
-        f"SELECT * FROM pigean_gene_associations WHERE phenotype {_in(keys)} AND collection = ? AND gene = ? LIMIT 1",
-        (*keys, collection, obj["symbol"]),
-    ).fetchone()
-    return _gene_assoc_view(con, row) if row else None
-
-
-@gene_set_type.field("pigeanAssociation")
-def resolve_set_assoc(obj, info, phenotype, collection=DEFAULT_COLLECTION):
-    con = _con(info)
-    keys = _phenotype_keys(con, phenotype)
-    row = con.execute(
-        f"SELECT * FROM pigean_gene_set_associations WHERE phenotype {_in(keys)} AND collection = ? AND gene_set = ? LIMIT 1",
-        (*keys, collection, obj["name"]),
-    ).fetchone()
-    return _set_assoc_view(con, row) if row else None
-
-
-def _membership_view(con, membership_row, set_row=None):
-    source = _index_source(con, membership_row["claim_id"], families=("roster",))
-    if set_row is not None:
-        gene_set = _set_view(con, set_row)
-    else:
-        # The GeneSet this edge's roster claim was built against (pinned in
-        # its synthesis inputs), not the latest entity for the name.
-        roster_entity = (_inputs_of(source[1]) or {}).get("gene_set_entity") if source else None
-        gene_set = {
-            "name": membership_row["gene_set"],
-            "source": "",
-            "collection": membership_row["collection"],
-            "dapperGeneSetId": roster_entity or _dapper_gene_set_id(
-                con, membership_row["collection"], membership_row["gene_set"]
-            ),
-        }
-    return {
-        "gene": {"symbol": membership_row["gene"]},
-        "geneSet": gene_set,
-        # One roster claim per gene set backs every (gene, set) pair in it.
-        "claim": envelope(con, membership_row["claim_id"], source=source),
-    }
-
-
-def _membership_scope(con, phenotype):
-    """SQL + params restricting memberships to one phenotype's observation
-    (plus collection-wide edges), or none."""
-    if not phenotype:
-        return "", []
-    keys = [*_phenotype_keys(con, phenotype), ""]
-    return f" AND phenotype {_in(keys)}", keys
-
-
-@gene_type.field("memberships")
-def resolve_gene_memberships(obj, info, collection=None, phenotype=None, first=100):
-    _bounded("first", first, MAX_ROWS)
-    con = _con(info)
-    sql = "SELECT * FROM claim_memberships WHERE gene = ?"
-    params = [obj["symbol"]]
-    if collection:
-        sql += " AND collection = ?"
-        params.append(collection)
-    scope, scope_params = _membership_scope(con, phenotype)
-    rows = con.execute(sql + scope + " ORDER BY gene_set, collection, phenotype LIMIT ?",
-                       [*params, *scope_params, first]).fetchall()
-    return [_membership_view(con, r) for r in rows]
-
-
-@gene_set_type.field("members")
-def resolve_set_members(obj, info, phenotype=None, first=100):
-    _bounded("first", first, MAX_ROWS)
-    con = _con(info)
-    phenotype = phenotype or obj.get("_phenotype")
-    scope, scope_params = _membership_scope(con, phenotype)
-    rows = con.execute(
-        "SELECT * FROM claim_memberships WHERE gene_set = ? AND collection = ?" + scope
-        + " ORDER BY gene, phenotype LIMIT ?",
-        (obj["name"], obj["collection"], *scope_params, first),
-    ).fetchall()
-    return [_membership_view(con, r) for r in rows]
-
-
-@query.field("pigeanValidationChallenge")
-def resolve_challenge(
-    _,
-    info,
-    phenotype,
-    collection=DEFAULT_COLLECTION,
-    where=None,
-    orderBy=None,
-    topGenes=20,
-    setsPerGene=10,
-    setOrder=None,
-    first=100,
-):
-    _bounded("topGenes", topGenes, MAX_TOP_GENES)
-    _bounded("setsPerGene", setsPerGene, MAX_SETS_PER_GENE)
-    _bounded("first", first, MAX_ROWS)
-    con = _con(info)
-    warnings = []
-    anchors = _gene_assoc_rows(con, phenotype, collection, where, orderBy, topGenes)
-
-    # Membership observed in this phenotype's PIGEAN run (under any of its
-    # keys), plus collection-wide memberships ('' = e.g. REST deposit hints).
-    keys = _phenotype_keys(con, phenotype)
-    member_keys = [*keys, ""]
-    membership_count = con.execute(
-        f"SELECT COUNT(*) AS c FROM claim_memberships WHERE collection = ? AND phenotype {_in(member_keys)}",
-        (collection, *member_keys),
-    ).fetchone()["c"]
-
-    unique, seen_genes = [], set()
-    for r in anchors:  # one row per gene even if a trait's rows sit under several keys
-        if r["gene"] not in seen_genes:
-            seen_genes.add(r["gene"])
-            unique.append(r)
-    truncated = len(unique) > first
-    kept = unique[:first]
-    sets_by_gene = {r["gene"]: [] for r in kept}
-    if membership_count == 0:
-        # A missing data source is not an empty result: the anchors are still
-        # returned (with no sets), and the gap is stated.
-        warnings.append(
-            f"No gene-set memberships are loaded for phenotype '{phenotype}' in collection "
-            f"'{collection}', so the (gene)-[member_of]->(gene_set) edge could not be joined; anchor "
-            "genes are returned with empty sets. This reflects a missing data source (membership "
-            "ingest pending), not an empty scientific result."
-        )
-    elif kept:
-        rfield = SET_ORDER_COLS[(setOrder or {}).get("field", "BETA_UNCORRECTED")]
-        rdir = "DESC" if (setOrder or {}).get("dir", "DESC") == "DESC" else "ASC"
-        placeholders = ",".join("?" * len(sets_by_gene))
-        # Per-gene window: each anchor gene keeps its own top-N sets, so one
-        # gene's strong sets can never crowd another gene out of the result.
-        # A (gene, set) pair present both phenotype-scoped and collection-wide
-        # counts once, preferring the phenotype's own observation.
-        joined = con.execute(
-            "SELECT * FROM ("
-            "SELECT m.gene AS m_gene, m.claim_id AS m_claim_id, m.collection AS m_collection, s.*, "
-            f"ROW_NUMBER() OVER (PARTITION BY m.gene ORDER BY s.{rfield} {rdir}, m.gene_set ASC) AS set_rank "
-            "FROM (SELECT gene, gene_set, collection, claim_id, "
-            "        ROW_NUMBER() OVER (PARTITION BY gene, gene_set ORDER BY phenotype DESC) AS pick "
-            "      FROM claim_memberships "
-            f"      WHERE collection = ? AND phenotype {_in(member_keys)} AND gene IN ({placeholders})) AS m "
-            "JOIN pigean_gene_set_associations s "
-            f"  ON s.gene_set = m.gene_set AND s.collection = m.collection AND s.phenotype {_in(keys)} "
-            "WHERE m.pick = 1"
-            ") AS ranked WHERE set_rank <= ? ORDER BY m_gene ASC, set_rank ASC",
-            [collection, *member_keys, *sets_by_gene.keys(), *keys, setsPerGene],
-        ).fetchall()
-        for r in joined:
-            membership_row = {
-                "gene": r["m_gene"],
-                "gene_set": r["gene_set"],
-                "collection": r["m_collection"],
-                "claim_id": r["m_claim_id"],
-            }
-            sets_by_gene[r["m_gene"]].append(
-                {
-                    "membership": _membership_view(con, membership_row, set_row=r),
-                    "geneSetAssociation": _set_assoc_view(con, r),
-                }
-            )
-
-    rows = [
-        {"geneAssociation": _gene_assoc_view(con, r), "sets": sets_by_gene[r["gene"]]}
-        for r in kept
-    ]
-    return {"rows": rows, "truncated": truncated, "warnings": warnings}
 
 
 # ---------------------------------------------------------------------------
@@ -1016,22 +657,104 @@ def _collection_envelope(con, claim_id, source):
 
 @query.field("collections")
 def resolve_collections(_, info):
-    return [{"id": c["id"], "title": c["title"], "description": c["description"], "methods": c["methods"],
-             "currentRelease": c["current_release"], "version": c["version"], "datasets": c["datasets"]}
+    return [{"id": c["id"], "kind": c["kind"], "title": c["title"], "description": c["description"],
+             "methods": c["methods"], "currentRelease": c["current_release"], "version": c["version"],
+             "datasets": c["datasets"], "objects": c["objects"]}
             for c in cserve.list_collections(_con(info))]
 
 
 @query.field("collection")
-def resolve_collection(_, info, id, release=None):
+def resolve_collection(_, info, id, release=None, datasetsFirst=50, datasetsOffset=0):
     try:
-        return cserve.describe(_con(info), id, release)
+        return cserve.describe(_con(info), id, release, first=datasetsFirst, offset=datasetsOffset)
     except cserve.CollectionNotFound:
         return None
 
 
+@query.field("queries")
+def resolve_queries(_, info, collection=None, release=None):
+    try:
+        return ccatalog.catalog(_con(info), collection, release)
+    except cserve.CollectionNotFound as exc:
+        raise ValueError(str(exc)) from exc
+
+
 @query.field("collectionQueries")
 def resolve_collection_queries(_, info, collection, release=None):
-    return cserve.list_queries(_con(info), collection, release)
+    try:
+        return ccatalog.catalog(_con(info), collection, release)["queries"]
+    except cserve.CollectionNotFound as exc:
+        raise ValueError(str(exc)) from exc
+
+
+# --- rows: questions in GraphQL beyond the templates (service/collections/rows.py) ------------------------
+
+row_type = ObjectType("Row")
+edge_type = ObjectType("RowEdge")
+
+
+@query.field("rows")
+def resolve_rows(_, info, collection, kind, orderBy, first=20, release=None, dimensions=None, subject=None,
+                 where=None):
+    try:
+        return crows.rows(_con(info), collection, kind, order=orderBy, first=first, release=release,
+                          dimensions=dimensions, subject=subject, where=where)
+    except cserve.CollectionNotFound as exc:
+        raise ValueError(str(exc)) from exc
+
+
+@row_type.field("dataset")
+def resolve_row_dataset(row, info):
+    return {"id": row["dataset"]["id"],
+            "dimensions": [{"name": k, "value": v} for k, v in sorted(row["dataset"]["dimensions"].items())]}
+
+
+@row_type.field("metric")
+def resolve_row_metric(row, info, name):
+    if name not in row["metrics"]:
+        raise ValueError(f"{row['kind']} rows have no metric {name!r}; they have {sorted(row['metrics'])}")
+    return row["metrics"][name]
+
+
+@row_type.field("metrics")
+def resolve_row_metrics(row, info):
+    return [{"name": k, "value": v} for k, v in row["metrics"].items()]
+
+
+@row_type.field("claim")
+def resolve_row_claim(row, info, key):
+    rc = crows.row_claims(_con(info), row).get(key)
+    return _collection_envelope(_con(info), rc["claim_id"], ("collection", rc)) if rc else None
+
+
+@row_type.field("claimKeys")
+def resolve_row_claim_keys(row, info):
+    return sorted(crows.row_claims(_con(info), row))
+
+
+@row_type.field("joined")
+def resolve_row_joined(row, info, via, kind, orderBy, first=10, where=None):
+    return crows.joined(_con(info), row, via, kind, order=orderBy, first=first, where=where)
+
+
+@edge_type.field("claim")
+def resolve_edge_claim(edge, info, key):
+    rc = crows.edge_claims(_con(info), edge).get(key)
+    return _collection_envelope(_con(info), rc["claim_id"], ("collection", rc)) if rc else None
+
+
+@edge_type.field("claimKeys")
+def resolve_edge_claim_keys(edge, info):
+    return sorted(crows.edge_claims(_con(info), edge))
+
+
+@query.field("dimensionValues")
+def resolve_dimension_values(_, info, collection, dimension, search=None, first=None, release=None):
+    try:
+        return ccatalog.dimension_values(_con(info), collection, dimension, release=release, search=search,
+                                         first=first)
+    except cserve.CollectionNotFound as exc:
+        raise ValueError(str(exc)) from exc
 
 
 @query.field("runQuery")
@@ -1044,7 +767,7 @@ def resolve_run_query(_, info, collection, query, variables=None, release=None, 
 
 
 schema = make_executable_schema(
-    _load_type_defs(), query, phenotype_type, gene_type, gene_set_type, json_scalar
+    _load_type_defs(), query, row_type, edge_type, json_scalar
 )
 
 # ---------------------------------------------------------------------------
@@ -1096,34 +819,8 @@ SWAGGER_HTML = """<!doctype html>
 </body>
 </html>"""
 
-DEFAULT_EXPLORER_QUERY = """\
-# Claims repository — PIGEAN IBD examples (schema docs via the sidebar).
-# Top IBD genes whose direct GWAS evidence outruns their gene-set support:
-{
-  phenotype(id: "IBD") {
-    pigeanGeneAssociations(
-      where: {prior: {lt: 0.5}}
-      orderBy: {field: COMBINED, dir: DESC}
-      first: 5
-    ) {
-      gene { symbol }
-      combined
-      logBf
-      prior
-      claim {
-        id
-        triple { subject predicate object }
-        scores { metric value interpretation }
-        provenanceRefs { derivedFromFiles resolution }
-      }
-    }
-  }
-}
-"""
-
-EXPLORER_HTML = ExplorerGraphiQL(
-    title="Claims Repository", default_query=DEFAULT_EXPLORER_QUERY
-).html(None)
+# GraphiQL opened on the example queries in api/graphql/examples (service/explorer.py).
+EXPLORER_HTML = explorer.render("Claims Repository")
 
 
 @app.get("/")
@@ -1195,10 +892,41 @@ def list_collections():
 
 
 @app.get("/v1/collections/{collection}")
-def describe_collection(collection: str, release: str | None = None):
+def describe_collection(collection: str, release: str | None = None,
+                        first: int = Query(50, ge=0, le=cserve.MAX_DATASETS_PAGE), offset: int = Query(0, ge=0)):
+    """What a collection holds; its datasets a page at a time (`first`, `offset`; see `datasets_page`)."""
     con = db.connect()
     try:
-        return cserve.describe(con, collection, release)
+        return cserve.describe(con, collection, release, first=first, offset=offset)
+    except cserve.CollectionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    finally:
+        con.close()
+
+
+@app.get("/v1/queries")
+def query_catalog(collection: str | None = None, release: str | None = None):
+    """Every query the repository answers (each collection's query templates),
+    described so that a client can run any of them with runQuery: params and
+    the values they take, the rows returned, the claims served, and a request
+    that runs as given."""
+    con = db.connect()
+    try:
+        return ccatalog.catalog(con, collection, release)
+    except cserve.CollectionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    finally:
+        con.close()
+
+
+@app.get("/v1/collections/{collection}/dimensions/{dimension}")
+def collection_dimension(collection: str, dimension: str, search: str | None = None,
+                         first: int | None = Query(None, ge=0), release: str | None = None):
+    """The values a dataset dimension (e.g. trait, library) takes, with labels,
+    the other keys a query accepts for each, and dataset counts."""
+    con = db.connect()
+    try:
+        return ccatalog.dimension_values(con, collection, dimension, release=release, search=search, first=first)
     except cserve.CollectionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     finally:
@@ -1209,7 +937,7 @@ def describe_collection(collection: str, release: str | None = None):
 def collection_queries(collection: str, release: str | None = None):
     con = db.connect()
     try:
-        return {"collection": collection, "queries": cserve.list_queries(con, collection, release)}
+        return {"collection": collection, "queries": ccatalog.catalog(con, collection, release)["queries"]}
     except cserve.CollectionNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     finally:
@@ -1266,6 +994,73 @@ async def run_collection_query(collection: str, name: str, request: Request):
     if status == 200:
         return Response(payload, media_type="application/json")
     return JSONResponse(payload, status_code=status)
+
+
+# --- object collections: releases built from deposits (service/collections/objects.py) ----------------------
+
+def _release_call(fn, *args):
+    con = db.connect()
+    try:
+        return fn(con, *args)
+    except cobjects.NotGranted as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except cobjects.ReleaseError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except cserve.CollectionNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        con.close()
+
+
+@app.post("/v1/collections/{collection}/releases")
+async def open_object_release(collection: str, request: Request, depositor: dict = Depends(api_keys.require_depositor)):
+    """Open a release of an object collection, to be filled by deposits naming the collection and this version
+    (any number of parts), then closed. Needs a key granted the collection. Opening an open release again
+    returns it unchanged (200); a new one is 201."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail='Send {"version": "..."}.')
+    if not isinstance(body, dict) or not isinstance(body.get("version"), str):
+        raise HTTPException(status_code=400, detail='Send {"version": "..."}.')
+    state, opened = await run_in_threadpool(_release_call, cobjects.open_release, depositor, collection, body["version"])
+    return JSONResponse(state, status_code=201 if opened else 200)
+
+
+@app.get("/v1/collections/{collection}/releases/{version}")
+def object_release_status(collection: str, version: str):
+    """An object collection release: open or closed, its ResultCollection id once closed, and the objects
+    and deposits it holds."""
+    return _release_call(cobjects.release_status, collection, version)
+
+
+@app.get("/v1/collections/{collection}/releases/{version}/members")
+def object_release_members(collection: str, version: str, class_name: str = Query(..., alias="class")):
+    """The ids of one class of a closed object release's members, one per line: the bytes of the release's
+    members File for that class (its sha256 is in the release document)."""
+    con = db.connect()
+    try:
+        row = con.execute("SELECT state FROM object_releases WHERE collection_key = ? AND version = ?",
+                          (collection, version)).fetchone()
+        if row is None or row["state"] != "closed":
+            raise HTTPException(status_code=404, detail=f"{collection} has no closed release {version}")
+        ids = cobjects.member_ids(con, collection, version, class_name)
+    finally:
+        con.close()
+    if not ids:
+        raise HTTPException(status_code=404, detail=f"{collection} {version} holds no {class_name} objects")
+    return Response(cobjects.members_file(ids), media_type="text/plain")
+
+
+@app.post("/v1/collections/{collection}/releases/{version}:close")
+async def close_object_release(collection: str, version: str, depositor: dict = Depends(api_keys.require_depositor)):
+    """Close an open release: mint its DAPPER ResultCollection (the members, the manifest and query Files),
+    record it, and make it the collection's current release, which queries read. Needs a key granted the
+    collection. Closing a closed release again returns it unchanged."""
+    state, _closed = await run_in_threadpool(_release_call, cobjects.close_release, depositor, collection, version)
+    return state
 
 
 @app.get("/v1/docs", response_class=HTMLResponse)
@@ -1610,7 +1405,7 @@ async def _deposit_body(request: Request) -> dict:
     return body
 
 
-def _write_deposit(depositor, prepared, hints, edges=()):
+def _write_deposit(depositor, prepared, hints, edges=(), collection=None, release=None):
     """The write behind POST /v1/deposits. `prepared` is what validation accepted: for each object its id, class and
     the plain DAPPER document to store, every id verified as the DAPPER-ID-1 address of its content. Everything a
     deposit must do happens here, in one transaction: the reserved address rule, idempotent storage, the reference
@@ -1621,6 +1416,14 @@ def _write_deposit(depositor, prepared, hints, edges=()):
         deposited = []
         bundle_objects = {}
         with con:
+            target = None
+            if collection is not None:  # the grant and the open release, as locking reads in this transaction
+                try:
+                    target = cobjects.target(con, depositor, collection, release)
+                except cobjects.NotGranted as exc:
+                    raise HTTPException(status_code=403, detail=str(exc))
+                except cobjects.ReleaseError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
             for item in prepared:
                 oid, cls, obj = item["id"], item["class_name"], item["document"]
                 bundle_objects[oid] = obj
@@ -1699,9 +1502,15 @@ def _write_deposit(depositor, prepared, hints, edges=()):
             if not api_keys.still_valid(con, depositor):
                 raise HTTPException(status_code=401, detail=api_keys.UNAUTHORIZED, headers=_UNAUTHORIZED)
             # Same transaction as the objects: a rejected bundle records no deposit.
-            deposit_id = api_keys.record_deposit(con, depositor, deposited, edges)
+            deposit_id = api_keys.record_deposit(con, depositor, deposited, edges, collection,
+                                                 target[0] if target else None)
+            in_collection = None
+            if target is not None:
+                added = cobjects.add_objects(con, collection, target[0], target[1], deposit_id, prepared)
+                in_collection = {"key": collection, "release": target[0], "state": "open", "objects": added}
             unresolved = _unresolved_references(con, bundle_objects, edges)
-        return {"deposit_id": deposit_id, "depositor": depositor, "deposited": deposited}, unresolved
+        return {"deposit_id": deposit_id, "depositor": depositor, "collection": in_collection,
+                "deposited": deposited}, unresolved
     except HTTPException:
         raise
     except (TypeError, ValueError, KeyError, IndexError, OverflowError) as exc:  # sqlite3.Row raises IndexError
@@ -1787,6 +1596,11 @@ async def deposit(request: Request, depositor: dict = Depends(api_keys.require_d
     body = await _deposit_body(request)
     if ("document" in body) == ("objects" in body):
         raise HTTPException(status_code=400, detail="send exactly one of document (a DAPPER document) or objects (a list of DAPPER nodes)")
+    collection, release = body.get("collection"), body.get("release")
+    if collection is not None and (not isinstance(collection, str) or not api_keys.COLLECTION_KEY_RE.match(collection)):
+        raise HTTPException(status_code=400, detail="collection must be a collection key such as dismech")
+    if release is not None and (collection is None or not isinstance(release, str) or not release or len(release) > 64):
+        raise HTTPException(status_code=400, detail="release names a version of the deposit's collection, e.g. 2026.11.0")
 
     def validate():
         try:
@@ -1810,7 +1624,7 @@ async def deposit(request: Request, depositor: dict = Depends(api_keys.require_d
 
     def run():
         prepared, edges = validate()
-        result, unresolved = _write_deposit(depositor, prepared, body.get("index_hints") or [], edges)
+        result, unresolved = _write_deposit(depositor, prepared, body.get("index_hints") or [], edges, collection, release)
         return {**result, "edges": len(edges), "unresolved_references": unresolved,
                 "validation": {"identity_profile": cidn.PROFILE, "dapper_version": cidn.DAPPER_VERSION}}
 
@@ -2049,6 +1863,46 @@ def get_deposit(deposit_id: str):
     return found
 
 
+@app.post("/v1/objects:batchGet")
+async def batch_get_objects(request: Request):
+    """Many stored objects in one call: {"ids": [...]} (at most 500 distinct ids) -> {"objects": {id: document},
+    "missing": [id]}. Documents are presented as GET /v1/objects/{id} presents them. A plain read: a claim the
+    loaded data implies but nothing has asserted yet is missing, and is not minted by this call."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body must be JSON.")
+    if not isinstance(body, dict) or "ids" not in body:
+        raise HTTPException(status_code=400, detail='Send {"ids": [...]}.')
+
+    def run():
+        con = db.connect()
+        try:
+            return obj_reads.batch_get(con, body["ids"])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        finally:
+            con.close()
+
+    return await run_in_threadpool(run)
+
+
+@app.get("/v1/objects/{object_id}/lineage")
+def object_lineage(object_id: str, depth: int = Query(obj_reads.MAX_DEPTH, ge=1, le=obj_reads.MAX_DEPTH)):
+    """One object's lineage as nodes and edges: what it references (its slots, such as was_derived_from,
+    was_generated_by and has_evidence, and deposited edges such as used_edges), followed to `depth` (at most 3),
+    and what references it (depth 1). Each edge names the slot or edge class it comes from. At most 500 nodes;
+    `truncated` says when the graph was cut. A plain read: nothing is asserted."""
+    con = db.connect()
+    try:
+        out = obj_reads.lineage(con, object_id, depth)
+    finally:
+        con.close()
+    if out is None:
+        raise HTTPException(status_code=404, detail=f"no stored object with id {object_id}")
+    return out
+
+
 @app.get("/v1/objects/{object_id}")
 def get_object(object_id: str, request: Request):
     """The resolver: dereference any dapper ID to its stored document.
@@ -2058,9 +1912,13 @@ def get_object(object_id: str, request: Request):
     try:
         payload = _fetch_payload(con, object_id)
         unasserted = payload is None and _index_source(con, object_id) is not None
+        elsewhere = cserve.provenance_resolver(con, object_id) if payload is None and not unasserted else None
     finally:
         con.close()
     if payload is None:
+        if elsewhere:
+            # Referenced provenance: hosted by another service (e.g. the provenance indexer), never copied here.
+            return RedirectResponse(elsewhere, status_code=307)
         if unasserted:
             raise HTTPException(
                 status_code=404,

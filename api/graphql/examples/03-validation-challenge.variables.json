@@ -1,0 +1,8 @@
+{
+  "variables": {
+    "trait": "T2DadjBMI",
+    "library": "mouse_msigdb",
+    "topGenes": 10,
+    "setsPerGene": 3
+  }
+}

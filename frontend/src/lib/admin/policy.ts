@@ -37,7 +37,8 @@ export function readablePath(path: string): boolean {
 }
 
 /** Admin API paths the browser may write through the proxy (POST, purpose admin_write). */
-const WRITE_PATHS = ["registration/check", "registration/jobs", "keys", `keys/${KEY_ID}/revoke`].map(exact);
+const WRITE_PATHS = ["registration/check", "registration/jobs", "keys", `keys/${KEY_ID}/revoke`,
+  `keys/${KEY_ID}/grants`, `keys/${KEY_ID}/grants/${KEY}/withdraw`].map(exact);
 export function writablePath(path: string): boolean {
   return WRITE_PATHS.some(re => re.test(path));
 }

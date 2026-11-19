@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { DataTable } from "@/components/admin/data-table";
 import { Callout, CopyButton, Mono, PageHeading, Panel, Pre, QueryFeedback, Status, When, clock, number, plural } from "@/components/admin/shared";
 import { adminGet, adminPost, type DepositKey, type DepositKeyList, type IssuedDepositKey, type RevokedDepositKey } from "@/lib/admin/api";
+import { Grants } from "./grants";
 
 const KEYS = ["admin", "keys"];
 const MAX_NAME = 120;
@@ -102,6 +103,8 @@ export default function KeysPage() {
     { id: "createdAt", accessorKey: "createdAt", header: "Created", meta: { muted: true }, cell: ({ row }) => <div>
       <When value={row.original.createdAt} />{row.original.createdBy ? <div className="mt-0.5 text-xs">by {row.original.createdBy}</div> : null}
     </div> },
+    { id: "collections", accessorFn: r => r.collections.join(" "), header: "Collections", enableSorting: false,
+      cell: ({ row }) => <Grants apiKey={row.original} queryKey={KEYS} /> },
     { id: "deposits", accessorKey: "deposits", header: "Deposits", meta: { align: "right" }, cell: ({ row }) => number(row.original.deposits) },
     { id: "lastDepositAt", accessorFn: r => r.lastDepositAt ?? "", header: "Last deposit", meta: { muted: true }, cell: ({ row }) => <When value={row.original.lastDepositAt} empty="Never" /> },
     // sr-only is absolutely positioned; the relative wrapper keeps it inside the table's scroll container at narrow widths.
@@ -118,7 +121,7 @@ export default function KeysPage() {
 
   return <>
     <PageHeading title="Deposit keys"
-      subtitle={<>Deposit keys authenticate <Mono>POST /v1/deposits</Mono>, the write API depositors use. Issue one key per depositor (an agent, a pipeline or a person&apos;s client). A key&apos;s name is public: it is shown to anyone reading who deposited an object.</>}
+      subtitle={<>Deposit keys authenticate <Mono>POST /v1/deposits</Mono>, the write API depositors use. Issue one key per depositor (an agent, a pipeline or a person&apos;s client). A key&apos;s name is public: it is shown to anyone reading who deposited an object. Any key can deposit objects on their own; to deposit into an object collection (open, fill and close its releases), grant the key that collection under Collections.</>}
       actions={<Button variant="outline" size="sm" disabled={query.isFetching} onClick={() => void query.refetch()}>Refresh</Button>} />
 
     <Panel title="Issue a key" description="The key is shown once, right after it is issued. The service stores only a hash of it." padded>

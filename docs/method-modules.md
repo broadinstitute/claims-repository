@@ -1,6 +1,10 @@
 # Method modules: claim templates ship their own query surface
 
-Status: design decision, 2025-11-06 · Supersedes the bespoke JSON query-graph wire format
+Status: **superseded 2026-11-18.** The per-method GraphQL modules described here were removed;
+results are read only through collection query templates (`runQuery`, catalog at `GET /v1/queries`;
+see docs/collections.md). Kept for history.
+
+Original status: design decision, 2025-11-06 · Supersedes the bespoke JSON query-graph wire format
 (`docs/query-graph-design.md` §2–§5 — execution semantics, storage, and open decisions — remain in force).
 
 ## 1. The decision

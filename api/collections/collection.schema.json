@@ -90,11 +90,6 @@
           "name": {
             "type": "string",
             "pattern": "^[a-z][a-z0-9_]*$"
-          },
-          "resolve": {
-            "enum": [
-              "kpn-traits"
-            ]
           }
         }
       }
@@ -306,9 +301,6 @@
               "lower"
             ]
           },
-          "confirmed": {
-            "type": "boolean"
-          },
           "description": {
             "type": "string",
             "minLength": 1
@@ -332,10 +324,6 @@
         ],
         "properties": {
           "version": {
-            "type": "string",
-            "minLength": 1
-          },
-          "status": {
             "type": "string",
             "minLength": 1
           },
@@ -406,6 +394,33 @@
       "items": {
         "type": "string",
         "minLength": 1
+      }
+    },
+    "mappings": {
+      "type": "object",
+      "description": "Per dataset dimension, a TSV under the collection directory: the collection's own vocabulary for it. Columns key, id (a CURIE) and label, and optionally more columns describing the id (e.g. category, trait_type, concept_id, concept_label). The only way a key becomes an id: the service reads no registry. Not part of the minting section.",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "xrefs": {
+      "type": "object",
+      "description": "Per mapped dataset dimension, an SSSOM-style TSV of the mapped ids' cross-references to other vocabularies (columns subject_id, predicate_id, object_id; optionally object_label, confidence, mapping_justification, source). Served with the dimension's values. Not part of the minting section.",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "unmapped": {
+      "type": "object",
+      "description": "Per dataset dimension, what to do with a key its mapping does not resolve: keep-raw (default), refuse, or skip the dataset.",
+      "additionalProperties": {
+        "enum": [
+          "keep-raw",
+          "refuse",
+          "skip"
+        ]
       }
     }
   }

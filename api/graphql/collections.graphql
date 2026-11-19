@@ -5,11 +5,50 @@
 # collection's own row kinds and metrics, not a fixed schema.
 
 extend type Query {
+  """
+  Start here: every query the repository answers, described so that you can
+  run any of them with runQuery without reading anything else. Returns
+  {guide, queries}: `guide` says how to call runQuery and what a result looks
+  like; each entry in `queries` gives the query's collection and name, its
+  params (type, default, bounds; a dimension param also gives a sample of its
+  values and where to list them all), the rows it returns (kinds, entities,
+  metrics and their meaning, joins), the claim keys `claims` accepts, and a
+  GraphQL and a REST request that run as given. `collection` limits the list
+  to one collection. Same as GET /v1/queries.
+  """
+  queries(collection: String, release: String): JSON
+  """
+  The values a collection's dataset dimension takes (e.g. pigean's `trait`
+  or `library`): each value with its label, the other keys a query accepts
+  for it (a trait's legacy key, such as IBD), and how many datasets have it.
+  `search` matches value, label or key, case-insensitively. Returns
+  {collection, release, dimension, count, values, truncated}.
+  """
+  dimensionValues(collection: String!, dimension: String!, search: String, first: Int, release: String): JSON
+  """
+  Ask a question no query template asks, in GraphQL. Rows of one kind from a
+  collection (see `queries` → `collections` for each collection's row kinds,
+  metrics, dimensions and edges), filtered by dimension values, by subject (a
+  gene symbol or gene-set name as the result files give it, or its id) and by
+  metric conditions, ordered by one of the kind's metrics, limited by `first`
+  (at most 500). Follow edges from each row with `Row.joined`. A condition or
+  order must use a metric of the kind it applies to: scores of different kinds
+  are never compared. Selecting `claim` serves the claim behind a row, with an
+  id to cite, exactly as a template does.
+  """
+  rows(collection: String!, kind: String!, dimensions: [DimensionFilter!], subject: [String!],
+       where: [MetricCondition!], orderBy: MetricOrder!, first: Int = 20, release: String): RowsResult!
   "Every registered collection, with its current release."
   collections: [CollectionSummary!]!
-  "One collection described from its release manifest (current release unless `release` names a version or release id)."
-  collection(id: String!, release: String): JSON
-  "A collection's query templates: description, parameters, plan, and a runnable example."
+  """
+  One collection described from its release manifest (current release unless
+  `release` names a version or release id): its dimensions, row and edge
+  kinds, metrics and what each means, templates and releases. Its datasets
+  come a page at a time: `datasetsFirst` (default 50, at most 500) from
+  `datasetsOffset`; `datasets_page` gives the total and the next offset.
+  """
+  collection(id: String!, release: String, datasetsFirst: Int = 50, datasetsOffset: Int = 0): JSON
+  "One collection's entries from `queries`."
   collectionQueries(collection: String!, release: String): JSON
   """
   Run a collection's query template. `claims` limits which claim keys each row
@@ -21,6 +60,8 @@ extend type Query {
 
 type CollectionSummary {
   id: String!
+  "files: releases built from result files (rows, claims minted by templates); objects: releases built from deposits of DAPPER objects."
+  kind: String!
   title: String!
   description: String
   methods: [String!]!
@@ -28,4 +69,103 @@ type CollectionSummary {
   currentRelease: String
   version: String
   datasets: Int!
+  "Objects in the current release (object collections; 0 otherwise)."
+  objects: Int!
+}
+
+"A dataset dimension and the value rows must have, e.g. {name: \"trait\", value: \"T2D\"}. A value may be any key the collection's vocabulary accepts."
+input DimensionFilter {
+  name: String!
+  value: String!
+}
+
+"Conditions on one metric of the row kind; all given conditions must hold."
+input MetricCondition {
+  metric: String!
+  lt: Float
+  lte: Float
+  gt: Float
+  gte: Float
+  eq: Float
+  ne: Float
+}
+
+enum OrderDirection {
+  ASC
+  DESC
+}
+
+"Order by one metric of the row kind. Ties break by subject, then dataset, the same way every time."
+input MetricOrder {
+  metric: String!
+  dir: OrderDirection = DESC
+}
+
+type RowsResult {
+  collection: String!
+  release: ReleaseRef!
+  rows: [Row!]!
+  "Why the result is empty, when it is: never a silent empty answer."
+  warnings: [String!]!
+}
+
+type ReleaseRef {
+  id: String!
+  version: String!
+}
+
+"One result row: a subject (e.g. a gene) assessed against an object (e.g. a trait) in one dataset, with its metrics and the claims that state them."
+type Row {
+  kind: String!
+  dataset: RowDataset!
+  subject: RowEntity!
+  object: RowEntity!
+  "One metric's value, by name (see the catalog for what each means)."
+  metric(name: String!): Float
+  metrics: [MetricValue!]!
+  "Extra columns the collection keeps for this kind."
+  columns: JSON
+  "The claim behind this row under one claim key (e.g. measurement), served and asserted as a template serves it."
+  claim(key: String!): ClaimEnvelope
+  "The claim keys this row has."
+  claimKeys: [String!]!
+  "Rows reached from this one through an edge kind (e.g. member_of from a gene to its gene sets), ordered and limited per row (at most 50)."
+  joined(via: String!, kind: String!, where: [MetricCondition!], orderBy: MetricOrder!, first: Int = 10): [JoinedRow!]!
+}
+
+type RowDataset {
+  id: String!
+  dimensions: [DimensionValue!]!
+}
+
+type DimensionValue {
+  name: String!
+  value: String!
+}
+
+type RowEntity {
+  "Canonical id, e.g. HGNC.SYMBOL:FTO or KPN.TRAIT:0000398."
+  id: String
+  "The value as the result file gives it, e.g. FTO."
+  value: String
+  label: String
+}
+
+type MetricValue {
+  name: String!
+  value: Float
+}
+
+type JoinedRow {
+  edge: RowEdge!
+  row: Row!
+}
+
+type RowEdge {
+  kind: String!
+  from: RowEntity!
+  to: RowEntity!
+  "The claim behind this edge under one claim key (e.g. roster: the gene set's membership)."
+  claim(key: String!): ClaimEnvelope
+  claimKeys: [String!]!
 }

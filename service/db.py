@@ -193,9 +193,55 @@ CREATE TABLE IF NOT EXISTS deposits (
   deposit_id TEXT PRIMARY KEY,
   key_id TEXT NOT NULL,
   received_at TEXT NOT NULL,
-  object_count INTEGER NOT NULL
+  object_count INTEGER NOT NULL,
+  collection_key TEXT,
+  release_version TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_deposits_key ON deposits (key_id, received_at);
+-- Object collections (008_object_collections.sql): releases built from deposits.
+CREATE TABLE IF NOT EXISTS api_key_grants (
+  key_id TEXT NOT NULL,
+  collection_key TEXT NOT NULL,
+  granted_at TEXT NOT NULL,
+  granted_by TEXT,
+  PRIMARY KEY (key_id, collection_key)
+);
+CREATE TABLE IF NOT EXISTS object_collections (
+  collection_key TEXT PRIMARY KEY,
+  definition TEXT NOT NULL,
+  git_commit TEXT,
+  registered_at TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS object_releases (
+  collection_key TEXT NOT NULL,
+  version TEXT NOT NULL,
+  state TEXT NOT NULL,
+  definition TEXT NOT NULL,
+  release_id TEXT,
+  opened_at TEXT NOT NULL,
+  opened_by TEXT NOT NULL,
+  closed_at TEXT,
+  PRIMARY KEY (collection_key, version)
+);
+CREATE TABLE IF NOT EXISTS release_objects (
+  collection_key TEXT NOT NULL,
+  version TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  class_name TEXT NOT NULL,
+  deposit_id TEXT NOT NULL,
+  PRIMARY KEY (collection_key, version, object_id)
+);
+CREATE INDEX IF NOT EXISTS idx_robj_class ON release_objects (collection_key, version, class_name);
+CREATE TABLE IF NOT EXISTS release_object_fields (
+  collection_key TEXT NOT NULL,
+  version TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  field TEXT NOT NULL,
+  value TEXT NOT NULL,
+  num REAL,
+  PRIMARY KEY (collection_key, version, object_id, field, value)
+);
+CREATE INDEX IF NOT EXISTS idx_rof_value ON release_object_fields (collection_key, version, field, value);
 CREATE TABLE IF NOT EXISTS deposit_objects (
   deposit_id TEXT NOT NULL,
   object_id TEXT NOT NULL,
@@ -501,6 +547,11 @@ def _connect_sqlite(path: str | None) -> Connection:
         raw.execute(
             "ALTER TABLE dapper_objects ADD COLUMN times_seen INTEGER NOT NULL DEFAULT 1"
         )
+    # ... and for DBs created before deposits could name a collection (008).
+    cols = {r[1] for r in raw.execute("PRAGMA table_info(deposits)")}
+    if "collection_key" not in cols:
+        raw.execute("ALTER TABLE deposits ADD COLUMN collection_key TEXT")
+        raw.execute("ALTER TABLE deposits ADD COLUMN release_version TEXT")
     return Connection(raw, "sqlite")
 
 

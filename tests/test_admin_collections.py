@@ -339,13 +339,13 @@ def test_check_then_publish_job_records_exactly_the_sampled_claims(monkeypatch):
     statuses = {s["id"]: s["status"] for s in report["steps"]}
     assert statuses["manifest"] == statuses["release"] == statuses["samples"] == "ok"
     assert statuses["git"] in ("ok", "warning")  # the fixture may be uncommitted
-    # FIXPHENO is not in this database's (empty) trait registry: kept as given, with a warning.
+    # FIXPHENO has no id in the collection's mapping: kept as given, with a warning.
     assert statuses["datasets"] == "warning" and any("FIXPHENO" in w for w in report["warnings"])
     assert report["datasets"][0]["dimensions"]["trait"]["resolved"] is False
     expected = "already-published" if before else "new-collection"
     assert report["release"]["state"] == expected
     assert report["release"]["releaseId"].startswith("dapper:ResultCollection.")
-    assert report["collection"]["key"] == "pigean" and len(report["collection"]["sourceFiles"]) == 5
+    assert report["collection"]["key"] == "pigean" and len(report["collection"]["sourceFiles"]) == 7
     assert {t["name"] for t in report["collection"]["templates"]} == {"gene", "gene_set", "roster"}
     ds = report["datasets"][0]
     assert ds["dimensions"]["trait"]["raw"] == "FIXPHENO" and ds["datasetId"].startswith("dapper:Dataset.")
@@ -430,7 +430,7 @@ def test_collection_detail(published):
     assert [r["id"] for r in d["releaseHistory"]] == [published.release_id]
     assert d["dapperProfile"] == "0.2.1-a1"
     assert [x["name"] for x in d["dimensions"]] == ["trait", "library"]
-    assert d["dimensions"][0]["resolve"] == "kpn-traits"
+    assert d["dimensions"][0].get("resolve") is None  # traits resolve through the collection's own mapping
     assert {m["name"] for m in d["metrics"]} == {"combined", "log_bf", "prior", "beta", "beta_uncorrected"}
     assert set(d["rowKinds"]) == {"gene_phenotype", "gene_set_phenotype"} and set(d["edgeKinds"]) == {"member_of"}
     [ds] = d["datasets"]
@@ -450,12 +450,13 @@ def test_collection_detail(published):
     assert templates["roster"]["groupBy"] == "to" and templates["roster"]["claims"][0]["mintable"] == 2
     measurement = templates["gene"]["claims"][0]
     assert "{" in measurement["statement"] and measurement["proposition"]["relation"]
-    [q] = d["queries"]
-    assert q["name"] == QUERY and q["path"] == f"queries/{QUERY}.yaml" and len(q["sha256"]) == 64
+    q = next(q for q in d["queries"] if q["name"] == QUERY)
+    assert q["path"] == f"queries/{QUERY}.yaml" and len(q["sha256"]) == 64
     assert q["example"]["variables"]["trait"] == "IBD"
-    assert [(f["kind"], f["name"]) for f in d["sourceFiles"]] == [
-        ("manifest", "pigean"), ("template", "gene"), ("template", "gene_set"), ("template", "roster"),
-        ("query", QUERY)]
+    assert [(f["kind"], f["name"]) for f in d["sourceFiles"]][:4] == [
+        ("manifest", "pigean"), ("template", "gene"), ("template", "gene_set"), ("template", "roster")]
+    assert {f["name"] for f in d["sourceFiles"] if f["kind"] == "query"} == {
+        QUERY, "gene-across-traits", "gene-set-across-traits"}
     assert all(len(f["sha256"]) == 64 and f["sizeBytes"] > 0 for f in d["sourceFiles"])
     assert d["dapperDocumentUrl"].endswith("/v1/collections/pigean/releases/0.0.1-test/document")
     assert d["manifest"]["collection"] == "pigean"

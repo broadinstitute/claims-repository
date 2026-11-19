@@ -55,7 +55,13 @@ REQUIRED_COLUMNS = {
     "admin_auth_events": {"at", "event", "email", "detail"},
     # 007_deposit_keys.sql
     "api_keys": {"key_id", "name", "key_sha256", "created_at", "created_by", "revoked_at", "revoked_by"},
-    "deposits": {"deposit_id", "key_id", "received_at", "object_count"},
+    "deposits": {"deposit_id", "key_id", "received_at", "object_count", "collection_key", "release_version"},
+    # 008_object_collections.sql
+    "api_key_grants": {"key_id", "collection_key", "granted_at"},
+    "object_collections": {"collection_key", "definition"},
+    "object_releases": {"collection_key", "version", "state", "definition", "release_id"},
+    "release_objects": {"collection_key", "version", "object_id", "class_name", "deposit_id"},
+    "release_object_fields": {"collection_key", "version", "object_id", "field", "value", "num"},
     "deposit_objects": {"deposit_id", "object_id", "status"},
     "deposit_edges": {"deposit_id", "seq", "class_name", "subject_id", "object_id", "payload"},
 }
@@ -69,6 +75,9 @@ REQUIRED_PRIMARY_KEYS = {
     # 007_deposit_keys.sql
     "api_keys": ["key_id"],
     "deposits": ["deposit_id"],
+    "api_key_grants": ["key_id", "collection_key"],
+    "object_releases": ["collection_key", "version"],
+    "release_objects": ["collection_key", "version", "object_id"],
     "deposit_objects": ["deposit_id", "object_id"],
     "deposit_edges": ["deposit_id", "seq"],
 }

@@ -1164,7 +1164,7 @@ def _key_event(con, event: str, email: str, key_id: str, name: str) -> None:
 def _key_row(row: dict) -> dict:
     return {"keyId": row["key_id"], "name": row["name"], "createdAt": _ts(row["created_at"]), "createdBy": row["created_by"],
             "revokedAt": _ts(row["revoked_at"]), "revokedBy": row["revoked_by"], "deposits": int(row["deposits"]),
-            "lastDepositAt": _ts(row["last_deposit_at"])}
+            "lastDepositAt": _ts(row["last_deposit_at"]), "collections": row.get("collections", [])}
 
 
 @router.get("/keys")
@@ -1190,6 +1190,57 @@ async def keys_issue(body: KeyRequest, admin: dict = Depends(gateway.require_adm
             con.close()
     issued = await run_in_threadpool(run)
     return _json({"keyId": issued["key_id"], "name": issued["name"], "key": issued["key"]}, status=201)
+
+
+class GrantRequest(BaseModel):
+    collection: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/keys/{key_id}/grants")
+async def keys_grant(key_id: str, body: GrantRequest, admin: dict = Depends(gateway.require_admin_write)):
+    """Let a key deposit into a collection (open, fill and close its releases). Without a grant a key can still
+    make deposits that name no collection."""
+    if not api_keys.KEY_ID_RE.match(key_id):
+        raise HTTPException(status_code=404, detail="Unknown key.")
+    def run():
+        con = db.connect()
+        try:
+            with con:
+                row = con.execute("SELECT name, revoked_at FROM api_keys WHERE key_id = ?", (key_id,)).fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Unknown key.")
+                if row["revoked_at"] is not None:
+                    raise HTTPException(status_code=409, detail="This key is revoked.")
+                try:
+                    added = api_keys.grant(con, key_id, body.collection, admin["email"])
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
+                if added:
+                    _key_event(con, "api_key_granted", admin["email"], key_id, f"{row['name']} -> {body.collection}")
+                return api_keys.grants(con, key_id)
+        finally:
+            con.close()
+    return _json({"keyId": key_id, "collections": await run_in_threadpool(run)})
+
+
+@router.post("/keys/{key_id}/grants/{collection}/withdraw")
+async def keys_ungrant(key_id: str, collection: str, admin: dict = Depends(gateway.require_admin_write)):
+    """Withdraw a key's grant for a collection. A deposit into it already in flight finishes first."""
+    if not api_keys.KEY_ID_RE.match(key_id):
+        raise HTTPException(status_code=404, detail="Unknown key.")
+    def run():
+        con = db.connect()
+        try:
+            with con:
+                row = con.execute("SELECT name FROM api_keys WHERE key_id = ?", (key_id,)).fetchone()
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Unknown key.")
+                if api_keys.revoke_grant(con, key_id, collection):
+                    _key_event(con, "api_key_grant_withdrawn", admin["email"], key_id, f"{row['name']} -> {collection}")
+                return api_keys.grants(con, key_id)
+        finally:
+            con.close()
+    return _json({"keyId": key_id, "collections": await run_in_threadpool(run)})
 
 
 @router.post("/keys/{key_id}/revoke")

@@ -88,7 +88,24 @@
                 "order": {
                   "$ref": "#/$defs/order"
                 },
-                "limit": {}
+                "limit": {},
+                "subject": {
+                  "description": "Only rows about this subject: its value as the result file gives it (e.g. a gene symbol or gene-set name) or its id. A string, a list of them, or a $variable; unset matches every subject.",
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "minItems": 1,
+                      "maxItems": 100
+                    }
+                  ]
+                }
               }
             }
           }

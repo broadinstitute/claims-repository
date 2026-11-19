@@ -1,0 +1,4 @@
+#!/bin/sh
+# The claims CLI (docs/creating-a-collection.md), run from this repository's virtualenv.
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$HERE" && exec "$HERE/.venv/bin/python" -m claims_cli.main "$@"

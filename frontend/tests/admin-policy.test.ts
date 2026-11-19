@@ -67,6 +67,12 @@ test("proxy reads only the read API", () => {
 test("proxy writes only the registration and deposit key POSTs", () => {
   for (const ok of WRITES) assert.equal(writablePath(ok), true, ok);
   assert.equal(writablePath("keys/key_ffffffffffffffff/revoke"), true);
+  assert.equal(writablePath("keys/key_ffffffffffffffff/grants"), true);
+  assert.equal(writablePath("keys/key_ffffffffffffffff/grants/dismech/withdraw"), true);
+  for (const bad of ["keys/key_ffffffffffffffff/grants/", "keys/key_ffffffffffffffff/grants/Dismech/withdraw",
+    "keys/key_ffffffffffffffff/grants/dismech", "keys/not-a-key/grants", "keys/key_ffffffffffffffff/grants/../revoke"]) {
+    assert.equal(writablePath(bad), false, bad);
+  }
   for (const bad of [...READS.filter(p => !WRITES.includes(p)), "registration/check/", "registration/check/x", "registration/jobs/abc",
     "registration/../registration/check", "Registration/check", "registration/check\n", "", "auth-events", ...BAD_KEY_PATHS]) {
     assert.equal(writablePath(bad), false, JSON.stringify(bad));

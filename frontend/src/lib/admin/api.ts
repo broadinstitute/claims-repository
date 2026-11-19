@@ -75,7 +75,7 @@ export type CollectionTemplate = {
   name: string; version: string; for: string; groupBy: string | null; fileId: string; path: string; sha256: string;
   claims: TemplateClaim[];
 };
-export type MetricInfo = { name: string; scoreKind: string; scale: string; better: string; confirmed: boolean; description: string | null; interpretation: string | null };
+export type MetricInfo = { name: string; scoreKind: string; scale: string; better: string; description: string | null; interpretation: string | null };
 export type QueryExample = { variables: Record<string, unknown>; rest: unknown; body: unknown; graphql: unknown };
 export type CollectionQuery = {
   name: string; description: string | null; params: Record<string, Spec>; plan: unknown;
@@ -236,7 +236,10 @@ export type Job = {
 export type DepositKey = {
   keyId: string; name: string; createdAt: string; createdBy: string | null;
   revokedAt: string | null; revokedBy: string | null; deposits: number; lastDepositAt: string | null;
+  /** Collections this key may deposit into (open, fill and close their releases). */
+  collections: string[];
 };
+export type KeyGrants = { keyId: string; collections: string[] };
 export type DepositKeyList = { asOf: string; keys: DepositKey[] };
 /** The 201 from POST keys: the only time the key leaves the service, which stores just its SHA-256. */
 export type IssuedDepositKey = { keyId: string; name: string; key: string };

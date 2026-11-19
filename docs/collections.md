@@ -1,6 +1,7 @@
 # Collections: a general claims repository
 
-Status: **phases 1–4 built, phase 5 partly** (2026-11-10; see §12). Supersedes the host/module split in
+Status: **phases 1–4 built, phase 5 partly** (2026-11-10; see §12). For the step-by-step guide to building one, with PIGEAN as the example, see
+[creating-a-collection.md](creating-a-collection.md). Supersedes the host/module split in
 [method-modules.md](method-modules.md) and realizes the generic tables sketched
 in [query-graph-design.md](query-graph-design.md) §5. Built on DAPPER
 **0.2.1-a1** (on top of 0.2.0), which adds `ResultCollection` and `ValueLocator` (dapper
@@ -313,9 +314,10 @@ example: { trait: IBD }
   library-wide ones; `warnings` and `truncated`; the 25,000-query budget; the
   2,000-assertion cap; row bounds; one transaction per request; render before
   write.
-- `pigeanValidationChallenge` becomes this query template and is then
-  removed. Development is local only, so no wrapper is kept for the challenge
-  UI. The persisted-query fixture is the parity check.
+- `pigeanValidationChallenge` became this query template and was removed on
+  2026-11-18, with every other per-method GraphQL field (`pigean*Associations`,
+  `pigeanAssociation`, `gene`, `geneSet`, `phenotypes`, `methods`). The
+  persisted-query fixture is gone with it.
 
 ## 7. Discovery: asking a collection about itself
 
@@ -473,8 +475,12 @@ Built, beside the PIGEAN path rather than replacing it:
   (a drifted row is refused). Endpoints: `GET /v1/collections`,
   `/v1/collections/{c}`, `/v1/collections/{c}/queries`,
   `/v1/collections/{c}/releases/{version}/document` and
-  `POST /v1/collections/{c}/queries/{name}:run`. GraphQL adds `collections`,
-  `collection`, `collectionQueries` and `runQuery`.
+  `POST /v1/collections/{c}/queries/{name}:run`, plus the query catalog
+  `GET /v1/queries` (every query with its params and their values, the rows it
+  returns, the claims it serves and a request that runs as given) and
+  `GET /v1/collections/{c}/dimensions/{d}` (a dimension's values). GraphQL
+  has `queries`, `dimensionValues`, `collections`, `collection`,
+  `collectionQueries` and `runQuery`, and no per-method fields.
 - **Parity.** The challenge query template returns the same genes, order,
   values and gene sets as `pigeanValidationChallenge`. That holds on the
   fixtures (tested) and on real IBD at 20, 37, 50 and 60 genes, up to 550 sets.
@@ -486,7 +492,103 @@ Not built yet:
 - **The Croissant/DOI/DRS source adapter** (§4). Files are given by path.
 - **Toolkit side:** `methods/pigean/claims.py` still mints local-dev ids. It
   retires in favor of the engine.
-- **Removing the PIGEAN path** (`pigeanValidationChallenge`, the `pigean_*`
-  tables and `load_pigean.py`). This waits until a second collection (EAGGL)
-  onboards with no service change.
+- **Asking your own question (2026-11-19).** Questions no template asks are
+  written in GraphQL, not in a plan language: `Query.rows(collection, kind,
+  dimensions, subject, where, orderBy, first)` returns typed `Row`s, with
+  `Row.joined(via, kind, ...)` to follow edges and `Row.claim(key)` for the
+  claim behind a row. The same rules as a template are checked against the
+  manifest (a condition or order uses the kind's own metrics; edges must
+  match the kinds) and lists are bounded (500 rows, 50 joined per row). A
+  template's anchor may name a `subject` too (pigean `gene-across-traits`,
+  `gene-set-across-traits`). The catalog lists each
+  collection's row kinds, metrics, dimensions and edges under `collections`.
+  `GET /v1/collections/{c}` pages its datasets (`first`, `offset`).
+  Rows serve their claims by default.
+- **Vocabularies live in each collection (2026-11-18).** A collection's
+  `mappings/<dimension>.tsv` (key, id, label and attributes such as category
+  and primary concept) and `mappings/<dimension>.sssom.tsv` (cross-references)
+  are its whole vocabulary: publishing and queries read nothing else, and
+  `dimensionValues` serves them. `resolve: kpn-traits` and GraphQL `phenotype`
+  are gone; `claims vocab check --write-template` writes the files from a
+  kpn-data-models trait release. (The `entities`/`kpn_traits` sketches above
+  predate this.)
+- **Removing the rest of the PIGEAN path.** The GraphQL fields are gone
+  (2026-11-18). Still there: the `pigean_*` tables and `load_pigean.py`, the
+  legacy claim sources `claim(id)` and `proposition` still synthesize from,
+  deposit `index_hints` (which write those tables), and `/v1/vocabulary`.
 
+
+## 13. Object collections: releases built from deposits (2026-11-18)
+
+REVEAL will keep no scientific objects of its own. Its job results are
+deposited with no collection (§ inputs-and-outputs 4.5), and its catalogs
+(DisMech gaps, EAGGL factors, CFDE gene sets, traits, gnomAD constraint) are
+deposited once per upstream release into collections, so that named queries
+can read them.
+
+**Why not an ordinary (file-based) collection.** A file-based release reads
+result files and mints its own claims from their rows with its templates. A
+catalog is not rows to mint from: it is DAPPER objects REVEAL has already
+minted (KnowledgeGaps, Mechanisms, GeneSets), whose ids job deposits copy
+verbatim. Re-minting them from files would give them other ids, or would
+need a template per class reproducing REVEAL's builders exactly. So a
+catalog goes in as deposits, and a collection may say its releases are built
+from deposits:
+
+| | File-based (`kind` absent) | Object collection (`kind: objects`) |
+|---|---|---|
+| A release is | result files, read and minted by the publisher | DAPPER objects deposited into it |
+| Ids | minted by the collection's templates | the deposited ids, unchanged (DAPPER-ID-1, checked on deposit) |
+| Built by | `scripts/publish_collection.py --release` | register the definition once; then open, deposit parts, close |
+| Queries read | `result_rows` / edges (metrics, dimensions) | the release's objects by class, indexed fields, links |
+| Query rows serve | claim envelopes (asserting them) | the stored documents; plain reads, no claims |
+| Release document | ResultCollection of Datasets of result files | ResultCollection of one Dataset per class, each with a File listing its member ids |
+
+**The manifest** (`api/collections/object-collection.schema.json`) names the
+DAPPER classes the collection holds (`object_kinds`), and for each the
+`fields` queries filter and order on (a slot each: string, number, or a list
+of them) and the `links` queries follow (a slot holding dapper ids). Classes
+and slots are checked against the vendored DAPPER schema. Vocabulary is the
+collection's own, as for file collections: `mappings` and `xrefs` keyed by a
+field (e.g. disease keys → the IRIs gaps name).
+
+**Query templates** (`object-query.schema.json`): an anchor (a class, `where`
+on its fields with eq, ne, lt, lte, gt, gte, contains; `order` by a field;
+`limit`), then up to three steps, each either `follow` (the objects an anchor's
+link names) or `referenced_by` (objects of a class in the release whose link
+names the anchor), with a per-anchor limit. A condition whose variable is
+unset is dropped, so one template can take alternative parameters.
+
+**Life of a release.**
+1. Register the definition from its directory:
+   `scripts/publish_collection.py <dir>` (no `--release`). It stores the
+   manifest, query and vocabulary Files.
+2. A key granted the collection opens a release:
+   `POST /v1/collections/{c}/releases {"version": ...}`.
+3. Deposits naming the collection and release add their objects. Membership
+   and field values are recorded in the deposit's transaction, after checking
+   the grant and that the release is open (locking reads), so a part sent
+   after the close is refused whole. Resending a part changes nothing.
+4. `POST /v1/collections/{c}/releases/{v}:close` mints the ResultCollection,
+   records it in `collection_releases` and makes it current. Queries read
+   closed releases only.
+
+Tables: `object_collections`, `object_releases`, `release_objects`,
+`release_object_fields`, `api_key_grants`, and `deposits.collection_key` /
+`release_version` (SQLite on connect; MySQL `schema/migrations/008_object_collections.sql`,
+not yet applied anywhere and untested on MySQL).
+
+**Catalog collections in kpn-dapper-toolkit.**
+- `collections/dismech`: KnowledgeGaps and Mechanisms; `gaps-by-disease`
+  (MONDO IRI and/or part of the disease name) and `gap-with-anchors`. The
+  anchors are the Mechanisms a gap's `about_entities` names, so REVEAL must
+  list each anchor's dapper id there (proposed; REVEAL's gaps carry only the
+  disease IRI today, and their anchors are REVEAL-side attachments).
+- **Waiting on REVEAL:** "factors and gene sets for a trait" (EAGGL) and
+  "constraint by gene" (gnomAD). DAPPER has no class for a constraint score,
+  and Mechanism and GeneSet have no trait slot; REVEAL's CFDE GeneSets carry
+  neither members nor a collection link. These queries can be written once
+  REVEAL fixes how a factor names its trait and genes, and how a constraint
+  value is expressed (for example as a Proposition about the gene with a
+  ClaimScore), since an object query can filter Propositions by
+  subject_entity, relation and object_entity.

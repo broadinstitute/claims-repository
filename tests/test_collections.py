@@ -1,7 +1,7 @@
 """Collections (docs/collections.md): manifests and templates checked at load,
 DAPPER-ID-1 minting through dapper's own module, publishing a release, claims
-minted on serve and checked against their recorded ids, discovery, and the
-query executor reproducing the PIGEAN validation challenge."""
+minted on serve and checked against their recorded ids, discovery (the query
+catalog), and the query executor."""
 from __future__ import annotations
 
 import copy
@@ -211,34 +211,43 @@ def test_a_file_in_the_wrong_dataset_is_refused(tmp_path, published):
 
 # --- serving and the executor ----------------------------------------------
 
-def _old_loader():
-    spec = importlib.util.spec_from_file_location("load_pigean", ROOT / "scripts" / "load_pigean.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+REVEAL_QUERY = ("query Candidates($variables: JSON) { runQuery(collection: \"pigean\", query: \"top-genes-with-sets\", "
+                "variables: $variables, claims: [\"measurement\"]) }")
 
 
-def test_challenge_query_matches_the_pigean_resolver(published):
-    con = service_db.connect()
-    try:
-        _old_loader().load(con, FIX / "pigean" / "combined_gene_stats.json",
-                           FIX / "pigean" / "combined_gene_set_stats.json", FIX / "pigean" / "gene_gene_set_stats.json")
-    finally:
-        con.close()
-    query = (ROOT / "api" / "graphql" / "queries" / "ibd-validation-challenge.graphql").read_text()
-    for prior_max, top, per in [(10.0, 20, 5), (1.0, 2, 1), (0.1, 3, 3)]:
-        variables = json.loads((ROOT / "api/graphql/queries/ibd-validation-challenge.variables.json").read_text())
-        variables.update(phenotype="FIXPHENO", priorMax=prior_max, topGenes=top, setsPerGene=per)
-        old = client.post("/v1/graphql", json={
-            "query": query.replace("phenotype: $phenotype", 'phenotype: $phenotype, collection: "fixture-v1"'),
-            "variables": variables}).json()["data"]["pigeanValidationChallenge"]
-        new = _run({"trait": "FIXPHENO", "library": "fixture-v1", "priorMax": prior_max, "topGenes": top,
-                    "setsPerGene": per}, claims=[]).json()
-        old_rows = [(r["geneAssociation"]["gene"]["symbol"], r["geneAssociation"]["combined"],
-                     [s["geneSetAssociation"]["geneSet"]["name"] for s in r["sets"]]) for r in old["rows"]]
-        new_rows = [(r["subject"]["label"], r["metrics"]["combined"],
-                     [s["row"]["subject"]["label"] for s in r["sets"]]) for r in new["rows"]]
-        assert new_rows == old_rows, (prior_max, top, per)
+def test_reveal_candidates_come_from_run_query(published):
+    """What reveal-mechanisms' scientific_account_job.sh needs from each
+    candidate (gene, combined, direct = log BF, prior, claim id, trait id), read
+    off runQuery rows; the PIGEAN-specific GraphQL fields it used are gone."""
+    body = client.post("/v1/graphql", json={"query": REVEAL_QUERY, "variables": {"variables": {
+        "trait": "FIXPHENO", "library": "fixture-v1", "priorMax": 1.0, "topGenes": 5, "setsPerGene": 1}}}).json()
+    assert "errors" not in body, body.get("errors")
+    rows = body["data"]["runQuery"]["rows"]
+    candidates = [{"gene": r["subject"]["value"], "combined": r["metrics"]["combined"],
+                   "direct": r["metrics"]["log_bf"], "prior": r["metrics"]["prior"],
+                   "claim_id": r["claims"]["measurement"]["id"],
+                   "trait": r["claims"]["measurement"]["triple"]["object"]} for r in rows]
+    assert [c["gene"] for c in candidates] == ["FIXG1", "FIXG2"]
+    assert all(c["claim_id"].startswith("dapper:Claim.") and c["trait"] == "FIXPHENO" for c in candidates)
+    assert all(c["prior"] < 1.0 for c in candidates)
+    assert [r["object"]["id"] for r in rows] == [c["trait"] for c in candidates]
+    for field in ("pigeanValidationChallenge(phenotype: \"FIXPHENO\") { warnings }", "methods { name }",
+                  "gene(symbol: \"FIXG1\") { symbol }", "phenotypes { id }"):
+        gone = client.post("/v1/graphql", json={"query": "{ %s }" % field}).json()
+        assert gone.get("errors") and "Cannot query field" in gone["errors"][0]["message"], field
+
+
+def test_dimension_values_list_what_a_param_takes(published):
+    traits = client.get("/v1/collections/pigean/dimensions/trait").json()
+    assert [v["value"] for v in traits["values"]] == ["FIXPHENO"] and traits["count"] == 1
+    assert traits["values"][0]["datasets"] == 1
+    assert client.get("/v1/collections/pigean/dimensions/trait", params={"search": "fixph"}).json()["count"] == 1
+    assert client.get("/v1/collections/pigean/dimensions/trait", params={"search": "zzz"}).json()["values"] == []
+    libraries = client.get("/v1/collections/pigean/dimensions/library", params={"first": 0}).json()
+    assert libraries["count"] == 1 and libraries["values"] == [] and libraries["truncated"] is True
+    assert client.get("/v1/collections/pigean/dimensions/nope").status_code == 404
+    gql = client.post("/v1/graphql", json={"query": '{ dimensionValues(collection: "pigean", dimension: "library") }'})
+    assert gql.json()["data"]["dimensionValues"]["values"][0]["value"] == "fixture-v1"
 
 
 def test_serving_mints_claims_once_and_counts_reassertions(published):
@@ -297,8 +306,12 @@ def test_discovery_describes_the_collection(published):
     assert d["metrics"]["combined"]["score_kind"] == "SCORE"
     assert {t["name"] for t in d["templates"]} == {"gene", "gene_set", "roster"}
     assert d["claims"]["mintable"] == 20
-    queries = client.get("/v1/collections/pigean/queries").json()["queries"]
-    assert queries[0]["name"] == QUERY and queries[0]["example"]["variables"]["trait"] == "IBD"
+    queries = {q["name"]: q for q in client.get("/v1/collections/pigean/queries").json()["queries"]}
+    assert queries[QUERY]["run"]["rest"]["body"]["variables"]["trait"] == "IBD"
+    assert d["datasets_page"] == {"total": 1, "offset": 0, "first": 50, "returned": 1, "next_offset": None}
+    empty = client.get("/v1/collections/pigean", params={"first": 0}).json()
+    assert empty["datasets"] == [] and empty["datasets_page"]["next_offset"] == 0
+    assert client.get("/v1/collections/pigean", params={"first": 501}).status_code == 422
     document = client.get(f"/v1/collections/pigean/releases/{d['release']['version']}/document").json()
     assert document["result_collections"][0]["id"] == d["release"]["id"]
     assert client.get("/v1/collections/nope").status_code == 404
@@ -518,3 +531,196 @@ def test_files_by_location_are_fetched_checked_and_resumed(tmp_path):
             publish(con, col, bad, tmp_path, workdir=work, fetch=fetch)
     finally:
         con.close()
+
+
+def test_files_without_a_sha256_are_hashed_when_fetched(tmp_path):
+    """A release may give files by location only: each dataset's files are
+    hashed when it is fetched, the caller is told each hash, and the release
+    is recorded only when every file is known. Same release as with hashes."""
+    import hashlib
+
+    col = load_collection(COLLECTION)
+    folders = {p: _variant_files(tmp_path / "upstream", p) for p in ("FIXPHENO", "OTHERPHENO")}
+
+    def spec(with_sha):
+        out = {"version": "0.3.0-unhashed", "datasets": []}
+        for phenotype, folder in folders.items():
+            files = {}
+            for role, name in ROLES.items():
+                data = (folder / name).read_bytes()
+                files[role] = {"location": f"s3://bucket/{phenotype}/{name}", "size": len(data)}
+                if with_sha:
+                    files[role]["sha256"] = hashlib.sha256(data).hexdigest()
+            out["datasets"].append({"dimensions": {"trait": phenotype, "library": "fixture-v1"}, "files": files})
+        return out
+
+    def fetch(location, dest):
+        dest.write_bytes((folders[location.split("/")[3]] / location.rsplit("/", 1)[1]).read_bytes())
+
+    hashed = {}
+    con = _fresh_db()
+    try:
+        first = publish(con, col, spec(False), tmp_path, workdir=tmp_path / "w", fetch=fetch, max_ingest=1,
+                        on_hash=lambda loc, sha, size: hashed.__setitem__(loc, sha))
+        assert not first.complete and first.release_id is None and len(hashed) == 3
+        assert con.execute("SELECT COUNT(*) AS n FROM collection_releases").fetchone()["n"] == 0
+        # The next call knows the first dataset's hashes, so it skips that dataset and hashes the other.
+        resumed = spec(False)
+        for ds in resumed["datasets"]:
+            for f in ds["files"].values():
+                if f["location"] in hashed:
+                    f["sha256"] = hashed[f["location"]]
+        done = publish(con, col, resumed, tmp_path, workdir=tmp_path / "w", fetch=fetch,
+                       on_hash=lambda loc, sha, size: hashed.__setitem__(loc, sha))
+        assert done.complete and done.stats["datasets_ingested"] == 1 and len(hashed) == 6
+    finally:
+        con.close()
+    known = _fresh_db()
+    try:
+        assert publish(known, col, spec(True), tmp_path, workdir=tmp_path / "w2", fetch=fetch).release_id == done.release_id
+    finally:
+        known.close()
+
+
+def test_explorer_examples_validate_and_run(published):
+    """Every example the GraphiQL page opens on is valid against the schema and
+    runs without errors (here on the fixture collection: FIXPHENO, fixture-v1)."""
+    from graphql import parse, validate
+
+    from service import explorer
+    from service.app import schema
+
+    examples = explorer.examples()
+    assert [e["name"][:2] for e in examples] == [f"{i:02d}" for i in range(1, len(examples) + 1)]
+    assert any("runQuery" in e["query"] for e in examples) and any("queries" in e["query"] for e in examples)
+    fixture = {"phenotype": "FIXPHENO", "trait": "FIXPHENO", "library": "fixture-v1", "search": "fix", "gene": "FIXG1"}
+    for e in examples:
+        assert e["query"].lstrip().startswith("#"), f"{e['name']} should open with a comment saying what it does"
+        assert validate(schema, parse(e["query"])) == [], e["name"]
+        variables = json.loads(e["variables"] or "{}")
+        variables = {k: fixture.get(k, v) for k, v in variables.items()}
+        if isinstance(variables.get("variables"), dict):
+            variables["variables"] = {k: fixture.get(k, v) for k, v in variables["variables"].items()}
+        body = client.post("/v1/graphql", json={"query": e["query"], "variables": variables}).json()
+        assert "errors" not in body, (e["name"], body.get("errors"))
+    page = client.get("/v1/graphql")
+    assert page.status_code == 200
+    assert "ValidationChallenge" in page.text and "claims-graphiql-" in page.text and "</script>" in page.text
+
+
+# --- the query catalog (last: it serves every claim the fixture implies) ----
+
+def _ids(rows):
+    return json.dumps(rows, sort_keys=True, default=str) if not rows else [
+        (r["subject"]["id"], sorted((k, c["id"]) for k, c in r["claims"].items()),
+         [(i["row"]["subject"]["id"], sorted((k, c["id"]) for k, c in i["edge"]["claims"].items()))
+          for i in r.get("sets", [])]) for r in rows]
+
+
+def _sample_value(param):
+    return param["values"]["sample"][0]["value"]
+
+
+def test_the_catalog_alone_is_enough_to_run_every_query(published):
+    """A client that reads only GET /v1/queries can build and run every query
+    it lists, and the rows come back as the entry says."""
+    catalog = client.get("/v1/queries").json()
+    assert "runQuery" in catalog["guide"]["graphql"]["field"]
+    assert catalog == client.post("/v1/graphql", json={"query": "{ queries }"}).json()["data"]["queries"]
+    assert catalog["queries"], "the fixture collection has a query"
+    for entry in catalog["queries"]:
+        variables = dict(entry["run"]["rest"]["body"]["variables"])
+        for name, param in entry["params"].items():
+            if "dimension" in param:
+                assert param["values"]["count"] >= 1 and param["values"]["all"].endswith("/" + param["dimension"])
+                variables[name] = _sample_value(param)
+            if "subject" in param:  # a gene or gene set the fixture holds
+                variables[name] = {"Gene": "FIXG1", "GeneSet": "FIXSET_A"}[
+                    entry["returns"]["rows"]["subject"]["entity"]]
+        rest = client.post(entry["run"]["rest"]["path"], json={"variables": variables})
+        assert rest.status_code == 200, rest.text
+        gql = client.post("/v1/graphql", json={"query": entry["run"]["graphql"]["query"],
+                                               "variables": {"variables": variables}}).json()
+        assert "errors" not in gql, gql.get("errors")
+        rows = rest.json()["rows"]
+        assert rows and _ids(gql["data"]["runQuery"]["rows"]) == _ids(rows)  # counters differ: each serve asserts
+        shape = entry["returns"]
+        served = set()
+        for row in rows:
+            assert row["kind"] == shape["rows"]["kind"]
+            assert set(row["metrics"]) == set(shape["rows"]["metrics"])
+            assert set(row["columns"]) == set(shape["rows"]["columns"])
+            assert set(row["claims"]) <= set(shape["rows"]["claims"])
+            served |= set(row["claims"])
+            for name, join in shape["joins"].items():
+                for item in row[name]:
+                    assert item["row"]["kind"] == join["row"]["kind"]
+                    assert set(item["edge"]["claims"]) <= set(join["edge"]["claims"])
+                    served |= set(item["edge"]["claims"]) | set(item["row"]["claims"])
+        assert served and served <= set(entry["claims"])
+        only = client.post(entry["run"]["rest"]["path"],
+                           json={"variables": variables, "claims": [entry["claims"][0]]}).json()["rows"]
+        assert all(set(r["claims"]) <= {entry["claims"][0]} for r in only)
+        # The fixture holds fixture-v1, not the templates' default mouse_msigdb library.
+        assert any("'mouse_msigdb' is not in this release" in n for n in entry["notes"])
+        if entry["name"] == QUERY:
+            meaning = shape["rows"]["metrics"]["combined"]
+            assert meaning["scale"] == "log posterior odds" and meaning["better"] == "higher"
+            assert shape["rows"]["claims"]["measurement"]["scores"] == ["combined", "log_bf", "prior"]
+            assert any("'IBD' is not in this release" in n for n in entry["notes"])
+        else:  # the across-traits templates: one subject, every trait
+            assert {r["subject"]["value"] for r in rows} == {variables.get("gene") or variables.get("geneSet")}
+    assert client.get("/v1/queries", params={"collection": "nope"}).status_code == 404
+    one = {q["name"]: q for q in client.get("/v1/collections/pigean/queries").json()["queries"]}
+    assert set(one) == {QUERY, "gene-across-traits", "gene-set-across-traits"}
+    assert one[QUERY]["params"]["trait"]["dimension"] == "trait" and "subject" in one["gene-across-traits"]["params"]["gene"]
+    [parts] = catalog["collections"]
+    assert parts["row_kinds"]["gene_phenotype"]["metrics"] == ["combined", "log_bf", "prior"]
+    assert parts["edge_kinds"]["member_of"] == {"from": "Gene", "to": "GeneSet"} and parts["dimensions"] == ["trait", "library"]
+
+
+def test_rows_asks_questions_in_graphql_with_the_templates_rules(published):
+    q = """query($subject: [String!], $where: [MetricCondition!], $order: MetricOrder!, $first: Int) {
+      rows(collection: "pigean", kind: "gene_phenotype", dimensions: [{name: "trait", value: "FIXPHENO"}],
+           subject: $subject, where: $where, orderBy: $order, first: $first) {
+        warnings release { version }
+        rows { kind subject { id value } object { id } dataset { dimensions { name value } }
+               prior: metric(name: "prior") metrics { name value } claimKeys
+               claim(key: "measurement") { id triple { subject object } }
+               joined(via: "member_of", kind: "gene_set_phenotype", orderBy: {metric: "beta"}, first: 2) {
+                 row { subject { value } beta: metric(name: "beta") claim(key: "measurement") { id } }
+                 edge { kind claimKeys claim(key: "roster") { id } } } } } }"""
+
+    def run(**v):
+        return client.post("/v1/graphql", json={"query": q, "variables": {"order": {"metric": "prior", "dir": "ASC"},
+                                                                          **v}}).json()
+
+    body = run(where=[{"metric": "log_bf", "gte": 0}], first=5)
+    assert "errors" not in body, body.get("errors")
+    rows = body["data"]["rows"]["rows"]
+    priors = [r["prior"] for r in rows]
+    assert priors == sorted(priors) and len(rows) == 3 and body["data"]["rows"]["warnings"] == []
+    template = _run({"trait": "FIXPHENO", "library": "fixture-v1", "topGenes": 20, "setsPerGene": 2},
+                    claims=["measurement"]).json()["rows"]
+    by_gene = {r["subject"]["value"]: r for r in template}
+    for r in rows:  # the same claims a template serves
+        assert r["claim"]["id"] == by_gene[r["subject"]["value"]]["claims"]["measurement"]["id"]
+        assert "measurement" in r["claimKeys"] and r["dataset"]["dimensions"][1] == {"name": "trait", "value": "FIXPHENO"}
+    with_sets = next(r for r in rows if r["joined"])
+    assert with_sets["joined"][0]["edge"]["claim"]["id"].startswith("dapper:Claim.")
+    one = run(subject=["FIXG1"])["data"]["rows"]["rows"]
+    assert [r["subject"]["value"] for r in one] == ["FIXG1"]
+    assert run(subject=["NOPE"])["data"]["rows"]["warnings"]
+
+    def refused(fragment, query=None, **v):
+        out = client.post("/v1/graphql", json={"query": query or q, "variables": {
+            "order": {"metric": "prior"}, **v}}).json()
+        assert out.get("errors") and fragment in out["errors"][0]["message"], out
+
+    refused("not a metric of gene_phenotype", order={"metric": "beta"})
+    refused("not a metric of gene_phenotype", where=[{"metric": "beta", "gt": 0}])
+    refused("must be between 0 and 500", first=501)
+    refused("has no row kind", query='{ rows(collection: "pigean", kind: "nope", orderBy: {metric: "x"}) { warnings } }')
+    refused("cannot join", query="""{ rows(collection: "pigean", kind: "gene_phenotype", orderBy: {metric: "prior"}) {
+      rows { joined(via: "member_of", kind: "gene_phenotype", orderBy: {metric: "prior"}) { row { kind } } } } }""")
+    assert client.post("/v1/collections/pigean/plans:run", json={"plan": []}).status_code in (404, 405)

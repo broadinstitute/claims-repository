@@ -1,0 +1,44 @@
+# A test object collection: a catalog of knowledge gaps, mechanisms and gene
+# sets, deposited as DAPPER objects (kind: objects) rather than published from
+# result files. Its releases are opened, filled by deposits and closed.
+collection: catalog-test
+kind: objects
+title: Test catalog of knowledge gaps and gene sets
+description: >-
+  Knowledge gaps with the mechanisms they are about, and gene sets with the
+  collections they belong to, as an upstream catalog would deposit them.
+owners: [tests]
+methods: [DisMech, CFDE]
+dapper_profile: 0.2.1-a1
+
+object_kinds:
+  KnowledgeGap:
+    description: An open question curated for a disease.
+    fields:
+      id: {slot: id}
+      name: {slot: name}
+      disease: {slot: about_entities, description: the disease IRIs (and other entities) the gap is about}
+      kind: {slot: gap_kind}
+    links:
+      about: {slot: about_entities, description: the entities the gap is about that this repository holds}
+  Mechanism:
+    fields:
+      name: {slot: name}
+  GeneSetCollection:
+    fields:
+      name: {slot: name}
+  GeneSet:
+    fields:
+      name: {slot: name}
+      size: {slot: n_members}
+    links:
+      collection: {slot: in_gene_set_collection}
+
+# The collection's own vocabulary: disease keys a query may pass -> the IRIs gaps name.
+mappings:
+  disease: mappings/disease.tsv
+
+queries:
+  - queries/gaps-by-disease.yaml
+  - queries/gap-with-anchors.yaml
+  - queries/gene-sets-in-collection.yaml

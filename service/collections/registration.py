@@ -32,7 +32,7 @@ from . import engine
 from . import identity as idn
 from . import publish as pub
 from .manifest import Collection, ManifestError, load_collection, load_release
-from .traits import TraitRegistry, resolve_dimension
+from .traits import MappingError, collection_vocabulary, is_resolved, resolve_dimension
 
 ENV = "CLAIMS_COLLECTION_ROOTS"
 SCAN_DEPTH = 5
@@ -165,7 +165,11 @@ STEPS = [("manifest", "Collection manifest, templates and queries"), ("git", "Gi
 
 def manifest_facets(doc: dict) -> dict:
     """The parts of a manifest the console shows, camelCased at the top level."""
+    if doc.get("kind") == "objects":  # an object collection: classes and their fields instead of files and rows
+        return {"kind": "objects", "dimensions": [], "entities": {}, "rowKinds": {}, "edgeKinds": {}, "fileRoles": {},
+                "metrics": [], "tierRules": {}, "objectKinds": doc["object_kinds"]}
     return {
+        "kind": "files",
         "dimensions": [{"name": d["name"], "resolve": d.get("resolve"), "description": d.get("description")}
                        for d in doc["dataset_dimensions"]],
         "entities": doc["entities"],
@@ -173,7 +177,7 @@ def manifest_facets(doc: dict) -> dict:
         "edgeKinds": doc.get("edge_kinds") or {},
         "fileRoles": doc["file_roles"],
         "metrics": [{"name": name, "scoreKind": m["score_kind"], "scale": m.get("scale"), "better": m.get("better"),
-                     "confirmed": m.get("confirmed"), "description": m.get("description"),
+                     "description": m.get("description"),
                      "interpretation": " ".join((m.get("interpretation") or "").split()) or None}
                     for name, m in doc["metrics"].items()],
         "tierRules": doc.get("tier_rules") or {},
@@ -192,7 +196,7 @@ def _collection_view(col: Collection) -> dict:
         "queries": sorted(col.queries),
         "sourceFiles": [{"kind": kind, "name": name, "path": f.rel, "sha256": f.sha256, "sizeBytes": len(f.data)}
                         for kind, name, f in files],
-        "mintingDigest": col.minting_digest(),
+        "mintingDigest": None if col.is_objects else col.minting_digest(),
     }
 
 
@@ -249,7 +253,7 @@ def check(con, collection_dir: str, release_file: str, sample: int = 3) -> dict:
     except (OSError, yaml.YAMLError, ManifestError) as exc:
         done("release", "error", str(exc))
         return _finish(out)
-    datasets, problems, registry = _inspect_datasets(con, col, spec, base, allowed)
+    datasets, problems, vocab = _inspect_datasets(con, col, spec, base, allowed)
     current = con.execute("SELECT r.version FROM collections c LEFT JOIN collection_releases r ON r.release_id = "
                           "c.current_release_id WHERE c.collection_key = ?", (col.key,)).fetchone()
     stored = con.execute("SELECT release_id FROM collection_releases WHERE collection_key = ? AND version = ?",
@@ -311,16 +315,16 @@ def check(con, collection_dir: str, release_file: str, sample: int = 3) -> dict:
     if plan is not None:
         for i, ds in enumerate(plan["datasets"]):
             try:
-                sample_rows.append(_read_dataset(col, ds, plan["registry"], sample))
+                sample_rows.append(_read_dataset(col, ds, plan["vocab"], sample))
             except KeyError as exc:
                 problems.append(f"dataset {i + 1}: a row has no column {exc}")
             except (pub.PublishError, ManifestError, ValueError, OSError) as exc:
                 problems.append(f"dataset {i + 1}: {exc}")
-    unresolved = sorted(set().union(*(r.unresolved for r in (registry, plan and plan["registry"]) if r)))
+    unresolved = sorted(set().union(*(r.unresolved for r in (vocab, plan and plan["vocab"]) if r)))
     if unresolved:
-        msg = (f"{len(unresolved)} trait key(s) are not in the KPN trait registry and would be kept as given: "
+        msg = (f"{len(unresolved)} key(s) resolve through no mapping and would be kept as given: "
                f"{unresolved[:5]}")
-        if not any(w.startswith(f"{len(unresolved)} trait key(s)") for w in out["warnings"]):
+        if not any(w.startswith(f"{len(unresolved)} key(s)") for w in out["warnings"]):
             out["warnings"].append(msg)
         steps["datasets"]["messages"].append(msg)
     if problems:
@@ -361,12 +365,16 @@ def _manifest_step(cdir: Path, allowed, out, done) -> bool:
 
 def _inspect_datasets(con, col: Collection, spec: dict, base: Path, allowed) -> tuple[list, list, object]:
     """Dimensions and result files as the release names them, without
-    reading any file: (dataset views, problems, trait registry)."""
+    reading any file: (dataset views, problems, the collection's vocabulary)."""
     doc = col.doc
     dims_spec = doc["dataset_dimensions"]
     dim_names = [d["name"] for d in dims_spec]
-    registry = TraitRegistry(con) if any(d.get("resolve") == "kpn-traits" for d in dims_spec) else None
     views, problems = [], []
+    try:
+        vocab = collection_vocabulary(doc, col.root)
+    except MappingError as exc:
+        vocab = None
+        problems.append(str(exc))
     for i, ds in enumerate(spec["datasets"]):
         where = f"dataset {i + 1}"
         raw_dims = ds["dimensions"]
@@ -377,8 +385,8 @@ def _inspect_datasets(con, col: Collection, spec: dict, base: Path, allowed) -> 
             if d["name"] not in raw_dims:
                 continue
             raw = raw_dims[d["name"]]
-            value, label = resolve_dimension(registry, d, raw)
-            resolved = d.get("resolve") != "kpn-traits" or (registry is not None and raw in registry.by_key)
+            value, label = resolve_dimension(vocab, d, raw)
+            resolved = is_resolved(vocab, d, raw)
             dims[d["name"]] = {"raw": raw, "value": value, "label": label, "resolved": resolved}
         unknown = sorted(set(ds["files"]) - set(doc["file_roles"]))
         if unknown:
@@ -395,18 +403,18 @@ def _inspect_datasets(con, col: Collection, spec: dict, base: Path, allowed) -> 
             files.append({"role": role, "path": str(path), "exists": exists, "insideRoots": inside,
                           "sizeBytes": path.stat().st_size if exists else None, "sha256": None, "location": None})
         views.append({"index": i, "dimensions": dims, "datasetId": None, "alreadyIngested": False, "files": files})
-    return views, problems, registry
+    return views, problems, vocab
 
 
-def _read_dataset(col: Collection, ds: dict, registry, sample: int) -> dict:
+def _read_dataset(col: Collection, ds: dict, vocab, sample: int) -> dict:
     """Read every file of a dataset as the ingester would (so a bad row is
     reported now, not at publish), keeping the first `sample` rows per kind."""
-    ents, edges = pub.dataset_entities(col, ds, {}, registry)
+    ents, edges = pub.dataset_entities(col, ds, {}, vocab)
     rows = {}
     for kind in col.doc["row_kinds"]:
         if col.role_for(kind) not in ds["files"]:
             continue
-        it = pub.dataset_rows(col, ds, ents, kind, registry)
+        it = pub.dataset_rows(col, ds, ents, kind, vocab)
         rows[kind] = list(islice(it, sample))
         for _ in it:  # validate the rest
             pass

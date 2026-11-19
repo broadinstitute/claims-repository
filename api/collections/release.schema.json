@@ -59,7 +59,7 @@
                   "minimum": 0
                 }
               },
-              "description": "A result file: a path relative to the release file, or its upstream location with its sha256 and size (fetched when its dataset is ingested).",
+              "description": "A result file: a path relative to the release file, or its upstream location. With a location, sha256 and size may be given; a missing sha256 is computed when the file is first read (and given size is checked).",
               "anyOf": [
                 {
                   "required": [
@@ -68,9 +68,7 @@
                 },
                 {
                   "required": [
-                    "location",
-                    "sha256",
-                    "size"
+                    "location"
                   ]
                 }
               ]
@@ -115,6 +113,48 @@
             "gt": {
               "type": "number"
             }
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "array",
+      "description": "DAPPER provenance documents for the run that wrote the result files: a `path` (stored with the release) or a `url` (referenced; resolved at `resolver`). Each dataset points at the Activity that generated its files.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "path"
+            ]
+          },
+          {
+            "required": [
+              "url"
+            ]
+          }
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "url": {
+            "type": "string",
+            "pattern": "^https?://"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "resolver": {
+            "type": "string",
+            "pattern": "^https?://"
+          },
+          "run": {
+            "type": "string",
+            "pattern": "^dapper:Activity\\."
           }
         }
       }

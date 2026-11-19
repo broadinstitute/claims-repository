@@ -8,7 +8,8 @@
 Checks the manifest, templates and queries (api/collections/*.schema.json),
 reads each dataset's result files, and records a DAPPER ResultCollection
 release with its rows, edges, metrics and mintable claims. Load the KPN trait
-registry first (scripts/load_kpn_traits.py) so trait dimensions resolve.
+registry first (scripts/load_kpn_traits.py) if a dimension declares `resolve: kpn-traits`; a collection
+with its own mappings/<dimension>.tsv (as pigean has) needs no registry.
 --document writes the release's DAPPER document, which dapper's linter can
 check (`--profile result-collection`).
 
@@ -54,7 +55,8 @@ def fetch_s3(location: str, dest: Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("collection", type=Path, help="collection directory (holds collection.yaml)")
-    parser.add_argument("--release", type=Path, required=True, help="release specification YAML")
+    parser.add_argument("--release", type=Path, help="release specification YAML (file-based collections; an object "
+                        "collection, kind: objects, is only registered: its releases are built from deposits)")
     parser.add_argument("--db", default=None, help="SQLite path (default: the service default)")
     parser.add_argument("--document", type=Path, help="write the release's DAPPER document here")
     parser.add_argument("--require-clean", action="store_true",
@@ -79,6 +81,23 @@ def main() -> int:
         print(f"target: SQLite {args.db or db.DB_PATH}")
     try:
         col = load_collection(args.collection)
+        if col.is_objects:
+            from service.collections import objects
+            from service.collections.publish import _git_info
+
+            if args.release:
+                parser.error("an object collection has no release file: register it, then open, fill and close "
+                             "releases with deposits (docs/collections.md)")
+            commit, dirty, _ = _git_info(col.manifest.path)
+            con = db.connect(args.db)
+            try:
+                done = objects.register(con, col, f"{commit}{'-dirty' if dirty else ''}" if commit else None)
+            finally:
+                con.close()
+            print(f"registered object collection {done['collection']}: queries {', '.join(done['queries']) or 'none'}")
+            return 0
+        if not args.release:
+            parser.error("--release is required for a file-based collection")
         spec, base = load_release(args.release)
     except ManifestError as exc:
         print(f"error: {exc}", file=sys.stderr)

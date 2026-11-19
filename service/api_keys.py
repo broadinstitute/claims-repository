@@ -72,6 +72,37 @@ def revoke(con, key_id: str, revoked_by: str | None = None) -> bool:
     return cur.rowcount == 1
 
 
+COLLECTION_KEY_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+
+
+def grant(con, key_id: str, collection: str, granted_by: str | None = None) -> bool:
+    """Let a key deposit into a collection. False when the grant already exists."""
+    if not COLLECTION_KEY_RE.match(collection or ""):
+        raise ValueError("collection must be a collection key such as dismech")
+    if con.execute("SELECT 1 FROM api_key_grants WHERE key_id = ? AND collection_key = ?", (key_id, collection)).fetchone():
+        return False
+    con.execute(f"INSERT INTO api_key_grants (key_id, collection_key, granted_at, granted_by) VALUES (?, ?, {con.dialect.now}, ?)",
+                (key_id, collection, _actor(granted_by)))
+    return True
+
+
+def revoke_grant(con, key_id: str, collection: str) -> bool:
+    return con.execute("DELETE FROM api_key_grants WHERE key_id = ? AND collection_key = ?",
+                       (key_id, collection)).rowcount > 0
+
+
+def grants(con, key_id: str) -> list[str]:
+    return [r["collection_key"] for r in con.execute(
+        "SELECT collection_key FROM api_key_grants WHERE key_id = ? ORDER BY collection_key", (key_id,))]
+
+
+def has_grant(con, depositor: dict, collection: str) -> bool:
+    """Whether the key may write into the collection. Read inside the write's transaction as a locking read, like
+    still_valid: a grant withdrawn before this point stops the write; one withdrawn after it waits for the write."""
+    return con.execute(f"SELECT 1 FROM api_key_grants WHERE key_id = ? AND collection_key = ?{con.dialect.lock_share}",
+                       (depositor["key_id"], collection)).fetchone() is not None
+
+
 def list_keys(con) -> list[dict]:
     rows = con.execute(
         "SELECT k.key_id, k.name, k.created_at, k.created_by, k.revoked_at, k.revoked_by, "
@@ -79,8 +110,12 @@ def list_keys(con) -> list[dict]:
         "(SELECT MAX(d.received_at) FROM deposits d WHERE d.key_id = k.key_id) AS last_deposit_at "
         "FROM api_keys k ORDER BY k.created_at, k.key_id"
     ).fetchall()
-    return [{name: (str(row[name]) if name.endswith("_at") and row[name] is not None else row[name])
-             for name in ("key_id", "name", "created_at", "created_by", "revoked_at", "revoked_by", "deposits", "last_deposit_at")}
+    held: dict[str, list[str]] = {}
+    for r in con.execute("SELECT key_id, collection_key FROM api_key_grants ORDER BY collection_key"):
+        held.setdefault(r["key_id"], []).append(r["collection_key"])
+    return [{**{name: (str(row[name]) if name.endswith("_at") and row[name] is not None else row[name])
+                for name in ("key_id", "name", "created_at", "created_by", "revoked_at", "revoked_by", "deposits",
+                             "last_deposit_at")}, "collections": held.get(row["key_id"], [])}
             for row in rows]
 
 
@@ -130,7 +165,8 @@ def new_deposit_id() -> str:
     return "dep_" + format(int(time.time() * 1000), "012x")[-12:] + secrets.token_hex(10)
 
 
-def record_deposit(con, depositor: dict, deposited: list[dict], edges=()) -> str:
+def record_deposit(con, depositor: dict, deposited: list[dict], edges=(), collection: str | None = None,
+                   release: str | None = None) -> str:
     """Record one accepted bundle inside its own transaction: the key, the time, every object it carried (whether
     this deposit created the object or it already existed) and the document's edges, which have no ids of their own
     and so belong to the deposit that carried them."""
@@ -141,8 +177,9 @@ def record_deposit(con, depositor: dict, deposited: list[dict], edges=()) -> str
         # document was kept; the record shows that this depositor held a different one.
         objects.setdefault(item["id"], "differs" if item.get("stored_differs") else item["status"])
     con.execute(
-        f"INSERT INTO deposits (deposit_id, key_id, received_at, object_count) VALUES (?, ?, {con.dialect.now}, ?)",
-        (deposit_id, depositor["key_id"], len(objects)),
+        f"INSERT INTO deposits (deposit_id, key_id, received_at, object_count, collection_key, release_version) "
+        f"VALUES (?, ?, {con.dialect.now}, ?, ?, ?)",
+        (deposit_id, depositor["key_id"], len(objects), collection, release),
     )
     con.executemany(
         "INSERT INTO deposit_objects (deposit_id, object_id, status) VALUES (?, ?, ?)",
@@ -160,11 +197,16 @@ def record_deposit(con, depositor: dict, deposited: list[dict], edges=()) -> str
 
 def _deposit(row) -> dict:
     return {"deposit_id": row["deposit_id"], "received_at": str(row["received_at"]), "object_count": row["object_count"],
-            "depositor": {"key_id": row["key_id"], "name": row["name"]}}
+            "depositor": {"key_id": row["key_id"], "name": row["name"]},
+            "collection": ({"key": row["collection_key"], "release": row["release_version"],
+                            "release_id": row["release_id"], "state": row["release_state"]}
+                           if row["collection_key"] else None)}
 
 
-_DEPOSIT_SELECT = ("SELECT d.deposit_id, d.received_at, d.object_count, d.key_id, k.name "
-                   "FROM deposits d JOIN api_keys k ON k.key_id = d.key_id")
+_DEPOSIT_SELECT = ("SELECT d.deposit_id, d.received_at, d.object_count, d.key_id, k.name, d.collection_key, "
+                   "d.release_version, r.release_id, r.state AS release_state "
+                   "FROM deposits d JOIN api_keys k ON k.key_id = d.key_id "
+                   "LEFT JOIN object_releases r ON r.collection_key = d.collection_key AND r.version = d.release_version")
 
 
 def deposits(con, *, object_id=None, deposited_by=None, limit=50, offset=0) -> dict:
