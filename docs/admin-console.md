@@ -5,8 +5,8 @@ The admin console is the `/admin` section of the claims repository frontend, a N
 | Page | What it shows |
 | --- | --- |
 | Overview | Minted (served at least once) and uncollected claims; assertion totals and 24h activity; the registered collections with their current release and claims served; claims minted per day (30 UTC days); objects by class; the KPN trait registry release |
-| Collections | Every registered collection with its title, handle and ID, its current release, dataset count and claim counts |
-| Collection detail (`/admin/collections/<uuid>`) | One collection at one release (the release picker lists earlier versions): its ID and handle, data model, datasets and their files, claim templates with example claims, metrics and tier rules, queries with a runnable example, source files and the raw manifest. The query example runs the query without serving claims. Collections are addressed by UUID. A handle in the URL still loads the collection, and the page replaces it with the UUID. |
+| Collections | Every registered collection with its title and handle, its current release, dataset count and claim counts |
+| Collection detail (`/admin/collections/<handle>`) | One collection at one release (the release picker lists earlier versions): its handle, data model, datasets and their files, claim templates with example claims, metrics and tier rules, queries with a runnable example, source files and the raw manifest. The query example runs the query without serving claims. Collections are addressed by handle. |
 | Add collection (`/admin/register`) | Registers a collection from files on the API machine's disk. The manifest needs an `id`. See "Add a collection". |
 | Claims | Every served collection claim and every uncollected claim, with search, filters (collection, claim key, origin) and sorting, and pagination. Opening a claim re-renders it from its template and reports whether it still matches its content address and the stored copy. Opening never asserts or mints. |
 | Tables | Exact row counts, sizes (MySQL) and applied/pending migrations; a read-only row browser in primary-key order with a contains/equals filter on one column. The legacy `pigean_*` tables are listed here. |
@@ -62,10 +62,10 @@ Register `http://localhost:3000/api/auth/callback/google` on the client as well,
 
 ## Add a collection
 
-A collection is a directory with `collection.yaml`, templates, queries and a `releases/` folder, plus a release file that lists each dataset's dimension values and result files. The manifest needs a top-level `id`, a lowercase UUID that identifies the collection, written once and never changed (make one with `uuidgen | tr A-Z a-z`). Its `collection:` field is the handle, a short name such as `pigean` that can be changed later and may not look like a UUID. The Add collection page needs `CLAIMS_COLLECTION_ROOTS` on the API. Without it the page says what to set and shows the CLI command. Four steps:
+A collection is a directory with `collection.yaml`, templates, queries and a `releases/` folder, plus a release file that lists each dataset's dimension values and result files. The manifest's `collection:` field is the handle, a short name such as `pigean` that identifies the collection; claim ids depend on it, so choose it once. The Add collection page needs `CLAIMS_COLLECTION_ROOTS` on the API. Without it the page says what to set and shows the CLI command. Four steps:
 
 1. **Choose the source.** Pick a collection directory and release file found under the roots, or type the paths.
-2. **Check.** Reads the files and writes nothing. Reports the manifest and its id, git state (uncommitted changes are a warning), release state (new collection, new version, already published, or conflict with a different release of the same version), and each dataset's dimensions and files. Release state is decided by the id. If the id is already registered under another handle or title, the check warns that publishing renames the collection. If another collection's id already owns the handle, the check reports an error and a publish is refused. Problems appear in the report.
+2. **Check.** Reads the files and writes nothing. Reports the manifest and its handle, git state (uncommitted changes are a warning), release state (new collection, new version, already published, or conflict with a different release of the same version), and each dataset's dimensions and files. Release state is decided by the handle. Problems appear in the report.
 3. **Preview sample claims.** Renders a few claims per template, with the same ids a publish records.
 4. **Publish.** Runs the real publish as a background job, with an option to require a clean git tree. The page shows the job's phase and result.
 

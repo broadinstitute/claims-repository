@@ -85,9 +85,9 @@ collection from the toolkit, then ask it about itself and run its query.
   --release ../kpn-dapper-toolkit/collections/pigean/releases/2026.11.0.yaml
 ```
 
-A collection is identified by the UUID in its manifest. The short name in these URLs (`pigean`) is its
-handle, and it resolves to the UUID. Responses identify the collection by that UUID (`id`), with the
-handle as `key`.
+A collection is identified by its handle, the manifest's `collection:` (`pigean` in these URLs), and
+responses return it as `id`. To create and publish a collection of your own with the `claims` CLI, see
+[docs/creating-a-collection.md](docs/creating-a-collection.md).
 
 ```bash
 curl -s localhost:8100/v1/collections/pigean

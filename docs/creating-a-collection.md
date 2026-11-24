@@ -1,7 +1,8 @@
 # Creating a collection
 
-> **Status (2026-11-17): partly built.** A local version of the `claims` CLI and a Parquet result
-> store exist in this repository (`bin/claims`); the commands marked *planned* below do not exist yet.
+> **Status (2026-11-24): partly built.** The `claims` CLI (`bin/claims`) and a Parquet result store
+> exist in this repository, and the walk below was re-run from a fresh clone on 2026-11-24; the commands
+> marked *planned* below do not exist yet.
 > [What exists today](#what-exists-today) says which is which. The worked example uses the real
 > PIGEAN run that was published on QA as the `pigean` collection, and the numbers are that run's.
 > Background: [collections.md](collections.md), and the design study *Querying PIGEAN results where
@@ -41,18 +42,57 @@ flowchart LR
 
 ---
 
-## Step 0. Install the CLI and sign in
+## Step 0. Set up the CLI
+
+The CLI runs from a clone of this repository, on any machine that can read the result files (Python 3.12
+and, for S3, the aws CLI with credentials that can list and get the files):
 
 ```bash
-pip install claims-repository-cli
+git clone git@github.com:broadinstitute/claims-repository.git && cd claims-repository
+python3 -m venv .venv && .venv/bin/pip install -r requirements-cli.txt
+aws sts get-caller-identity          # S3 sources: the CLI reads through the aws CLI
 ```
+
+Every command that reads or writes a deployment names one: a control-plane SQLite file and a Parquet
+index directory, both created on first use. Set them once per shell:
 
 ```bash
-claims login --api https://api-qa.hugeampkpnbi.org/api/claims
+export CLAIMS_DB=$HOME/claims-local/claims.db CLAIMS_INDEX_DIR=$HOME/claims-local/index
 ```
 
-`claims login` stores your publisher key, which an admin issues in the admin console's **Keys** page.
-Reading never needs a key; publishing always does.
+The CLI refuses the repository's own `claims.db` and refuses to run when `CLAIMS_MYSQL_HOST` is set: it
+writes only to a local deployment. `claims serve --port <port>` serves that deployment over HTTP
+(default port 8100).
+
+Trait suggestions in `collection init` and `vocab check` read a KPN trait release file from a
+[kpn-data-models](https://github.com/broadinstitute/kpn-data-models) clone. Point `CLAIMS_TRAIT_RELEASE`
+(or `--traits`) at `versions/trait/v0.0.2/kpn_trait_collection.yaml` in that clone. Without it the commands
+still run and only the suggestions are missing.
+
+`claims login` and publishing to a deployed API with a publisher key are planned; today the CLI publishes
+into the local deployment.
+
+### Starting from an existing collection
+
+A new collection that reads files laid out like an existing one (another PIGEAN run, say) can start from a
+copy of that collection's directory instead of Step 2. The PIGEAN collection is kept in
+[kpn-dapper-toolkit](https://github.com/broadinstitute/kpn-dapper-toolkit) under `collections/pigean/`.
+
+```bash
+cp -R ../kpn-dapper-toolkit/collections/pigean my-collection
+rm -rf my-collection/releases/* my-collection/provenance
+```
+
+Then, before planning a release:
+
+- **`collection.yaml`**: set `collection:` to a new handle and change `title:`. The handle is the
+  collection's identity: claim ids depend on it, so a copy that keeps `pigean` collides with the
+  published collection. Choose it once.
+- **`source.yaml`**: point `location:` and `path:` at the new files, and update `run:`.
+- **Vocabulary**: run `claims vocab check my-collection` (Step 4). The copied `mappings/` cover the
+  traits of the original run; new keys show as unmapped.
+- Everything else (templates, queries, tier rules) carries over. Run `claims collection validate`, then
+  continue at Step 8.
 
 ---
 
@@ -633,7 +673,7 @@ claims release status pigean 2026.11.1
 ```
 
 ```text
-pigean 2026.11.1   ingesting   25 / 1,444 datasets   8,288 rows, 386,684 edges, 33,151 claims
+pigean 2026.11.1   ingesting   25 / 1,444 datasets   8,288 rows, 386,684 edges
                    not served yet: the release is recorded when every dataset is in
 ```
 
@@ -692,8 +732,8 @@ To see every query a published collection offers, with its params and the values
 rows it returns and a request that runs as given, read `GET /v1/queries` (GraphQL: `{ queries }`).
 
 Serving a claim records it: the first time a claim is served it is stored, and every later serve is
-counted. Before storing, the repository re-renders the claim from the row and its template, and refuses
-it unless the id matches the one recorded at publish.
+counted. A claim's id is computed from its row, the file bytes and its template under the release's
+mint context, so the same row always gives the same id, whenever it is first served.
 
 ---
 
@@ -793,7 +833,7 @@ and query answers as release 2026.11.1 on QA.
 
 | Step | Command | State |
 | --- | --- | --- |
-| 0 | `claims login` | planned. The local CLI writes to the deployment named by `--db` and `--index-dir`, and refuses to run when `CLAIMS_MYSQL_HOST` is set. |
+| 0 | setup, `claims login` | setup built (`requirements-cli.txt`); `claims login` planned. The local CLI writes to the deployment named by `--db` and `--index-dir` (or `CLAIMS_DB` and `CLAIMS_INDEX_DIR`), and refuses to run when `CLAIMS_MYSQL_HOST` is set. |
 | 1 | `claims sources check` | built (S3 through the aws CLI) |
 | 2 | `claims collection init` | built: samples files from S3, infers the path pattern, row and edge kinds, identifiers and metrics, writes a draft with `TODO`s and a `GUIDE.md` |
 | 3 | `source.yaml` | built: location, path pattern, roles with `optional` and `requires`, `run`, `where` |

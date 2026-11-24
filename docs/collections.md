@@ -28,7 +28,7 @@ the same claims and the same challenge-query results, and then a second method
 | Owner-hosted APIs | Pull and snapshot a release through a small Rows contract; live calls only for data that cannot leave the owner's system. |
 | Query surface | A generic plan executor, `runQuery(collection, query, variables)`. Typed GraphQL may be generated later. |
 | Organizing object | The **collection**: files, datasets, templates and queries, released together, and self-describing. |
-| Collection identity | The **handle** (the manifest's `collection:`, such as `pigean`), decided 2026-11-17 by Chase: it is what a collection is addressed by and what claim ids depend on. A UUID, if one is ever added, is internal to the database and enters no id. The UUID-as-identity design described in §1, §2 and §12 below was never built and is superseded by this row. |
+| Collection identity | The **handle** (the manifest's `collection:`, such as `pigean`), decided 2026-11-17 by Chase: it is what a collection is addressed by and what claim ids depend on. A UUID, if one is ever added, is internal to the database and enters no id. A UUID-as-identity design was drafted before this decision and never built; the sections below describe the handle. |
 | Collection in DAPPER | Each release is a DAPPER `ResultCollection` record; the release id is its DAPPER id, and its `collection_key` holds the collection's handle. `ResultCollection` and `GeneSetCollection` both inherit from an abstract DAPPER `Collection` (members plus a version chain). |
 | Bringing data | Upload, an owner's Rows API, or a pointer to a data repository: a Croissant record, a DOI or DRS objects. All three snapshot bytes by sha256. |
 | Ids | DAPPER-ID-1 now, through dapper's own `dapper_identity` at the 0.2.1-a1 tag. No interim local-dev scheme. |
@@ -38,7 +38,7 @@ the same claims and the same challenge-query results, and then a second method
 ## 1. Model
 
 ```
-Collection  id 7b0f6c1e-2d4a-4e8b-9c35-1a6f0d2e8b47   handle pigean   owners, title, description
+Collection  pigean (the handle)   owners, title, description
  └─ Release  2026.11.0                      a DAPPER ResultCollection record: immutable, content-addressed
      ├─ Templates   claim templates + tier rules (versioned with the release)
      ├─ Queries     query templates (params, plan, example)
@@ -47,17 +47,14 @@ Collection  id 7b0f6c1e-2d4a-4e8b-9c35-1a6f0d2e8b47   handle pigean   owners, ti
 ```
 
 - **Collection.** A named, owned group of results, usually from one method.
-  Its identity is the UUID in the manifest's `id`. The manifest's
-  `collection:` field is its handle, a short name such as `pigean` that is
-  unique across collections and resolves to the id; it may not itself look like
-  a UUID. Title, owners, description and handle can change. Nothing that mints
-  claims can. A rename changes no claim id, no mint-context Activity id and no
-  dataset id, because claim identity uses the UUID. It does change the release
-  id, since a release records the exact manifest bytes and its name carries the
-  title, so a rename is published as a new version. The same version with a
-  renamed manifest is refused as a conflict. Old handles are not kept as
-  aliases, and a handle that another collection id owns is refused. In DAPPER,
-  the UUID is the `collection_key` that names the collection across releases.
+  Its identity is its handle, the manifest's `collection:` field, a short name
+  such as `pigean` that is unique across collections. Claim ids, mint-context
+  Activity ids and dataset ids depend on the handle, so it is chosen once and
+  not changed: a collection under a new handle is a new collection. Title,
+  owners and description can change; a release records the exact manifest
+  bytes, so such a change is published as a new version, and the same version
+  with a changed manifest is refused as a conflict. In DAPPER, the handle is
+  the `collection_key` that names the collection across releases.
 - **Release.** One DAPPER `ResultCollection` record, immutable and
   content-addressed. It pins the claim templates, query templates, manifest
   and every dataset's files. The release id is that record's DAPPER id, and
@@ -92,8 +89,7 @@ governance step, the same rule the KPN trait registry uses. Illustrative:
 
 ```yaml
 # collections/pigean/collection.yaml
-id: 7b0f6c1e-2d4a-4e8b-9c35-1a6f0d2e8b47   # the collection's identity: a lowercase UUID, written once, never changed
-collection: pigean                         # its handle: a unique short name that can change and resolves to the id
+collection: pigean                         # the handle: the collection's identity, unique, chosen once
 title: PIGEAN gene and gene-set associations
 owners: [dig-aggregator-pipeline]
 methods: [PIGEAN]
@@ -129,7 +125,7 @@ the data, linted with DAPPER's `result-collection` profile. Abridged; dapper's
 ```yaml
 result_collections:
   - id: dapper:ResultCollection.<digest>          # the release id
-    collection_key: 7b0f6c1e-2d4a-4e8b-9c35-1a6f0d2e8b47   # the collection's UUID, not its handle
+    collection_key: pigean                         # the collection's handle
     version: 2026.11.0
     methods: [PIGEAN]
     dataset_dimensions: [trait, library]
@@ -189,9 +185,9 @@ evidence: { per_metric: true, locator: value }   # byte-exact ValueLocator into 
 **One placeholder namespace for every layer:** `row.<column>`,
 `subject.{id,label}`, `object.{id,label}`, `dataset.<dimension>`,
 `collection.id`, `release.id`, `metric.<name>.{value,text}`,
-`tier.{label,rule,rule_version}`. `collection.id` is the collection's UUID. The handle and the title are not
-available to templates, because they are not part of claim identity, and a
-template that uses `{collection.key}` is refused. Today measurement claims and tier claims
+`tier.{label,rule,rule_version}`. `collection.id` is the collection's handle. The title is not available to
+templates, because it is not part of claim identity, and a template that uses
+`{collection.key}` is refused. Today measurement claims and tier claims
 see different names, and numbers render differently between them.
 
 **Fixed function vocabulary.** Everything the Python does today, and nothing
@@ -266,7 +262,7 @@ one row, because its id does not depend on the release.
 
 | Table | Holds |
 | --- | --- |
-| `collections` | `collection_id` (the manifest's UUID, primary key), `collection_key` (the handle, unique), title, description, current release |
+| `collections` | `collection_key` (the handle, primary key), title, description, current release |
 | `collection_releases` | release id (the `ResultCollection` DAPPER id), `collection_id`, version (unique per collection), manifest, its DAPPER document, git commit, published_at |
 | `datasets` | release, dimension tuple |
 | `release_files` | dataset, role, sha256, size, location |
@@ -324,7 +320,7 @@ example: { trait: IBD }
 Every collection describes itself from its manifest, so the docs can't drift
 from what runs:
 
-- `GET /v1/collections`: `id` (the UUID), `key` (the handle), title, methods,
+- `GET /v1/collections`: `id` (the handle), title, methods,
   current release, dataset count.
 - `GET /v1/collections/{c}`: releases; datasets with their dimension values
   and labels (which traits are covered); row and edge kinds; metrics with
@@ -336,9 +332,7 @@ from what runs:
   admin console shows it through its own admin API.
 
 In every path `{c}`, and in every GraphQL argument that names a collection, the
-reference is either the UUID or the handle. A handle only resolves to the UUID.
-Responses return the UUID as `id` and the handle as `key`, and the URLs and
-example calls the API generates use the UUID.
+reference is the handle, and responses return it as `id`.
 
 This gives a person or an LLM agent one route: list collections, read a
 manifest, run a query. An MCP tool later is a thin wrapper over these three
