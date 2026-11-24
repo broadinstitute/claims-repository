@@ -184,10 +184,9 @@ evidence: { per_metric: true, locator: value }   # byte-exact ValueLocator into 
 
 **One placeholder namespace for every layer:** `row.<column>`,
 `subject.{id,label}`, `object.{id,label}`, `dataset.<dimension>`,
-`collection.id`, `release.id`, `metric.<name>.{value,text}`,
-`tier.{label,rule,rule_version}`. `collection.id` is the collection's handle. The title is not available to
-templates, because it is not part of claim identity, and a template that uses
-`{collection.key}` is refused. Today measurement claims and tier claims
+`file.{name,id}`, `collection.key`, `metric.<name>.{value,text}`,
+`tier.label`. `collection.key` is the collection's handle, which is part of claim
+identity. The title is not available to templates, because it is not part of claim identity. Today measurement claims and tier claims
 see different names, and numbers render differently between them.
 
 **Fixed function vocabulary.** Everything the Python does today, and nothing
