@@ -12,6 +12,8 @@ nav:
   - Home: index.md
   - Introduction: introduction.md
   - Inputs and outputs: inputs-and-outputs.md
+  - Collections: collections.md
+  - Creating a collection: creating-a-collection.md
   - Method modules: method-modules.md
   - Graph-query contract design: query-graph-design.md
   - Admin console: admin-console.md

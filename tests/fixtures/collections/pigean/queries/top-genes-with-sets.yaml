@@ -1,0 +1,49 @@
+# The IBD validation challenge as a query template: top genes for a trait,
+# each with its strongest gene sets. Same semantics as the service's
+# pigeanValidationChallenge: filter, order and limit the anchor genes before
+# any join; ties break by entity ascending; each gene keeps its own window of
+# sets.
+query: top-genes-with-sets
+description: >-
+  Top genes for a trait by combined score (optionally only genes whose prior
+  is below a threshold), each with its strongest gene sets by marginal effect.
+params:
+  trait:
+    type: string
+    required: true
+    description: Trait as a KPN.TRAIT id or a legacy key such as IBD.
+  library:
+    type: string
+    default: mouse_msigdb
+    description: Gene-set library.
+  priorMax:
+    type: number
+    description: Keep only genes whose prior is below this value. Omit for no filter.
+  topGenes:
+    type: integer
+    default: 20
+    min: 0
+    max: 200
+  setsPerGene:
+    type: integer
+    default: 10
+    min: 0
+    max: 50
+plan:
+  - anchor:
+      kind: gene_phenotype
+      dimensions: {trait: $trait, library: $library}
+      where: {prior: {lt: $priorMax}}
+      order: {metric: combined, dir: desc}
+      limit: $topGenes
+  - join:
+      as: sets
+      via: member_of
+      kind: gene_set_phenotype
+      order: {metric: beta_uncorrected, dir: desc}
+      limit_per_anchor: $setsPerGene
+example:
+  trait: IBD
+  priorMax: 0.5
+  topGenes: 20
+  setsPerGene: 5

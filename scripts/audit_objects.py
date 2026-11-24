@@ -87,7 +87,12 @@ def main() -> int:
             continue
         if payload.get("id") != oid:
             problems.append(f"{oid}: payload.id mismatch ({payload.get('id')})")
-        if payload.get("class_name") != cls:
+        # A plain DAPPER node (DAPPER-ID-1: a deposit, a collection claim) carries no class_name; its class is
+        # in its id. A legacy document carries one, and it must agree with the row.
+        declared = payload.get("class_name")
+        if declared is None:
+            declared = oid.partition(":")[2].partition(".")[0] if oid.startswith("dapper:") else None
+        if declared != cls:
             problems.append(f"{oid}: payload.class_name mismatch ({payload.get('class_name')})")
         # References first: every stored object's refs belong in the index,
         # whatever its class.

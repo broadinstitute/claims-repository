@@ -1,0 +1,25 @@
+# One roster claim per gene set and dataset, grouped from the member_of edges
+# of the dataset's membership file. The GeneSet entity's content-addressed
+# `members` list pins the exact roster.
+template: roster
+version: 1.0.0
+for: member_of
+group_by: to
+
+claims:
+  - key: roster
+    proposition:
+      statement: >-
+        In the {dataset.library} gene-set library, the gene set {group.label}
+        comprises {group.count} member genes; the exact roster is recorded in
+        its content-addressed GeneSet entity.
+      subject: "{group.id}"
+      relation: has_members
+      object: "{group.parent}"
+      scope: "PIGEAN gene-set library {dataset.library} membership (observed roster)."
+      kind: RESULT
+    name: "PIGEAN roster: {group.label}"
+    statement: >-
+      The {dataset.library} gene-set library used by PIGEAN defines the
+      membership of {group.label}: {group.count} genes observed in {file.name}.
+    source_locator: "{file.name}#gene_set={group.label}"

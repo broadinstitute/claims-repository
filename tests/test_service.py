@@ -1,6 +1,5 @@
 """Contract tests on a throwaway DB: deposit idempotency, the objects-only
-REST surface (resolver, list, search), GraphQL queries over deposited claims,
-and — via the real loader on small fixtures — claims synthesized when served
+REST surface (resolver, list, search), GraphQL claim lookups, and — via the real loader on small fixtures — claims synthesized when served
 (2026-11-09: claims are minted when queried)."""
 import importlib.util
 import json
@@ -22,13 +21,45 @@ ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures" / "pigean"
 client = TestClient(app)
 
+# Deposits are validated DAPPER at DAPPER-ID-1 addresses, which nobody can write by hand. Bundles here are written
+# with symbolic ids ("dapper:Claim.SYNTHG01"); `_deposit` mints the real objects they describe (dependency order,
+# references rewritten) and `R` / `ids` name the minted ids afterwards. See tests/dapper_fixtures.py.
+from dapper_fixtures import R, ids, remint  # noqa: E402
+
 
 def _bundle():
-    return json.loads((ROOT / "api" / "examples" / "deposit-bundle.request.json").read_text())
+    """The PIGEAN gene-phenotype bundle of the published deposit example, written with symbolic ids."""
+    return json.loads((ROOT / "tests" / "fixtures" / "deposits" / "pigean-gene-claim.symbolic.json").read_text())
+
+
+def _deposit(bundle):
+    """POST /v1/deposits with the real DAPPER objects a symbolic bundle describes."""
+    return client.post("/v1/deposits", json=remint(bundle))
+
+
+def _seed(*documents, profile="unverified"):
+    """Write documents straight into the store, the way a loader or an earlier version of the service did. Deposit
+    refuses documents that are not valid DAPPER, but such rows exist in stored data, so the read side is still
+    tested against them."""
+    from service.refs import dapper_refs
+    con = service_db.connect()
+    try:
+        with con:
+            for doc in documents:
+                con.execute(con.dialect.upsert_object, (doc["id"], doc["class_name"], profile, json.dumps(doc, sort_keys=True)))
+                refs = sorted(dapper_refs(doc))
+                if refs:
+                    con.executemany(con.dialect.insert_ref, [(doc["id"], ref) for ref in refs])
+                if doc["class_name"] == "Claim":
+                    con.execute(f"{con.dialect.insert_or_ignore} claims (claim_id, proposition_id, method) VALUES (?, ?, ?)",
+                                (doc["id"], doc.get("proposition", "") if isinstance(doc.get("proposition"), str) else "", ""))
+    finally:
+        con.close()
 
 
 def _gql(query, variables=None):
-    return client.post("/v1/graphql", json={"query": query, "variables": variables or {}}).json()
+    """GraphQL; symbolic fixture ids in the query are replaced by the minted ids they stand for."""
+    return client.post("/v1/graphql", json={"query": ids(query), "variables": variables or {}}).json()
 
 
 def test_health():
@@ -45,9 +76,9 @@ def test_swagger_docs_and_contract():
     assert contract.status_code == 200
     assert contract.text.startswith("openapi:")
     # REST output is objects only: resolver + general list + search.
-    for path in ("/v1/objects/{object_id}:", "/v1/objects:", "/v1/objects/search:"):
+    for path in ("/v1/objects/{object_id}:", "/v1/objects:", "/v1/objects/search:", "/v1/deposits:", "/v1/deposits/{deposit_id}:"):
         assert path in contract.text
-    for removed in ("/v1/claims/{claim_id}", "/v1/claims/search", "/v1/propositions"):
+    for removed in ("/v1/claims/{claim_id}", "/v1/claims/search", "/v1/claims:", "/v1/propositions"):
         assert removed not in contract.text
     # This deployment is injected as the FIRST server, so Swagger try-it-out
     # stays same-origin (the localhost vs 127.0.0.1 CORS trap).
@@ -72,19 +103,19 @@ def test_swagger_docs_and_contract():
 
 
 def test_deposit_is_idempotent_and_retrievable():
-    first = client.post("/v1/claims", json=_bundle())
+    first = _deposit(_bundle())
     assert first.status_code == 200
     statuses = {d["id"]: d["status"] for d in first.json()["deposited"]}
-    assert statuses["dapper:Claim.SYNTHG01"] == "created"
+    assert statuses[R("dapper:Claim.SYNTHG01")] == "created"
 
-    second = client.post("/v1/claims", json=_bundle())
+    second = _deposit(_bundle())
     deposited = second.json()["deposited"]
     assert {d["status"] for d in deposited} == {"exists"}
     # The counter tracks every idempotent re-deposit of the same content.
     times = {d["id"]: d["times_deposited"] for d in deposited}
-    assert times["dapper:Claim.SYNTHG01"] == 2
+    assert times[R("dapper:Claim.SYNTHG01")] == 2
 
-    got = client.get("/v1/objects/dapper:Claim.SYNTHG01")
+    got = client.get(ids("/v1/objects/dapper:Claim.SYNTHG01"))
     assert got.status_code == 200
     assert got.json()["class_name"] == "Claim"
     env = _gql("""{ claim(id: "dapper:Claim.SYNTHG01") {
@@ -97,14 +128,14 @@ def test_deposit_is_idempotent_and_retrievable():
 def test_measurement_claim_carries_evidence():
     """has_evidence -> EvidenceItem -> ValueLocator, dereferenced on the
     GraphQL envelope."""
-    client.post("/v1/claims", json=_bundle())
+    _deposit(_bundle())
     env = _gql("""{ claim(id: "dapper:Claim.SYNTHG01") {
         triple { subject predicate object } evidence { item valueLocators } } }""")["data"]["claim"]
     assert env["triple"] == {"subject": "NOD2", "predicate": "associated_with", "object": "IBD"}
     assert len(env["evidence"]) == 1
     item = env["evidence"][0]["item"]
     assert item["class_name"] == "EvidenceItem"
-    assert item["target_proposition"] == "dapper:Proposition.SYNTHG01"
+    assert item["target_proposition"] == R("dapper:Proposition.SYNTHG01")
     locators = env["evidence"][0]["valueLocators"]
     assert [loc["value_text"] for loc in locators] == ["9.8"]
     assert locators[0]["file"] == "dapper:File.SYNTHGENESTATS"
@@ -112,12 +143,12 @@ def test_measurement_claim_carries_evidence():
 
 def test_identifier_resolution_and_resolver_urls():
     """CURIE stays canonical; every response offers the shareable URL form."""
-    client.post("/v1/claims", json=_bundle())
+    _deposit(_bundle())
     idres = client.get("/v1/vocabulary").json()["identifier_resolution"]
     assert idres["prefixes"]["dapper"].startswith("https://")
     assert idres["resolver_url_template"].endswith("/v1/objects/{id}")
     data = _gql("""{ claim(id: "dapper:Claim.SYNTHG01") { resolverUrl } identifierResolution }""")["data"]
-    assert data["claim"]["resolverUrl"].endswith("/v1/objects/dapper:Claim.SYNTHG01")
+    assert data["claim"]["resolverUrl"].endswith(ids("/v1/objects/dapper:Claim.SYNTHG01"))
     assert "dapper" in data["identifierResolution"]["prefixes"]
     listed = client.get("/v1/objects", params={"limit": 1}).json()
     first = listed["objects"][0]
@@ -127,44 +158,18 @@ def test_identifier_resolution_and_resolver_urls():
 def test_object_landing_page_negotiation():
     """A shared resolver link opens as a page in a browser and as the JSON
     document everywhere else."""
-    client.post("/v1/claims", json=_bundle())
-    page = client.get("/v1/objects/dapper:Claim.SYNTHG01", headers={"Accept": "text/html"})
+    _deposit(_bundle())
+    page = client.get(ids("/v1/objects/dapper:Claim.SYNTHG01"), headers={"Accept": "text/html"})
     assert page.status_code == 200
     assert page.headers["content-type"].startswith("text/html")
-    assert "dapper:Claim.SYNTHG01" in page.text
+    assert R("dapper:Claim.SYNTHG01") in page.text
     # Referenced dapper IDs are linked through the same resolver, and the
     # reverse direction through the references search.
-    assert "/v1/objects/dapper:Proposition.SYNTHG01" in page.text
-    assert "/v1/objects/search?references=dapper:Claim.SYNTHG01" in page.text
-    raw = client.get("/v1/objects/dapper:Claim.SYNTHG01")
+    assert ids("/v1/objects/dapper:Proposition.SYNTHG01") in page.text
+    assert ids("/v1/objects/search?references=dapper:Claim.SYNTHG01") in page.text
+    raw = client.get(ids("/v1/objects/dapper:Claim.SYNTHG01"))
     assert raw.headers["content-type"].startswith("application/json")
     assert raw.json()["class_name"] == "Claim"
-
-
-def test_graph_query_over_deposited_claim():
-    client.post("/v1/claims", json=_bundle())
-    body = _gql("""{ phenotype(id: "IBD") {
-        pigeanGeneAssociations(where: {prior: {lt: 0.5}}, first: 5) {
-          gene { symbol } combined prior claim { id scores { metric value } } } } }""")
-    assert "errors" not in body, body.get("errors")
-    assocs = body["data"]["phenotype"]["pigeanGeneAssociations"]
-    assert [a["gene"]["symbol"] for a in assocs] == ["NOD2"]
-    assert assocs[0]["claim"]["id"] == "dapper:Claim.SYNTHG01"
-
-
-def test_challenge_reports_missing_membership_source():
-    client.post("/v1/claims", json=_bundle())
-    query = (ROOT / "api" / "graphql" / "queries" / "ibd-validation-challenge.graphql").read_text()
-    variables = json.loads((ROOT / "api" / "graphql" / "queries" / "ibd-validation-challenge.variables.json").read_text())
-    body = _gql(query, variables)
-    assert "errors" not in body, body.get("errors")
-    challenge = body["data"]["pigeanValidationChallenge"]
-    # A missing data source is not an empty result: anchors come back with no
-    # sets, and the gap is stated.
-    assert [r["geneAssociation"]["gene"]["symbol"] for r in challenge["rows"]] == ["NOD2"]
-    assert challenge["rows"][0]["sets"] == []
-    assert challenge["truncated"] is False
-    assert any("membership" in w for w in challenge["warnings"])
 
 
 def _membership_bundle():
@@ -251,46 +256,18 @@ def _membership_bundle():
     }
 
 
-def test_challenge_joins_after_membership_deposit():
-    # Runs after test_challenge_reports_missing_membership_source by design:
-    # that test needs the shared tmp DB's membership table still empty.
-    client.post("/v1/claims", json=_bundle())
-    assert client.post("/v1/claims", json=_membership_bundle()).status_code == 200
-    query = (ROOT / "api" / "graphql" / "queries" / "ibd-validation-challenge.graphql").read_text()
-    variables = json.loads((ROOT / "api" / "graphql" / "queries" / "ibd-validation-challenge.variables.json").read_text())
-    body = _gql(query, variables)
-    assert "errors" not in body, body.get("errors")
-    challenge = body["data"]["pigeanValidationChallenge"]
-    assert not any("membership" in w for w in challenge["warnings"])
-    assert len(challenge["rows"]) == 1
-    row = challenge["rows"][0]
-    assert row["geneAssociation"]["gene"]["symbol"] == "NOD2"
-    assert row["geneAssociation"]["claim"]["triple"] == {
-        "subject": "NOD2", "predicate": "associated_with", "object": "IBD"
-    }
-    assert len(row["sets"]) == 1
-    entry = row["sets"][0]
-    assert entry["membership"]["claim"]["id"] == "dapper:Claim.SYNTHM01"
-    assert entry["membership"]["claim"]["triple"]["predicate"] == "member_of"
-    assert entry["geneSetAssociation"]["geneSet"]["name"] == "SYNTH_SET"
-    assert entry["geneSetAssociation"]["betaUncorrected"] == 2.5
-    # The membership claim is score-less.
-    membership = _gql("""{ claim(id: "dapper:Claim.SYNTHM01") { scores { metric } } }""")["data"]["claim"]
-    assert membership["scores"] == []
-
-
 def test_resolver_returns_consistent_documents():
     """Every class of dapper object comes back in the same shape: id and
     class_name first, remaining keys sorted, matching the requested ID."""
-    client.post("/v1/claims", json=_bundle())
-    client.post("/v1/claims", json=_membership_bundle())
+    _deposit(_bundle())
+    _deposit(_membership_bundle())
     cases = [
-        ("dapper:Claim.SYNTHG01", "Claim"),
-        ("dapper:Proposition.SYNTHG01", "Proposition"),
-        ("dapper:ClaimScore.SYNTHG01combined", "ClaimScore"),
-        ("dapper:EvidenceItem.SYNTHG01combined", "EvidenceItem"),
-        ("dapper:ValueLocator.SYNTHG01combined", "ValueLocator"),
-        ("dapper:GeneSet.SYNTHSET01", "GeneSet"),
+        (R("dapper:Claim.SYNTHG01"), "Claim"),
+        (R("dapper:Proposition.SYNTHG01"), "Proposition"),
+        (R("dapper:ClaimScore.SYNTHG01combined"), "ClaimScore"),
+        (R("dapper:EvidenceItem.SYNTHG01combined"), "EvidenceItem"),
+        (R("dapper:ValueLocator.SYNTHG01combined"), "ValueLocator"),
+        (R("dapper:GeneSet.SYNTHSET01"), "GeneSet"),
     ]
     for oid, cls in cases:
         body = client.get(f"/v1/objects/{oid}").json()
@@ -340,51 +317,21 @@ def _second_set_bundle():
     }
 
 
-def test_sets_per_gene_limit_and_order():
-    client.post("/v1/claims", json=_bundle())
-    client.post("/v1/claims", json=_membership_bundle())
-    assert client.post("/v1/claims", json=_second_set_bundle()).status_code == 200
-    q = """
-      query($n: Int!) {
-        pigeanValidationChallenge(
-          phenotype: "IBD", where: {prior: {lt: 0.5}}, topGenes: 5, setsPerGene: $n
-        ) {
-          rows {
-            geneAssociation { gene { symbol } }
-            sets { geneSetAssociation { geneSet { name } betaUncorrected } }
-          }
-        }
-      }
-    """
-
-    def set_names(n):
-        body = _gql(q, {"n": n})
-        assert "errors" not in body, body.get("errors")
-        rows = body["data"]["pigeanValidationChallenge"]["rows"]
-        assert [r["geneAssociation"]["gene"]["symbol"] for r in rows] == ["NOD2"]
-        return [s["geneSetAssociation"]["geneSet"]["name"] for s in rows[0]["sets"]]
-
-    assert set_names(5) == ["SYNTH_SET", "SYNTH_SET_B"]
-    assert set_names(1) == ["SYNTH_SET"]
-
-
 def test_gene_set_entity_is_traceable():
     """claim -> geneSetRefs / dapperGeneSetId -> full GeneSet entity record."""
-    client.post("/v1/claims", json=_bundle())
-    client.post("/v1/claims", json=_membership_bundle())
+    _deposit(_bundle())
+    _deposit(_membership_bundle())
     env = _gql("""{ claim(id: "dapper:Claim.SYNTHS01") {
         triple { subject predicate object } provenanceRefs { geneSetRefs resolution } } }""")["data"]["claim"]
     assert env["triple"] == {
-        "subject": "dapper:GeneSet.SYNTHSET01", "predicate": "associated_with", "object": "IBD",
+        "subject": R("dapper:GeneSet.SYNTHSET01"), "predicate": "associated_with", "object": "IBD",
     }
-    assert env["provenanceRefs"]["geneSetRefs"] == ["dapper:GeneSet.SYNTHSET01"]
+    assert env["provenanceRefs"]["geneSetRefs"] == [R("dapper:GeneSet.SYNTHSET01")]
     assert env["provenanceRefs"]["resolution"] == "RESOLVED"
-    gs = _gql("""{ geneSet(name: "SYNTH_SET", collection: "cfde-inc-v2") { name dapperGeneSetId } }""")["data"]["geneSet"]
-    assert gs["dapperGeneSetId"] == "dapper:GeneSet.SYNTHSET01"
     obj = _gql("""{ dapperObject(id: "dapper:GeneSet.SYNTHSET01") }""")["data"]["dapperObject"]
     assert obj["class_name"] == "GeneSet"
     assert obj["members"] == ["NOD2"]
-    rest = client.get("/v1/objects/dapper:GeneSet.SYNTHSET01")
+    rest = client.get(ids("/v1/objects/dapper:GeneSet.SYNTHSET01"))
     assert rest.status_code == 200
     assert rest.json()["name"] == "SYNTH_SET"
 
@@ -403,41 +350,41 @@ def test_object_list_and_search():
     """REST output is objects only: general list and search, not tied to a
     class — `references` gives the claim fan-in of a proposition (or any
     object's in-links), `q` matches text, `match` matches string slots."""
-    client.post("/v1/claims", json=_bundle())
-    client.post("/v1/claims", json=_membership_bundle())
-    client.post("/v1/claims", json=_second_set_bundle())
-    assert client.post("/v1/claims", json=_second_opinion_bundle()).status_code == 200
+    _deposit(_bundle())
+    _deposit(_membership_bundle())
+    _deposit(_second_set_bundle())
+    assert _deposit(_second_opinion_bundle()).status_code == 200
 
     claims = client.get("/v1/objects", params={"class_name": "Claim", "limit": 500}).json()
     assert claims["total"] >= 4
     assert all(o["class_name"] == "Claim" for o in claims["objects"])
-    assert "dapper:Claim.SYNTHG01" in {o["id"] for o in claims["objects"]}
+    assert R("dapper:Claim.SYNTHG01") in {o["id"] for o in claims["objects"]}
     every = client.get("/v1/objects", params={"limit": 3}).json()
     assert every["total"] > claims["total"]  # all classes
 
     # Fan-in: every claim assessing a proposition, hinted or not.
     fanin = client.get("/v1/objects/search",
-                       params={"class_name": "Claim", "references": "dapper:Proposition.SYNTHS01"}).json()
-    assert {o["id"] for o in fanin["objects"]} == {"dapper:Claim.SYNTHS01", "dapper:Claim.SYNTHS01B"}
+                       params={"class_name": "Claim", "references": R("dapper:Proposition.SYNTHS01")}).json()
+    assert {o["id"] for o in fanin["objects"]} == {R("dapper:Claim.SYNTHS01"), R("dapper:Claim.SYNTHS01B")}
     # In-links of any object: what references the GeneSet entity.
-    inlinks = client.get("/v1/objects/search", params={"references": "dapper:GeneSet.SYNTHSET01"}).json()
-    assert {"dapper:Proposition.SYNTHS01", "dapper:Proposition.SYNTHM01"} <= {o["id"] for o in inlinks["objects"]}
+    inlinks = client.get("/v1/objects/search", params={"references": R("dapper:GeneSet.SYNTHSET01")}).json()
+    assert {R("dapper:Proposition.SYNTHS01"), R("dapper:Proposition.SYNTHM01")} <= {o["id"] for o in inlinks["objects"]}
 
     # Text search over statement / name / description.
     text = client.get("/v1/objects/search", params={"q": "member of the gene set"}).json()
-    assert "dapper:Proposition.SYNTHM01" in {o["id"] for o in text["objects"]}
+    assert R("dapper:Proposition.SYNTHM01") in {o["id"] for o in text["objects"]}
     # Exact slot match (repeatable, ANDed).
     nod2 = client.get("/v1/objects/search", params=[
         ("class_name", "Proposition"), ("match", "subject_entity:NOD2"), ("match", "relation:member_of"),
     ]).json()
-    assert {o["id"] for o in nod2["objects"]} == {"dapper:Proposition.SYNTHM01", "dapper:Proposition.SYNTHM02"}
+    assert {o["id"] for o in nod2["objects"]} == {R("dapper:Proposition.SYNTHM01"), R("dapper:Proposition.SYNTHM02")}
     assert client.get("/v1/objects/search", params={"match": "Bad Slot:x"}).status_code == 400
 
     # Same fan-in over GraphQL, with full envelopes.
     gql = _gql("""{ proposition(id: "dapper:Proposition.SYNTHS01") {
         triple { subject predicate object } claims { id } } }""")["data"]["proposition"]
     assert gql["triple"]["object"] == "IBD"
-    assert {c["id"] for c in gql["claims"]} == {"dapper:Claim.SYNTHS01", "dapper:Claim.SYNTHS01B"}
+    assert {c["id"] for c in gql["claims"]} == {R("dapper:Claim.SYNTHS01"), R("dapper:Claim.SYNTHS01B")}
 
     # Deterministic pagination with a stable total.
     page = client.get("/v1/objects", params={"class_name": "Claim", "limit": 1, "offset": 1}).json()
@@ -540,25 +487,28 @@ def test_loader_stores_no_claims():
     assert props["total"] == 1  # the data plane is there
 
 
+CLAIM_FIELDS = "id timesDeposited triple { subject predicate object } scores { metric value } evidence { valueLocators }"
+
+
+def _claims(*claim_ids, fields="id"):
+    """claim(id) for each id, in one request (aliases c0, c1, ...)."""
+    query = "{ " + " ".join(f'c{i}: claim(id: "{cid}") {{ {fields} }}' for i, cid in enumerate(claim_ids)) + " }"
+    return _gql(query)
+
+
 def test_claims_are_synthesized_when_served():
     _load_fixtures()
     fixg1 = _index_claim_id("pigean_gene_associations", "gene", "FIXG1")
     fixg2 = _index_claim_id("pigean_gene_associations", "gene", "FIXG2")
-    q = """{ phenotype(id: "FIXPHENO") {
-        pigeanGeneAssociations(collection: "fixture-v1", where: {prior: {lt: 0.5}}) {
-          gene { symbol } prior
-          claim { id timesDeposited scores { metric value } evidence { valueLocators } } } } }"""
     before = {fixg1: _times_seen(fixg1), fixg2: _times_seen(fixg2)}
-    body = _gql(q)
+    body = _claims(fixg1, fixg2, fields=CLAIM_FIELDS)
     assert "errors" not in body, body.get("errors")
-    assocs = {a["gene"]["symbol"]: a for a in body["data"]["phenotype"]["pigeanGeneAssociations"]}
-    assert set(assocs) == {"FIXG1", "FIXG2"}
-    assert assocs["FIXG1"]["claim"]["id"] == fixg1
-    assert assocs["FIXG2"]["claim"]["id"] == fixg2
-    assert assocs["FIXG1"]["claim"]["timesDeposited"] == before[fixg1] + 1
+    g1, g2 = body["data"]["c0"], body["data"]["c1"]
+    assert (g1["id"], g2["id"]) == (fixg1, fixg2)
+    assert g1["timesDeposited"] == before[fixg1] + 1
+    assert g1["triple"]["subject"] == "FIXG1" and g1["triple"]["object"] == "FIXPHENO"
     # FIXG2's file values are JSON ints ("prior": 0, "combined": 2): the score
     # is normalized to float, the locator keeps the file's exact bytes.
-    g2 = assocs["FIXG2"]["claim"]
     assert {s["metric"]: s["value"] for s in g2["scores"]}["prior"] == 0.0
     locs = [loc for e in g2["evidence"] for loc in e["valueLocators"]]
     prior_loc = next(loc for loc in locs if loc["selector"].endswith("key=prior"))
@@ -567,8 +517,7 @@ def test_claims_are_synthesized_when_served():
     for loc in locs:
         assert data[loc["byte_start"]:loc["byte_start"] + loc["byte_length"]].decode() == loc["value_text"]
     # Every further serve is an assertion; stored claims are found by reference.
-    again = _gql(q)["data"]["phenotype"]["pigeanGeneAssociations"]
-    assert {a["gene"]["symbol"]: a["claim"]["timesDeposited"] for a in again}["FIXG1"] == before[fixg1] + 2
+    assert _claims(fixg1, fields="timesDeposited")["data"]["c0"]["timesDeposited"] == before[fixg1] + 2
     prop = client.get(f"/v1/objects/{fixg2}").json()["proposition"]
     fanin = client.get("/v1/objects/search", params={"class_name": "Claim", "references": prop}).json()
     assert [o["id"] for o in fanin["objects"]] == [fixg2]
@@ -576,59 +525,37 @@ def test_claims_are_synthesized_when_served():
 
 def test_gene_set_associations_synthesize_with_int_beta():
     _load_fixtures()
-    body = _gql("""{ phenotype(id: "FIXPHENO") { pigeanGeneSetAssociations(collection: "fixture-v1") {
-        geneSet { name dapperGeneSetId } beta claim { id scores { metric value } } } } }""")
+    set_a = _index_claim_id("pigean_gene_set_associations", "gene_set", "FIXSET_A")
+    body = _claims(set_a, fields="id triple { subject } scores { metric value } provenanceRefs { geneSetRefs }")
     assert "errors" not in body, body.get("errors")
-    sets = {s["geneSet"]["name"]: s for s in body["data"]["phenotype"]["pigeanGeneSetAssociations"]}
-    assert sets["FIXSET_A"]["beta"] == 0.0  # "beta": 0 in the file
-    assert sets["FIXSET_A"]["claim"]["id"] == _index_claim_id("pigean_gene_set_associations", "gene_set", "FIXSET_A")
-    assert sets["FIXSET_A"]["geneSet"]["dapperGeneSetId"].startswith("dapper:GeneSet.")
+    env = body["data"]["c0"]
+    assert {s["metric"]: s["value"] for s in env["scores"]}["beta"] == 0.0  # "beta": 0 in the file
+    assert env["triple"]["subject"].startswith("dapper:GeneSet.")
+    assert env["provenanceRefs"]["geneSetRefs"] == [env["triple"]["subject"]]
 
 
-def test_roster_claims_members_and_lookup_by_id():
-    _load_fixtures()
-    # One roster claim per gene set backs every (gene, set) pair in it.
-    g1 = _gql("""{ gene(symbol: "FIXG1") { memberships(collection: "fixture-v1") {
-        geneSet { name } claim { id triple { predicate } } } } }""")
-    assert "errors" not in g1, g1.get("errors")
-    g1_sets = {m["geneSet"]["name"]: m["claim"] for m in g1["data"]["gene"]["memberships"]}
-    assert set(g1_sets) == {"FIXSET_A", "FIXSET_B"}
-    assert {c["triple"]["predicate"] for c in g1_sets.values()} == {"has_members"}
-    members = _gql("""{ geneSet(name: "FIXSET_A", collection: "fixture-v1") {
-        members { gene { symbol } claim { id } } } }""")
-    assert "errors" not in members, members.get("errors")
-    rows = members["data"]["geneSet"]["members"]
-    assert sorted(r["gene"]["symbol"] for r in rows) == ["FIXG1", "FIXG2"]
-    assert {r["claim"]["id"] for r in rows} == {g1_sets["FIXSET_A"]["id"]}
-
-    # claim(id) on never-served claims finds the index row and synthesizes:
-    # a gene-set association, and a roster (looked up in the rosters table).
+def test_never_served_claims_are_found_by_id():
+    """claim(id) on never-served claims finds the index row and synthesizes:
+    a gene-set association, and a roster (looked up in the rosters table)."""
     _load_dir(_variant("BYID", "byid-v1"))
     set_b = _index_claim_id("pigean_gene_set_associations", "gene_set", "FIXSET_B", "byid-v1")
     assert _times_seen(set_b) == 0  # never served in this slice
     env = _gql(f'{{ claim(id: "{set_b}") {{ id timesDeposited }} }}')
     assert "errors" not in env, env.get("errors")
     assert env["data"]["claim"] == {"id": set_b, "timesDeposited": 1}
-    roster_b = g1_sets["FIXSET_B"]["id"]
+    roster_b = _rows("SELECT claim_id FROM pigean_gene_set_rosters WHERE collection = 'byid-v1' "
+                     "AND gene_set = 'FIXSET_B'")[0]["claim_id"]
     env = _gql(f'{{ claim(id: "{roster_b}") {{ id triple {{ predicate }} }} }}')
     assert env["data"]["claim"]["triple"]["predicate"] == "has_members"
 
 
-def test_challenge_dedupes_assertions_within_a_request():
-    """A roster / association claim served by several rows of ONE response is
-    asserted once."""
+def test_a_claim_served_twice_in_one_request_is_asserted_once():
     _load_fixtures()
-    roster_a = _index_claim_id("claim_memberships", "gene", "FIXG2")  # FIXG2 is only in FIXSET_A
     set_a = _index_claim_id("pigean_gene_set_associations", "gene_set", "FIXSET_A")
-    before = (_times_seen(roster_a), _times_seen(set_a))
-    body = _gql("""{ pigeanValidationChallenge(phenotype: "FIXPHENO", collection: "fixture-v1",
-        where: {prior: {lt: 10}}, topGenes: 5, setsPerGene: 5) {
-          rows { geneAssociation { gene { symbol } } sets { membership { claim { id } } geneSetAssociation { geneSet { name } } } } } }""")
+    before = _times_seen(set_a)
+    body = _claims(set_a, set_a, set_a)
     assert "errors" not in body, body.get("errors")
-    served = [s["geneSetAssociation"]["geneSet"]["name"]
-              for r in body["data"]["pigeanValidationChallenge"]["rows"] for s in r["sets"]]
-    assert served.count("FIXSET_A") == 2  # FIXG1 and FIXG2 both link to it
-    assert (_times_seen(roster_a), _times_seen(set_a)) == (before[0] + 1, before[1] + 1)
+    assert _times_seen(set_a) == before + 1
 
 
 def test_second_load_keeps_earlier_claims_servable():
@@ -637,39 +564,26 @@ def test_second_load_keeps_earlier_claims_servable():
     _load_dir(_variant("TWOA", "two-v1"))
     _load_dir(_variant("TWOB", "two-v1", membership=[("FIXG1", "FIXSET_A"), ("FIXG3", "FIXSET_A"),
                                                      ("FIXG1", "FIXSET_B")]))
-    body = _gql("""{ phenotype(id: "TWOA") { pigeanGeneSetAssociations(collection: "two-v1") {
-        geneSet { name } claim { id } } } }""")
+    expected = [r["claim_id"] for r in _rows(
+        "SELECT claim_id FROM pigean_gene_set_associations WHERE phenotype = 'TWOA' AND collection = 'two-v1' "
+        "ORDER BY gene_set")]
+    assert len(expected) == 2
+    body = _claims(*expected)
     assert "errors" not in body, body.get("errors")
-    served = {s["geneSet"]["name"]: s["claim"]["id"] for s in body["data"]["phenotype"]["pigeanGeneSetAssociations"]}
-    con = service_db.connect()
-    try:
-        expected = {r["gene_set"]: r["claim_id"] for r in con.execute(
-            "SELECT gene_set, claim_id FROM pigean_gene_set_associations WHERE phenotype = 'TWOA' AND collection = 'two-v1'")}
-    finally:
-        con.close()
-    assert served == expected
-    # TWOA's observed membership (FIXG2 in FIXSET_A) still resolves for TWOA.
-    challenge = _gql("""{ pigeanValidationChallenge(phenotype: "TWOA", collection: "two-v1",
-        where: {prior: {lt: 10}}, topGenes: 5, setsPerGene: 5) {
-          rows { geneAssociation { gene { symbol } } sets { membership { claim { id } } } } } }""")
-    assert "errors" not in challenge, challenge.get("errors")
-    rows = {r["geneAssociation"]["gene"]["symbol"]: r for r in challenge["data"]["pigeanValidationChallenge"]["rows"]}
-    assert len(rows["FIXG2"]["sets"]) == 1 and len(rows["FIXG3"]["sets"]) == 0
+    assert [body["data"][f"c{i}"]["id"] for i in range(len(expected))] == expected
 
 
 def test_tampered_row_is_refused_even_after_mint():
     _load_dir(_variant("TAMPER", "tamper-v1"))
-    q = """{ gene(symbol: "FIXG1") { pigeanAssociation(phenotype: "TAMPER", collection: "tamper-v1") {
-        combined claim { id timesDeposited } } } }"""
-    first = _gql(q)
+    claim_id = _index_claim_id("pigean_gene_associations", "gene", "FIXG1", "tamper-v1")
+    first = _claims(claim_id)
     assert "errors" not in first, first.get("errors")
-    claim_id = first["data"]["gene"]["pigeanAssociation"]["claim"]["id"]
     count = _times_seen(claim_id)
     con = service_db.connect()
     with con:
         con.execute("UPDATE pigean_gene_associations SET combined = 99.0 WHERE phenotype = 'TAMPER' AND gene = 'FIXG1'")
     con.close()
-    body = _gql(q)
+    body = _claims(claim_id)
     assert body.get("errors") and "template drift" in body["errors"][0]["message"]
     assert _times_seen(claim_id) == count  # the failed request counted nothing
 
@@ -683,15 +597,18 @@ def test_failed_response_rolls_back_every_mint():
         con.execute("UPDATE pigean_gene_associations SET claim_id = 'dapper:Claim.localdeadbeef' "
                     "WHERE phenotype = 'ROLLBACK' AND gene = 'FIXG2'")
     con.close()
-    # Ordered by combined: FIXG3 (4.75), FIXG1 (3.5) synthesize, then FIXG2 fails.
-    body = _gql("""{ phenotype(id: "ROLLBACK") { pigeanGeneAssociations(collection: "rb-v1",
-        orderBy: {field: COMBINED, dir: DESC}) { claim { id } } } }""")
-    assert body.get("errors")
+    # FIXG3 and FIXG1 synthesize, then the row now naming dapper:Claim.localdeadbeef fails.
+    body = _claims(ids["FIXG3"], ids["FIXG1"], "dapper:Claim.localdeadbeef")
+    assert body.get("errors") and body["data"] is None
     for gene in ("FIXG3", "FIXG1"):
         assert client.get(f"/v1/objects/{ids[gene]}").status_code == 404, gene
 
 
 def test_forged_deposit_at_a_reserved_address_is_refused():
+    """A claim the loaded data implies sits at a local-dev address. Nothing can be deposited there: deposit takes
+    DAPPER-ID-1 addresses only, so neither a forgery nor the genuine document enters through it. The claim exists
+    once a query serves it. (The reserved-address rule itself is exercised on a collection claim, whose address
+    is DAPPER-ID-1, in test_deposits.py.)"""
     _load_dir(_variant("FORGE", "forge-v1"))
     con = service_db.connect()
     row = con.execute("SELECT * FROM pigean_gene_associations WHERE phenotype = 'FORGE' AND gene = 'FIXG1'").fetchone()
@@ -699,13 +616,12 @@ def test_forged_deposit_at_a_reserved_address_is_refused():
     from service.app import synthesize_claim
     genuine = synthesize_claim("gene", row)
     forged = {**genuine, "statement": "FORGED"}
-    resp = client.post("/v1/claims", json={"objects": [forged]})
-    # Refused by local-dev address verification (the forged content cannot
-    # hash to the genuine address); the reserved-address check backs this up
-    # for identity profiles the service cannot verify.
-    assert resp.status_code == 400 and "does not hash" in resp.json()["detail"]
-    # The genuine document is accepted (asserted by its depositor).
-    assert client.post("/v1/claims", json={"objects": [genuine]}).status_code == 200
+    for document in (forged, genuine):
+        resp = client.post("/v1/deposits", json={"objects": [document]})
+        assert resp.status_code == 400 and "not a DAPPER-ID-1 identifier" in resp.json()["detail"]
+    assert client.get(f"/v1/objects/{genuine['id']}").status_code == 404
+    assert _gql(f'{{ claim(id: "{genuine["id"]}") {{ id }} }}')["data"]["claim"] == {"id": genuine["id"]}
+    assert client.get(f"/v1/objects/{genuine['id']}").json()["statement"] == genuine["statement"]
 
 
 def test_proposition_fanin_includes_implied_claims():
@@ -720,21 +636,11 @@ def test_proposition_fanin_includes_implied_claims():
 
 
 def test_claim_query_on_a_non_claim_returns_null_and_counts_nothing():
-    client.post("/v1/claims", json=_bundle())
-    before = _times_seen("dapper:Proposition.SYNTHG01")
+    _deposit(_bundle())
+    before = _times_seen(R("dapper:Proposition.SYNTHG01"))
     body = _gql("""{ claim(id: "dapper:Proposition.SYNTHG01") { id } }""")
     assert body["data"]["claim"] is None
-    assert _times_seen("dapper:Proposition.SYNTHG01") == before
-
-
-def test_graphql_argument_bounds():
-    _load_fixtures()  # the phenotype must exist for its child resolvers to run
-    for q in ('{ phenotype(id: "FIXPHENO") { pigeanGeneAssociations(collection: "fixture-v1", first: -1) { prior } } }',
-              '{ phenotype(id: "FIXPHENO") { pigeanGeneAssociations(collection: "fixture-v1", first: 501) { prior } } }',
-              '{ pigeanValidationChallenge(phenotype: "FIXPHENO", collection: "fixture-v1", topGenes: 201) { truncated } }',
-              '{ pigeanValidationChallenge(phenotype: "FIXPHENO", collection: "fixture-v1", setsPerGene: 51) { truncated } }'):
-        body = _gql(q)
-        assert body.get("errors") and "must be between" in body["errors"][0]["message"], q
+    assert _times_seen(R("dapper:Proposition.SYNTHG01")) == before
 
 
 def test_object_search_is_literal_case_insensitive_and_validated():
@@ -751,15 +657,18 @@ def test_object_search_is_literal_case_insensitive_and_validated():
 
 
 def test_deposit_rejects_malformed_input():
-    assert client.post("/v1/claims", content=b"{not json", headers={"Content-Type": "application/json"}).status_code == 400
-    assert client.post("/v1/claims", json=[1, 2]).status_code == 400
-    assert client.post("/v1/claims", json={"objects": "x"}).status_code == 400
-    assert client.post("/v1/claims", json={"objects": [1]}).status_code == 400
-    for bad_id in ('dapper:Claim.x"><script>alert(1)</script>', "dapper:Proposition.WRONGCLASS", "dapper:Claim." + "a" * 200):
-        resp = client.post("/v1/claims", json={"objects": [{"class_name": "Claim", "id": bad_id}]})
+    post = lambda body: client.post("/v1/deposits", json=body)
+    assert client.post("/v1/deposits", content=b"{not json", headers={"Content-Type": "application/json"}).status_code == 400
+    assert post([1, 2]).status_code == 400
+    assert post({"objects": "x"}).status_code == 400
+    assert post({"objects": [1]}).status_code == 400
+    for bad_id in ('dapper:Claim.x"><script>alert(1)</script>', "dapper:Proposition.WRONGCLASS", "dapper:Claim." + "a" * 200,
+                   "dapper:Claim." + "a" * 32 + "\n"):
+        resp = post({"objects": [{"class_name": "Claim", "id": bad_id}]})
         assert resp.status_code == 400, bad_id
-    long_ref = {"class_name": "Claim", "id": "dapper:Claim.LONGREF", "proposition": "dapper:Proposition." + "b" * 200}
-    assert client.post("/v1/claims", json={"objects": [long_ref]}).status_code == 400
+    long_ref = {"id": "dapper:Claim." + "L" * 32, "proposition": "dapper:Proposition." + "b" * 200}
+    resp = post({"objects": [long_ref]})
+    assert resp.status_code == 400 and "longer than 128" in resp.json()["detail"]
 
 
 def test_deposit_hint_does_not_break_loaded_rosters():
@@ -778,14 +687,14 @@ def test_deposit_hint_does_not_break_loaded_rosters():
                          "object": {"category": "gene_set", "id": "FIXSET_B", "dapper_id": "dapper:GeneSet.HINTSET"},
                          "collection": "fixture-v1"}],
     }
-    assert client.post("/v1/claims", json=bundle).status_code == 200
+    assert _deposit(bundle).status_code == 200
     con = service_db.connect()
     entity_after = con.execute("SELECT dapper_id, n_genes FROM gene_set_entities WHERE collection = 'fixture-v1' AND name = 'FIXSET_B'").fetchone()
     con.close()
     assert tuple(entity_after) == tuple(entity_before)  # the hint did not clobber the loaded entity
-    body = _gql("""{ geneSet(name: "FIXSET_B", collection: "fixture-v1") { members { gene { symbol } claim { id } } } }""")
-    assert "errors" not in body, body.get("errors")
-    assert sorted(m["gene"]["symbol"] for m in body["data"]["geneSet"]["members"]) == ["FIXG1", "FIXG9"]
+    genes = {r["gene"] for r in _rows("SELECT gene FROM claim_memberships WHERE collection = 'fixture-v1' "
+                                      "AND gene_set = 'FIXSET_B'")}
+    assert genes == {"FIXG1", "FIXG9"}
 
 
 def test_template_number_canonicalization():
@@ -823,8 +732,7 @@ def test_template_drift_is_refused():
     with con:
         con.execute("UPDATE pigean_gene_associations SET combined = 99.0 WHERE gene = 'FIXG3' AND collection = 'drift-v1'")
     con.close()
-    body = _gql("""{ gene(symbol: "FIXG3") {
-        pigeanAssociation(phenotype: "DRIFT", collection: "drift-v1") { claim { id } } } }""")
+    body = _claims(fixg3)
     assert body.get("errors"), body
     assert body["data"] is None  # a failed response writes nothing and reports no data
     assert "template drift" in body["errors"][0]["message"]
@@ -832,23 +740,15 @@ def test_template_drift_is_refused():
     assert resp.status_code == 404 and "not yet asserted" in resp.json()["detail"]
 
 
-def test_set_pigean_association_and_never_served_gene_claim_by_id():
+def test_never_served_gene_and_roster_claims_by_id():
     _load_dir(_variant("SETASSOC", "setassoc-v1"))
-    body = _gql("""{ geneSet(name: "FIXSET_A", collection: "setassoc-v1") {
-        pigeanAssociation(phenotype: "SETASSOC", collection: "setassoc-v1") { beta claim { id } } } }""")
-    assert "errors" not in body, body.get("errors")
-    assoc = body["data"]["geneSet"]["pigeanAssociation"]
-    assert assoc["beta"] == 0.0
-    assert assoc["claim"]["id"] == _index_claim_id("pigean_gene_set_associations", "gene_set", "FIXSET_A", "setassoc-v1")
     gene = _index_claim_id("pigean_gene_associations", "gene", "FIXG1", "setassoc-v1")
     assert _times_seen(gene) == 0
     env = _gql(f'{{ claim(id: "{gene}") {{ id timesDeposited triple {{ predicate }} }} }}')
     assert env["data"]["claim"] == {"id": gene, "timesDeposited": 1, "triple": {"predicate": "associated_with"}}
     # A never-served ROSTER claim by id (rosters looked up in their own table).
-    con = service_db.connect()
-    roster = con.execute("SELECT claim_id FROM pigean_gene_set_rosters WHERE collection = 'setassoc-v1' "
-                         "AND gene_set = 'FIXSET_B'").fetchone()["claim_id"]
-    con.close()
+    roster = _rows("SELECT claim_id FROM pigean_gene_set_rosters WHERE collection = 'setassoc-v1' "
+                   "AND gene_set = 'FIXSET_B'")[0]["claim_id"]
     assert _times_seen(roster) == 0
     env = _gql(f'{{ claim(id: "{roster}") {{ id triple {{ predicate }} }} }}')
     assert env["data"]["claim"]["triple"]["predicate"] == "has_members"
@@ -867,8 +767,8 @@ def _load_traits():
 
 
 def test_kpn_trait_ids_name_the_phenotype():
-    """Legacy / PIGEAN phenotype keys resolve to canonical KPN.TRAIT IDs: claims
-    name the trait ID, and every key finds the phenotype."""
+    """The legacy loader resolves legacy / PIGEAN phenotype keys to canonical
+    KPN.TRAIT IDs through the registry it loads: index rows and claims name the trait ID."""
     stats = _load_traits()
     assert (stats["traits"], stats["mappings"]) == (2, 3)
     _load_dir(_variant("REGPHENO", "reg-v1"))
@@ -877,48 +777,35 @@ def test_kpn_trait_ids_name_the_phenotype():
         "SELECT DISTINCT phenotype FROM pigean_gene_associations WHERE collection = 'reg-v1'")}
     con.close()
     assert stored == {"KPN.TRAIT:9000001"}  # index rows carry the canonical id
-    q = """query($id: ID!) { phenotype(id: $id) {
-        id legacyId name category traitType conceptId conceptLabel mappings { targetId ontology predicate }
-        efo: mappings(ontology: "EFO") { targetId }
-        pigeanGeneAssociations(collection: "reg-v1", first: 1, orderBy: {field: COMBINED, dir: DESC}) {
-          gene { symbol } claim { triple { object } proposition } } } }"""
-    for key in ("REGPHENO", "KPN.TRAIT:9000001"):
-        body = _gql(q, {"id": key})
-        assert "errors" not in body, body.get("errors")
-        ph = body["data"]["phenotype"]
-        assert ph["id"] == "KPN.TRAIT:9000001" and ph["legacyId"] == "REGPHENO"
-        assert ph["conceptId"] == "EFO:9999991" and ph["category"] == "digestive"
-        assert {m["targetId"] for m in ph["mappings"]} == {"EFO:9999991", "MONDO:9999992"}
-        assert [m["targetId"] for m in ph["efo"]] == ["EFO:9999991"]
-        assoc = ph["pigeanGeneAssociations"][0]
-        assert assoc["claim"]["triple"]["object"] == "KPN.TRAIT:9000001"
-        assert "Registered fixture phenotype" in assoc["claim"]["proposition"]["statement"]
-    # The challenge accepts the legacy key too.
-    ch = _gql("""{ pigeanValidationChallenge(phenotype: "REGPHENO", collection: "reg-v1",
-        where: {prior: {lt: 10}}, topGenes: 5) { rows { sets { membership { claim { id } } } } } }""")
-    assert "errors" not in ch, ch.get("errors")
-    assert sum(len(r["sets"]) for r in ch["data"]["pigeanValidationChallenge"]["rows"]) == 3
+    claim = _claims(_index_claim_id("pigean_gene_associations", "gene", "FIXG3", "reg-v1"),
+                    fields="triple { object } proposition")["data"]["c0"]
+    assert claim["triple"]["object"] == "KPN.TRAIT:9000001"
+    assert "Registered fixture phenotype" in claim["proposition"]["statement"]
     # A PIGEAN key resolves via pigean_id; the vocabulary lists the release.
     _load_dir(_variant("PIGKEY", "pig-v1"))
-    ph = _gql('{ phenotype(id: "PIGKEY") { id legacyId conceptId } }')["data"]["phenotype"]
-    assert ph == {"id": "KPN.TRAIT:9000002", "legacyId": "OLDKEY", "conceptId": "ORPHANET:9999993"}
+    assert {r["phenotype"] for r in _rows("SELECT DISTINCT phenotype FROM pigean_gene_associations "
+                                          "WHERE collection = 'pig-v1'")} == {"KPN.TRAIT:9000002"}
     vocab = client.get("/v1/vocabulary").json()
     assert vocab["trait_registry"]["version"] == "v0.0.2"
     assert vocab["identifier_resolution"]["prefixes"]["KPN.TRAIT"].startswith("https://")
 
 
-def test_local_dev_addresses_are_verified_on_deposit():
-    genuine = tpl.score("combined", 3.5)
-    forged = {**genuine, "value": 99.0}  # same id, different content
-    resp = client.post("/v1/claims", json={"objects": [forged]})
-    assert resp.status_code == 400 and "does not hash" in resp.json()["detail"]
-    assert client.post("/v1/claims", json={"objects": [genuine]}).status_code == 200
-    # A re-deposit at an existing (non-verifiable) id must carry the same document.
-    client.post("/v1/claims", json=_bundle())
-    altered = [dict(o) for o in _bundle()["objects"]]
-    altered[0]["statement"] = "ALTERED"
-    resp = client.post("/v1/claims", json={"objects": altered[:1]})
-    assert resp.status_code == 400 and "different document" in resp.json()["detail"]
+def test_local_dev_and_synthetic_ids_are_not_depositable():
+    """Deposit takes DAPPER-ID-1 addresses only. A local-dev id (the loader's profile, verifiable by its own hash)
+    and a hand-written id are both refused, genuine or not; the loader writes local-dev objects itself."""
+    genuine = tpl.score("combined", 3.14159)  # a value no fixture loads
+    assert tpl.local_dev_address_ok(genuine) and not tpl.local_dev_address_ok({**genuine, "value": 99.0})
+    for document in (genuine, {**genuine, "value": 99.0}, _bundle()["objects"][0]):
+        resp = client.post("/v1/deposits", json={"objects": [document]})
+        assert resp.status_code == 400 and "not a DAPPER-ID-1 identifier" in resp.json()["detail"], document["id"]
+        assert client.get(f"/v1/objects/{document['id']}").status_code == 404
+    # At a DAPPER-ID-1 address, content that does not hash to it is refused.
+    _deposit(_bundle())
+    stored = client.get(ids("/v1/objects/dapper:Proposition.SYNTHG01")).json()
+    altered = {k: v for k, v in stored.items() if k != "class_name"} | {"statement": "ALTERED"}
+    resp = client.post("/v1/deposits", json={"objects": [altered]})
+    assert resp.status_code == 400 and "not the DAPPER-ID-1 address of this content" in resp.json()["detail"]
+    assert client.get(ids("/v1/objects/dapper:Proposition.SYNTHG01")).json()["statement"] == stored["statement"]
 
 
 def test_deposit_hints_cannot_overwrite_loaded_rows():
@@ -926,39 +813,46 @@ def test_deposit_hints_cannot_overwrite_loaded_rows():
     claim = {"class_name": "Claim", "id": "dapper:Claim.HINTOVERWRITE", "proposition": "dapper:Proposition.SYNTHG01",
              "has_score": ["dapper:ClaimScore.SYNTHG01combined", "dapper:ClaimScore.SYNTHG01logbf",
                            "dapper:ClaimScore.SYNTHG01prior"]}
-    client.post("/v1/claims", json=_bundle())
+    _deposit(_bundle())
     hint = {"claim_id": claim["id"], "method": "pigean", "predicate": "associated_with",
             "subject": {"category": "gene", "id": "FIXG1"}, "object": {"category": "phenotype", "id": "HINT"},
             "collection": "hint-v1"}
-    resp = client.post("/v1/claims", json={"objects": [claim], "index_hints": [hint]})
+    resp = _deposit({"objects": [claim], "index_hints": [hint]})
     assert resp.status_code == 400 and "template-backed" in resp.json()["detail"]
     # A hint naming a non-Claim is refused (it would break every serve).
     bad = {**hint, "claim_id": "dapper:Proposition.SYNTHG01", "subject": {"category": "gene", "id": "FIXG9"}}
-    resp = client.post("/v1/claims", json={"objects": [claim], "index_hints": [bad]})
+    resp = _deposit({"objects": [claim], "index_hints": [bad]})
     assert resp.status_code == 400 and "not a Claim" in resp.json()["detail"]
     for malformed in ({**hint, "claim_id": ["x"]}, {**hint, "object": {}}, {**hint, "collection": 5}):
-        assert client.post("/v1/claims", json={"objects": [claim], "index_hints": [malformed]}).status_code == 400
+        assert _deposit({"objects": [claim], "index_hints": [malformed]}).status_code == 400
 
 
 def test_dapper_id_1_identifiers_are_accepted():
-    pid = "dapper:Proposition.2Rz_JqeQJ1Rsr1N7khXSppi7fEtf9lda"  # base64url digest with '_'
-    cid = "dapper:Claim.x-Y_z0Abc123"
+    """DAPPER-ID-1 digests are base64url: they may hold '-' and '_', and resolve, link and index like any id."""
     bundle = {"objects": [
-        {"class_name": "Proposition", "id": pid, "statement": "s", "subject_entity": "A", "relation": "r",
-         "object_entity": "B"},
-        {"class_name": "Claim", "id": cid, "proposition": pid},
+        {"class_name": "Proposition", "id": "dapper:Proposition.URLSAFE", "statement": "s", "subject_entity": "A",
+         "relation": "r", "object_entity": "B"},
+        {"class_name": "Claim", "id": "dapper:Claim.URLSAFE", "proposition": "dapper:Proposition.URLSAFE"},
     ]}
-    assert client.post("/v1/claims", json=bundle).status_code == 200
-    found = client.get("/v1/objects/search", params={"references": pid}).json()
+    assert _deposit(bundle).status_code == 200
+    pid, cid = R("dapper:Proposition.URLSAFE"), R("dapper:Claim.URLSAFE")
+    assert all(len(i.split(".")[1]) == 32 for i in (pid, cid))
+    found = client.get("/v1/objects/search", params={"references": pid, "class_name": "Claim"}).json()
     assert [o["id"] for o in found["objects"]] == [cid]
     page = client.get(f"/v1/objects/{cid}", headers={"Accept": "text/html"}).text
     assert f'href="/v1/objects/{pid}"' in page
+    # An id with every base64url punctuation character resolves through the same routes.
+    odd = "dapper:Proposition.x-Y_z0Abc123x-Y_z0Abc123x-Y_z0Ab"
+    _seed({"class_name": "Proposition", "id": odd, "statement": "seeded at a url-safe id"})
+    assert client.get(f"/v1/objects/{odd}").json()["id"] == odd
 
 
 def test_search_matches_string_slots_only():
-    bundle = {"objects": [{"class_name": "Agent", "id": "dapper:Agent.NULLDESC", "description": None},
-                          {"class_name": "Agent", "id": "dapper:Agent.NUMDESC", "description": 7}]}
-    assert client.post("/v1/claims", json=bundle).status_code == 200
+    # Stored rows whose text slots hold null or a number (deposit refuses them today; older rows have them).
+    _seed({"class_name": "Agent", "id": "dapper:Agent.NULLDESC", "description": None},
+          {"class_name": "Agent", "id": "dapper:Agent.NUMDESC", "description": 7})
+    listed = {o["id"] for o in client.get("/v1/objects", params={"class_name": "Agent", "limit": 500}).json()["objects"]}
+    assert {"dapper:Agent.NULLDESC", "dapper:Agent.NUMDESC"} <= listed
     assert client.get("/v1/objects/search", params={"q": "null", "class_name": "Agent"}).json()["total"] == 0
     assert client.get("/v1/objects/search", params={"match": "description:7"}).json()["total"] == 0
 
@@ -969,13 +863,12 @@ def test_assertion_budget_bounds_a_request():
     original = svc.MAX_ASSERTIONS_PER_REQUEST
     svc.MAX_ASSERTIONS_PER_REQUEST = 2
     try:
-        body = _gql("""{ phenotype(id: "BUDGET") { pigeanGeneAssociations(collection: "budget-v1") { claim { id } } } }""")
+        ids = [r["claim_id"] for r in _rows("SELECT claim_id FROM pigean_gene_associations WHERE collection = 'budget-v1'")]
+        body = _claims(*ids)
     finally:
         svc.MAX_ASSERTIONS_PER_REQUEST = original
+    assert len(ids) == 3
     assert body.get("errors") and "more than 2 claims" in body["errors"][0]["message"]
-    con = service_db.connect()
-    ids = [r["claim_id"] for r in con.execute("SELECT claim_id FROM pigean_gene_associations WHERE collection = 'budget-v1'")]
-    con.close()
     assert all(_times_seen(i) == 0 for i in ids)  # nothing written
 
 
@@ -1003,27 +896,24 @@ def _rows(sql, params=()):
 
 def test_results_loaded_before_the_registry_never_duplicate():
     """Rows loaded under the legacy key, then the registry, then a reload:
-    one canonical copy, a working challenge, and no deposit can shadow the
+    one canonical copy, and no deposit can shadow the
     legacy-keyed result in between."""
     with _isolated_db():
         _load_dir(_variant("REGPHENO", "late-v1"))
         _load_traits()
         assert {r["phenotype"] for r in _rows(
             "SELECT DISTINCT phenotype FROM pigean_gene_associations WHERE collection = 'late-v1'")} == {"REGPHENO"}
-        client.post("/v1/claims", json=_bundle())
+        _deposit(_bundle())
         hint = {"claim_id": "dapper:Claim.SYNTHG01", "method": "pigean", "predicate": "associated_with",
                 "subject": {"category": "gene", "id": "FIXG1"},
                 "object": {"category": "phenotype", "id": "KPN.TRAIT:9000001"}, "collection": "late-v1"}
-        resp = client.post("/v1/claims", json={"objects": _bundle()["objects"], "index_hints": [hint]})
+        resp = _deposit({"objects": _bundle()["objects"], "index_hints": [hint]})
         assert resp.status_code == 400 and "template-backed" in resp.json()["detail"]
         _load_dir(_variant("REGPHENO", "late-v1"))
         for table in ("pigean_gene_associations", "pigean_gene_set_associations", "claim_memberships"):
             keys = {r["phenotype"] for r in _rows(f"SELECT DISTINCT phenotype FROM {table} WHERE collection = 'late-v1'")}
             assert keys == {"KPN.TRAIT:9000001"}, (table, keys)
-        body = _gql("""{ pigeanValidationChallenge(phenotype: "REGPHENO", collection: "late-v1",
-            where: {prior: {lt: 10}}, topGenes: 5) { rows { geneAssociation { gene { symbol } } } } }""")
-        assert "errors" not in body, body.get("errors")
-        genes = [r["geneAssociation"]["gene"]["symbol"] for r in body["data"]["pigeanValidationChallenge"]["rows"]]
+        genes = [r["gene"] for r in _rows("SELECT gene FROM pigean_gene_associations WHERE collection = 'late-v1'")]
         assert sorted(genes) == ["FIXG1", "FIXG2", "FIXG3"]
 
 
@@ -1036,20 +926,6 @@ def test_superseded_rosters_are_no_longer_implied():
         assert env["data"]["claim"] is None  # superseded: no edge cites it any more
         resp = client.get(f"/v1/objects/{old['FIXSET_A']}")
         assert resp.status_code == 404 and "not yet asserted" not in resp.json()["detail"]
-
-
-def test_gene_set_root_pins_one_phenotypes_observation():
-    with _isolated_db():
-        _load_dir(_variant("P1", "pin-v1"))
-        _load_dir(_variant("P2", "pin-v1", membership=[("FIXG1", "FIXSET_A"), ("FIXG3", "FIXSET_A"), ("FIXG1", "FIXSET_B")]))
-        for phenotype, genes in (("P1", ["FIXG1", "FIXG2"]), ("P2", ["FIXG1", "FIXG3"])):
-            body = _gql(f"""{{ geneSet(name: "FIXSET_A", collection: "pin-v1", phenotype: "{phenotype}") {{
-                dapperGeneSetId members {{ gene {{ symbol }} geneSet {{ dapperGeneSetId }} claim {{ triple {{ subject }} }} }} }} }}""")
-            assert "errors" not in body, body.get("errors")
-            gs = body["data"]["geneSet"]
-            assert sorted(m["gene"]["symbol"] for m in gs["members"]) == genes
-            for m in gs["members"]:  # parent, member, and roster claim name one GeneSet
-                assert m["geneSet"]["dapperGeneSetId"] == gs["dapperGeneSetId"] == m["claim"]["triple"]["subject"]
 
 
 def test_trait_release_guards():
@@ -1083,28 +959,34 @@ def test_trait_release_guards():
 
 
 def test_deposit_rejects_non_finite_ambiguous_and_malformed_input():
-    raw = b'{"objects":[{"class_name":"Agent","id":"dapper:Agent.NAN1","value":NaN}]}'
-    assert client.post("/v1/claims", content=raw, headers={"Content-Type": "application/json"}).status_code == 400
-    raw = b'{"objects":[{"class_name":"Agent","id":"dapper:Agent.BIG1","value":1e400}]}'
-    assert client.post("/v1/claims", content=raw, headers={"Content-Type": "application/json"}).status_code == 400
-    assert client.post("/v1/claims", json={"objects": [{"class_name": "Agent", "id": "dapper:Agent.NL\n"}]}).status_code == 400
-    assert client.post("/v1/claims", json={"objects": [{"class_name": "Agent", "id": "dapper:Agent.FLAG", "flag": 1}]}).status_code == 200
-    again = client.post("/v1/claims", json={"objects": [{"class_name": "Agent", "id": "dapper:Agent.FLAG", "flag": True}]})
-    assert again.status_code == 400 and "different document" in again.json()["detail"]
-    # A hinted claim citing a malformed score is refused (it would break every serve).
-    bundle = {"objects": [{"class_name": "ClaimScore", "id": "dapper:ClaimScore.EMPTY"},
-                          {"class_name": "Claim", "id": "dapper:Claim.BADSCORE", "proposition": "dapper:Proposition.SYNTHG01",
-                           "has_score": ["dapper:ClaimScore.EMPTY"]}],
-              "index_hints": [{"claim_id": "dapper:Claim.BADSCORE", "method": "pigean", "predicate": "member_of",
-                               "subject": {"category": "gene", "id": "FIXG9"}, "object": {"category": "gene_set", "id": "FIXSET_Z"},
-                               "collection": "malformed-v1"}]}
-    resp = client.post("/v1/claims", json=bundle)
+    from service.app import _same_document
+    score = "dapper:ClaimScore." + "N" * 32
+    raw = b'{"objects":[{"id":"%s","score_kind":"SCORE","metric":"m","interpretation":"i","value":NaN}]}' % score.encode()
+    assert client.post("/v1/deposits", content=raw, headers={"Content-Type": "application/json"}).status_code == 400
+    raw = b'{"objects":[{"id":"%s","score_kind":"SCORE","metric":"m","interpretation":"i","value":1e400}]}' % score.encode()
+    assert client.post("/v1/deposits", content=raw, headers={"Content-Type": "application/json"}).status_code == 400
+    assert client.post("/v1/deposits", json={"objects": [{"id": "dapper:Proposition." + "N" * 31 + "\n", "statement": "x"}]}).status_code == 400
+    # 1 and true are different values: a boolean is not accepted where the schema wants a number, and two documents
+    # that differ only that way are different documents.
+    flagged = client.post("/v1/deposits", json={"objects": [{"id": "dapper:File." + "F" * 32, "size_in_bytes": True}]})
+    assert flagged.status_code == 400 and "must not be a boolean" in flagged.json()["detail"]
+    assert not _same_document({"flag": 1}, {"flag": True}) and _same_document({"flag": 2}, {"flag": 2.0})
+    # A hinted claim citing a malformed score is refused (it would break every serve). Deposit no longer stores
+    # such a score; older rows can hold one.
+    _deposit(_bundle())
+    _seed({"class_name": "ClaimScore", "id": "dapper:ClaimScore.EMPTY"},
+          {"class_name": "Claim", "id": "dapper:Claim.BADSCORE", "proposition": R("dapper:Proposition.SYNTHG01"),
+           "has_score": ["dapper:ClaimScore.EMPTY"]})
+    hint = {"claim_id": "dapper:Claim.BADSCORE", "method": "pigean", "predicate": "member_of",
+            "subject": {"category": "gene", "id": "FIXG9"}, "object": {"category": "gene_set", "id": "FIXSET_Z"},
+            "collection": "malformed-v1"}
+    resp = _deposit({"objects": _bundle()["objects"], "index_hints": [hint]})
     assert resp.status_code == 400 and "well-formed ClaimScore" in resp.json()["detail"]
     bad_entity = {"claim_id": "dapper:Claim.SYNTHM01", "method": "pigean", "predicate": "member_of",
                   "subject": {"category": "gene", "id": "FIXG9"},
                   "object": {"category": "gene_set", "id": "FIXSET_Z", "dapper_id": "not-a-dapper-id"}, "collection": "x-v1"}
-    client.post("/v1/claims", json=_membership_bundle())
-    assert client.post("/v1/claims", json={"objects": _bundle()["objects"], "index_hints": [bad_entity]}).status_code == 400
+    _deposit(_membership_bundle())
+    assert _deposit({"objects": _bundle()["objects"], "index_hints": [bad_entity]}).status_code == 400
 
 
 def test_deposit_cannot_cite_a_loaded_roster_claim():
@@ -1115,7 +997,8 @@ def test_deposit_cannot_cite_a_loaded_roster_claim():
         hint = {"claim_id": roster_b, "method": "pigean", "predicate": "member_of", "phenotype": "ROSTERHINT",
                 "subject": {"category": "gene", "id": "FIXG3"}, "object": {"category": "gene_set", "id": "FIXSET_B"},
                 "collection": "rh-v1"}
-        resp = client.post("/v1/claims", json={"objects": [{"class_name": "Agent", "id": "dapper:Agent.RH"}], "index_hints": [hint]})
+        carrier = {"class_name": "Proposition", "id": "dapper:Proposition.RH", "statement": "An object to carry the hint."}
+        resp = _deposit({"objects": [carrier], "index_hints": [hint]})
         assert resp.status_code == 400 and "roster" in resp.json()["detail"]
 
 
@@ -1125,7 +1008,8 @@ def test_query_budget_bounds_a_request():
     original = svc.MAX_QUERIES_PER_REQUEST
     svc.MAX_QUERIES_PER_REQUEST = 5
     try:
-        body = _gql("""{ phenotype(id: "FIXPHENO") { pigeanGeneAssociations(collection: "fixture-v1") { claim { id } } } }""")
+        body = _claims(*[r["claim_id"] for r in _rows(
+            "SELECT claim_id FROM pigean_gene_associations WHERE collection = 'fixture-v1'")])
     finally:
         svc.MAX_QUERIES_PER_REQUEST = original
     assert body["data"] is None and "database queries" in body["errors"][0]["message"]
@@ -1195,11 +1079,6 @@ def test_another_phenotypes_membership_never_names_the_subject():
         _load_dir(both)
         assert _gene_set_subject("leak-v1", "FIXSET_A", "P2") == own
         assert _gene_set_subject("leak-v1", "FIXSET_A", "P1") != own
-        body = _gql("""{ geneSet(name: "FIXSET_A", collection: "leak-v1", phenotype: "P2") {
-            dapperGeneSetId members { claim { triple { subject } } } } }""")
-        gs = body["data"]["geneSet"]
-        assert gs["dapperGeneSetId"] == own
-        assert {m["claim"]["triple"]["subject"] for m in gs["members"]} == {own}
         # A membership file for a phenotype the result files lack is refused.
         mismatched = _variant("P3", "leak-v1")
         (mismatched / "gene_gene_set_stats.json").write_text(
@@ -1248,25 +1127,31 @@ def test_reload_removes_rows_under_long_or_non_ascii_legacy_keys_on_sqlite():
 
 
 def test_numbers_strings_and_nesting_must_be_interoperable():
+    from service.collections import identity as idn
+
     def post(raw):
-        return client.post("/v1/claims", content=raw.encode(), headers={"Content-Type": "application/json"})
+        return client.post("/v1/deposits", content=raw.encode(), headers={"Content-Type": "application/json"})
+    huge = "dapper:File." + "H" * 32
     for value in (10 ** 30, 2 ** 53, -(2 ** 53), 10 ** 400):
-        resp = post('{"objects":[{"class_name":"Agent","id":"dapper:Agent.HUGE","value":%d}]}' % value)
+        resp = post('{"objects":[{"id":"%s","size_in_bytes":%d}]}' % (huge, value))
         assert resp.status_code == 400 and "2^53" in resp.json()["detail"], value
-    ok = {"objects": [{"class_name": "Agent", "id": "dapper:Agent.EXACT", "value": 2 ** 53 - 1}]}
-    assert client.post("/v1/claims", json=ok).status_code == 200
-    # A float literal is an IEEE-754 double: accepted, rounded on parse (documented).
-    assert post('{"objects":[{"class_name":"Agent","id":"dapper:Agent.DBL","value":9007199254740993.0}]}').status_code == 200
-    assert client.get("/v1/objects/dapper:Agent.DBL").json()["value"] == 9007199254740992.0
-    for raw in ('{"objects":[{"class_name":"Agent","id":"dapper:Agent.SURR","name":"\\ud800"}]}',
-                '{"objects":[{"class_name":"Agent","id":"dapper:Agent.SURRK","\\udc00":1}]}'):
+    exact = idn.mint("File", {"filename": "exact.bin", "size_in_bytes": 2 ** 53 - 1})
+    assert client.post("/v1/deposits", json={"objects": [exact]}).status_code == 200
+    # A float literal is an IEEE-754 double: accepted, rounded on parse (documented). The address is that of the
+    # rounded value, which is the value stored.
+    rounded = idn.mint("ClaimScore", {"score_kind": "SCORE", "metric": "rounding", "interpretation": "x", "value": 9007199254740992.0})
+    assert post('{"objects":[{"id":"%s","score_kind":"SCORE","metric":"rounding","interpretation":"x","value":9007199254740993.0}]}'
+                % rounded["id"]).status_code == 200
+    assert client.get(f"/v1/objects/{rounded['id']}").json()["value"] == 9007199254740992.0
+    surrogate, deep = "dapper:Proposition." + "S" * 32, "dapper:Proposition." + "D" * 32
+    for raw in ('{"objects":[{"id":"%s","statement":"\\ud800"}]}' % surrogate,
+                '{"objects":[{"id":"%s","statement":"x","\\udc00":1}]}' % surrogate):
         resp = post(raw)
         assert resp.status_code == 400 and "Unicode" in resp.json()["detail"], raw
     for depth in (100, 600, 5000):
-        resp = post('{"objects":[{"class_name":"Agent","id":"dapper:Agent.DEEP%d","x":%s1%s}]}'
-                    % (depth, "[" * depth, "]" * depth))
+        resp = post('{"objects":[{"id":"%s","statement":"x","x":%s1%s}]}' % (deep, "[" * depth, "]" * depth))
         assert resp.status_code == 400 and "nested" in resp.json()["detail"], depth
-    for missing in ("dapper:Agent.SURR", "dapper:Agent.DEEP600"):
+    for missing in (surrogate, deep, huge):
         assert client.get(f"/v1/objects/{missing}").status_code == 404
 
 
@@ -1284,19 +1169,24 @@ def test_response_render_check_matches_the_real_render():
 
 def test_score_kind_must_be_a_score_kind():
     _load_fixtures()
+    _deposit(_bundle())
     scores = [{"class_name": "ClaimScore", "id": f"dapper:ClaimScore.SKX{m}", "score_kind": kind, "metric": m,
                "value": v, "interpretation": "x"}
               for m, kind, v in (("combined", "NOT_A_KIND", 99999.0), ("log_bf", "SCORE", 1.0), ("prior", "SCORE", 1.0))]
-    claim = {"class_name": "Claim", "id": "dapper:Claim.SKX", "proposition": "dapper:Proposition.SYNTHG01",
+    claim = {"class_name": "Claim", "id": "dapper:Claim.SKX", "proposition": R("dapper:Proposition.SYNTHG01"),
              "has_score": [s["id"] for s in scores]}
+    # Deposit refuses a score whose kind is not a ScoreKind...
+    refused = client.post("/v1/deposits", json={"objects": [{"id": "dapper:ClaimScore." + "K" * 32, "score_kind": "NOT_A_KIND",
+                                                             "metric": "combined", "value": 1.0, "interpretation": "x"}]})
+    assert refused.status_code == 400 and "score_kind must be one of" in refused.json()["detail"]
+    # ...but a store can hold one from before. A hint may not index a claim that cites it,
+    _seed(*scores, claim)
     hint = {"claim_id": claim["id"], "method": "pigean", "predicate": "associated_with",
             "subject": {"category": "gene", "id": "ZZKIND"}, "object": {"category": "phenotype", "id": "FIXPHENO"},
             "collection": "fixture-v1"}
-    client.post("/v1/claims", json=_bundle())
-    resp = client.post("/v1/claims", json={"objects": [*scores, claim], "index_hints": [hint]})
+    resp = _deposit({"objects": _bundle()["objects"], "index_hints": [hint]})
     assert resp.status_code == 400 and "ScoreKind" in resp.json()["detail"]
-    # Stored without a hint, the claim still serves — minus the bad score.
-    assert client.post("/v1/claims", json={"objects": [*scores, claim]}).status_code == 200
+    # and the claim still serves — minus the bad score.
     body = _gql('{ claim(id: "dapper:Claim.SKX") { scores { metric scoreKind } } }')
     assert "errors" not in body, body.get("errors")
     assert sorted(s["metric"] for s in body["data"]["claim"]["scores"]) == ["log_bf", "prior"]
@@ -1429,10 +1319,10 @@ def test_audit_reports_deposited_roster_edges_for_non_members():
         hint = {"claim_id": claim["id"], "method": "pigean", "predicate": "member_of",
                 "subject": {"category": "gene", "id": "NOTAMEMBER"}, "object": {"category": "gene_set", "id": "FIXSET_A"},
                 "collection": "aud-v1"}
-        assert client.post("/v1/claims", json={"objects": [prop, claim], "index_hints": [hint]}).status_code == 200
+        assert _deposit({"objects": [prop, claim], "index_hints": [hint]}).status_code == 200
         audit = subprocess.run([sys.executable, str(ROOT / "scripts" / "audit_objects.py")],
                                capture_output=True, text=True, env={**os.environ, "CLAIMS_DB": service_db.DB_PATH})
-        assert audit.returncode != 0 and "deposited roster claim dapper:Claim.ROSTERX" in audit.stdout + audit.stderr
+        assert audit.returncode != 0 and f"deposited roster claim {R('dapper:Claim.ROSTERX')}" in audit.stdout + audit.stderr
 
 
 def test_mysql_needs_an_explicit_database_name():
@@ -1464,33 +1354,18 @@ def test_other_phenotypes_member_less_subject_ignores_this_loads_membership():
     assert len(set(subjects)) == 1, subjects
 
 
-def test_service_finds_memberships_under_non_ascii_legacy_keys_on_sqlite():
-    with _isolated_db():
-        legacy = "Crohn’s disease"
-        _load_dir(_variant(legacy, "svc-v1"))
-        con = service_db.connect()
-        try:
-            with con:
-                con.execute("INSERT INTO kpn_traits (trait_id, legacy_id, name) VALUES (?, ?, ?)",
-                            ("KPN.TRAIT:9100002", legacy, "Crohn's"))
-        finally:
-            con.close()
-        _load_without_membership(_variant(legacy, "svc-v1"))  # edges stay under the legacy key
-        body = _gql("""{ geneSet(name: "FIXSET_A", collection: "svc-v1", phenotype: "KPN.TRAIT:9100002") {
-            dapperGeneSetId members { gene { symbol } claim { triple { subject } } } } }""")
-        assert "errors" not in body, body.get("errors")
-        gs = body["data"]["geneSet"]
-        assert sorted(m["gene"]["symbol"] for m in gs["members"]) == ["FIXG1", "FIXG2"]
-        assert {m["claim"]["triple"]["subject"] for m in gs["members"]} == {gs["dapperGeneSetId"]}
-
-
 def test_typed_slots_are_validated_and_stored_documents_never_fail_a_response():
-    for obj in ({"class_name": "Proposition", "id": "dapper:Proposition.BADREL", "relation": {"k": 1}},
-                {"class_name": "Proposition", "id": "dapper:Proposition.BADSUBJ", "subject_entity": ["ZZ"]},
-                {"class_name": "Claim", "id": "dapper:Claim.BADDERIV", "was_derived_from": [{"k": 1}]},
-                {"class_name": "EvidenceItem", "id": "dapper:EvidenceItem.BADLOC", "value_locators": 7}):
-        resp = client.post("/v1/claims", json={"objects": [obj]})
-        assert resp.status_code == 400, obj
+    # Each object is valid DAPPER except for one typed slot, and the refusal names that slot.
+    _deposit(_bundle())
+    claim = {"proposition": R("dapper:Proposition.SYNTHG01"), "was_generated_by": "dapper:Activity." + "A" * 32,
+             "was_attributed_to": ["urn:test:depositor"]}
+    for obj, slot in (({"id": "dapper:Proposition." + "P" * 32, "statement": "x", "relation": {"k": 1}}, "relation"),
+                      ({"id": "dapper:Proposition." + "Q" * 32, "statement": "x", "subject_entity": ["ZZ"]}, "subject_entity"),
+                      ({"id": "dapper:Claim." + "C" * 32, **claim, "was_derived_from": [{"k": 1}]}, "was_derived_from"),
+                      ({"id": "dapper:EvidenceItem." + "E" * 32, "value_locators": 7}, "value_locators")):
+        resp = client.post("/v1/deposits", json={"objects": [obj]})
+        assert resp.status_code == 400 and f"{slot} must" in resp.json()["detail"], (obj, resp.json())
+        assert "is required" not in resp.json()["detail"], resp.json()
     # A malformed document already in the store (written before validation
     # existed) is rendered defensively, never failing the response.
     con = service_db.connect()
@@ -1529,38 +1404,36 @@ def test_audit_checks_the_cited_rosters_gene_set_and_tolerates_foreign_rosters()
         hint = {"claim_id": wrong["id"], "method": "pigean", "predicate": "member_of",
                 "subject": {"category": "gene", "id": "FIXG2"}, "object": {"category": "gene_set", "id": "FIXSET_B"},
                 "collection": "aud2-v1"}
-        assert client.post("/v1/claims", json={"objects": [wrong], "index_hints": [hint]}).status_code == 200
-        # A foreign roster (members as objects / CURIEs): not checkable, must not crash or fail.
-        foreign = [
-            {"class_name": "GeneSet", "id": "dapper:GeneSet.FOREIGN", "name": "FOREIGN", "members": [{"symbol": "NOD2"}]},
-            {"class_name": "Proposition", "id": "dapper:Proposition.FOREIGN", "subject_entity": "dapper:GeneSet.FOREIGN",
-             "relation": "has_members", "object_entity": "dapper:GeneSetCollection.Y"},
-            {"class_name": "Claim", "id": "dapper:Claim.FOREIGN", "proposition": "dapper:Proposition.FOREIGN"},
-        ]
+        assert _deposit({"objects": [wrong], "index_hints": [hint]}).status_code == 200
+        # Foreign and odd rosters (members as objects, a roster "proposition" that is not one): deposit refuses such
+        # documents today, but a store can hold them. They are not checkable and must not crash or fail the audit.
+        _seed({"class_name": "GeneSet", "id": "dapper:GeneSet.FOREIGN", "name": "FOREIGN", "members": [{"symbol": "NOD2"}]},
+              {"class_name": "Proposition", "id": "dapper:Proposition.FOREIGN", "subject_entity": "dapper:GeneSet.FOREIGN",
+               "relation": "has_members", "object_entity": "dapper:GeneSetCollection.Y"},
+              {"class_name": "Claim", "id": "dapper:Claim.FOREIGN", "proposition": "dapper:Proposition.FOREIGN"},
+              {"class_name": "Activity", "id": "dapper:Activity.ODDROSTER", "relation": "has_members",
+               "subject_entity": ["dapper:GeneSet.X"]},
+              {"class_name": "Claim", "id": "dapper:Claim.ODD", "proposition": "dapper:Activity.ODDROSTER"})
         entity_a = _rows("SELECT dapper_id FROM gene_set_entities WHERE collection = 'aud2-v1' AND name = 'FIXSET_A'")[0]["dapper_id"]
-        about_a = [{"class_name": "Proposition", "id": "dapper:Proposition.ABOUTA", "subject_entity": entity_a,
-                    "relation": "has_members", "object_entity": "dapper:GeneSetCollection.Z"},
-                   {"class_name": "Claim", "id": "dapper:Claim.OTHERCOLL", "proposition": "dapper:Proposition.ABOUTA"},
-                   {"class_name": "Activity", "id": "dapper:Activity.ODDROSTER", "relation": "has_members",
-                    "subject_entity": ["dapper:GeneSet.X"]},
-                   {"class_name": "Claim", "id": "dapper:Claim.ODD", "proposition": "dapper:Activity.ODDROSTER"}]
+        about_a = [{"class_name": "Proposition", "id": "dapper:Proposition.ABOUTA", "statement": "FIXSET_A's roster, restated.",
+                    "subject_entity": entity_a, "relation": "has_members", "object_entity": "dapper:GeneSetCollection.Z"},
+                   {"class_name": "Claim", "id": "dapper:Claim.OTHERCOLL", "proposition": "dapper:Proposition.ABOUTA"}]
         hints = [{"claim_id": "dapper:Claim.OTHERCOLL", "method": "pigean", "predicate": "member_of",
                   "subject": {"category": "gene", "id": "FIXG2"}, "object": {"category": "gene_set", "id": "FIXSET_A"},
                   "collection": "other-v9"},
                  {"claim_id": "dapper:Claim.ODD", "method": "pigean", "predicate": "member_of",
                   "subject": {"category": "gene", "id": "FIXG2"}, "object": {"category": "gene_set", "id": "ODD"},
-                  "collection": "odd-v1"}]
-        assert client.post("/v1/claims", json={"objects": about_a, "index_hints": hints}).status_code == 200
-        hint2 = {"claim_id": "dapper:Claim.FOREIGN", "method": "pigean", "predicate": "member_of",
-                 "subject": {"category": "gene", "id": "NOD2"}, "object": {"category": "gene_set", "id": "FOREIGN"},
-                 "collection": "foreign-v1"}
-        assert client.post("/v1/claims", json={"objects": foreign, "index_hints": [hint2]}).status_code == 200
+                  "collection": "odd-v1"},
+                 {"claim_id": "dapper:Claim.FOREIGN", "method": "pigean", "predicate": "member_of",
+                  "subject": {"category": "gene", "id": "NOD2"}, "object": {"category": "gene_set", "id": "FOREIGN"},
+                  "collection": "foreign-v1"}]
+        assert _deposit({"objects": about_a, "index_hints": hints}).status_code == 200
         audit = subprocess.run([sys.executable, str(ROOT / "scripts" / "audit_objects.py")],
                                capture_output=True, text=True, env={**os.environ, "CLAIMS_DB": service_db.DB_PATH})
         out = audit.stdout + audit.stderr
         assert "Traceback" not in out, out
-        assert audit.returncode != 0 and "dapper:Claim.WRONGSET for a different gene set" in out
-        assert "dapper:Claim.OTHERCOLL for a different gene set" in out  # right set, wrong collection
+        assert audit.returncode != 0 and f"{R('dapper:Claim.WRONGSET')} for a different gene set" in out
+        assert f"{R('dapper:Claim.OTHERCOLL')} for a different gene set" in out  # right set, wrong collection
         problems = out.split("PROBLEMS", 1)[1]
         assert "Claim.FOREIGN" not in problems and "Claim.ODD" not in problems  # counted, not judged
         assert "(members not checked): 2" in out
@@ -1581,6 +1454,127 @@ def test_loader_cli_membership_options():
     own = subprocess.run(base + ["--membership-stats", str(variant / "gene_gene_set_stats.json")],
                          capture_output=True, text=True, env=env)
     assert own.returncode == 0 and "membership pairs indexed: 3" in own.stdout
+
+
+def _load_variant(variant, path, **kwargs):
+    con = service_db.connect(path)
+    try:
+        return _loader().load(con, variant / "combined_gene_stats.json", variant / "combined_gene_set_stats.json",
+                              variant / "gene_gene_set_stats.json", **kwargs)
+    finally:
+        con.close()
+
+
+def test_loader_keeps_only_rows_above_the_thresholds():
+    loader = _loader()
+    path = os.path.join(tempfile.mkdtemp(), "filtered.db")
+    variant = _variant("KEEPPHENO", "keep-v1")
+    # Fixture rows: genes FIXG1 3.5, FIXG2 2, FIXG3 4.75; sets FIXSET_A 1.5, FIXSET_B 0.9;
+    # pairs (FIXG1, A), (FIXG2, A), (FIXG1, B). Bounds are strict.
+    stats = _load_variant(variant, path, keep=loader.Keep(min_combined=2, min_beta_uncorrected=1.0))
+    assert (stats["gene_claims"], stats["gene_set_claims"], stats["roster_claims"]) == (2, 1, 1)
+    assert stats["membership_pairs"] == 1
+    assert stats["skipped"] == {"gene_rows": 1, "gene_set_rows": 1, "membership_pairs": 2, "rosters": 0}
+    con = service_db.connect(path)
+    try:
+        genes = {r["gene"] for r in con.execute("SELECT gene FROM pigean_gene_associations").fetchall()}
+        assert genes == {"FIXG1", "FIXG3"}
+        sets = {r["gene_set"] for r in con.execute("SELECT gene_set FROM pigean_gene_set_associations").fetchall()}
+        assert sets == {"FIXSET_A"}
+        pairs = {(r["gene"], r["gene_set"]) for r in con.execute("SELECT gene, gene_set FROM claim_memberships").fetchall()}
+        assert pairs == {("FIXG1", "FIXSET_A")}
+        # The kept set's entity still lists its whole observed roster; the dropped set has none.
+        entities = [json.loads(r["payload"]) for r in
+                    con.execute("SELECT payload FROM dapper_objects WHERE class_name = 'GeneSet'").fetchall()]
+        assert [(e["name"], e["members"]) for e in entities] == [("FIXSET_A", ["FIXG1", "FIXG2"])]
+        # Nothing was minted for a row below a threshold.
+        statements = " ".join(json.loads(r["payload"])["statement"] for r in
+                              con.execute("SELECT payload FROM dapper_objects WHERE class_name = 'Proposition'").fetchall())
+        assert "FIXG2" not in statements and "FIXSET_B" not in statements
+    finally:
+        con.close()
+    # Raising the gene bound past every member of the kept set leaves no edge and no roster row behind.
+    stats = _load_variant(variant, path, keep=loader.Keep(min_combined=4, min_beta_uncorrected=1.0))
+    assert (stats["gene_claims"], stats["roster_claims"], stats["membership_pairs"]) == (1, 0, 0)
+    assert stats["skipped"]["rosters"] == 1
+    con = service_db.connect(path)
+    try:
+        assert con.execute("SELECT COUNT(*) AS c FROM claim_memberships").fetchone()["c"] == 0
+        assert {r["gene"] for r in con.execute("SELECT gene FROM pigean_gene_associations").fetchall()} == {"FIXG3"}
+    finally:
+        con.close()
+
+
+def test_loader_reads_python_none_in_membership_only():
+    loader = _loader()
+    variant = _variant("NONEPHENO", "none-v1")
+    membership = variant / "gene_gene_set_stats.json"
+    lines = membership.read_text().splitlines()
+    lines[0] = lines[0][:-1] + ', "log_bf": None}'
+    membership.write_text("\n".join(lines) + "\n")
+    stats = _load_variant(variant, os.path.join(tempfile.mkdtemp(), "none.db"))
+    assert stats["membership_pairs"] == 3 and loader.PY_NONE_LINES == {"gene_gene_set_stats.json": 1}
+    # A value-bearing file is never repaired: its numbers are what the claims state.
+    genes = variant / "combined_gene_stats.json"
+    genes.write_text(genes.read_text().replace('"n": 4', '"n": None'))
+    try:
+        _load_variant(variant, os.path.join(tempfile.mkdtemp(), "none2.db"))
+    except json.JSONDecodeError:
+        pass
+    else:
+        raise AssertionError("a Python None in combined_gene_stats.json must be refused")
+
+
+def test_loader_source_sets_file_locations_and_defaults_are_unchanged():
+    loader = _loader()
+    variant = _variant("SRCPHENO", "src-v1")
+
+    def files(path):
+        con = service_db.connect(path)
+        try:
+            return {r["id"]: json.loads(r["payload"])["source_uri"] for r in
+                    con.execute("SELECT id, payload FROM dapper_objects WHERE class_name = 'File'").fetchall()}
+        finally:
+            con.close()
+
+    default_path = os.path.join(tempfile.mkdtemp(), "default.db")
+    _load_variant(variant, default_path)
+    assert all("/cfde-inc-v2/portal/IBD/" in uri for uri in files(default_path).values())
+    source = loader.Source.under("s3://bucket/out/run/", "src-v1", "portal", "SRCPHENO",
+                                 run_description="A run.", library_origin="a library")
+    other_path = os.path.join(tempfile.mkdtemp(), "other.db")
+    _load_variant(variant, other_path, source=source)
+    assert sorted(files(other_path).values()) == [
+        "s3://bucket/out/run/combined_gene_set_stats/src-v1/portal/SRCPHENO/combined_gene_set_stats.json",
+        "s3://bucket/out/run/combined_gene_stats/src-v1/portal/SRCPHENO/combined_gene_stats.json",
+        "s3://bucket/out/run/gene_gene_set_stats/src-v1/portal/SRCPHENO/gene_gene_set_stats.json",
+    ]
+    assert not set(files(default_path)) & set(files(other_path))
+
+
+def test_run_receipt_resumes_only_the_same_target_and_thresholds():
+    spec = importlib.util.spec_from_file_location("load_pigean_run", ROOT / "scripts" / "load_pigean_run.py")
+    run = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run)
+    keep = {"min_combined": 1.0, "min_beta_uncorrected": 0.0}
+    receipt = Path(tempfile.mkdtemp()) / "run.receipt.jsonl"
+    lines = [
+        {"phenotype": "A", "status": "loaded", "target": "SQLite /x.db", "spec": "run.json", "keep": keep},
+        {"phenotype": "B", "status": "failed", "target": "SQLite /x.db", "spec": "run.json", "keep": keep},
+        {"phenotype": "C", "status": "loaded", "target": "MySQL other on host", "spec": "run.json", "keep": keep},
+        {"phenotype": "D", "status": "loaded", "target": "SQLite /x.db", "spec": "run.json",
+         "keep": {"min_combined": 0.5, "min_beta_uncorrected": 0.0}},
+        {"phenotype": "E", "status": "skipped-unregistered", "target": "SQLite /x.db", "spec": "run.json", "keep": keep},
+    ]
+    receipt.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    assert run.receipt_done(receipt, "SQLite /x.db", "run.json", keep) == {"A"}
+    assert run.receipt_done(receipt, "SQLite /x.db", "run.json", {"min_combined": 0.5, "min_beta_uncorrected": 0.0}) == {"D"}
+    assert run.receipt_done(receipt.with_name("absent.jsonl"), "SQLite /x.db", "run.json", keep) == set()
+    # The checked-in run specification parses, and names only keys the driver knows.
+    for path in sorted((ROOT / "loads").glob("*.json")):
+        parsed = run.read_spec(path)
+        assert parsed["prefix"].startswith("s3://") and not parsed["prefix"].endswith("/")
+    assert run.storable_key("Migraine") and not run.storable_key("x" * 65) and not run.storable_key("caf\u00e9")
 
 
 def _silent_server():
@@ -1670,17 +1664,17 @@ def test_audit_checks_edges_citing_rosters_about_member_less_loaded_sets():
         _load_dir(_variant("AUD3", "aud3-v1", membership=[("FIXG1", "FIXSET_A")]))  # FIXSET_B: member-less
         entity_b = _gene_set_subject("aud3-v1", "FIXSET_B")
         assert _members_of(entity_b) is None
-        objs = [{"class_name": "Proposition", "id": "dapper:Proposition.ABOUTB", "subject_entity": entity_b,
-                 "relation": "has_members", "object_entity": "dapper:GeneSetCollection.Z"},
+        objs = [{"class_name": "Proposition", "id": "dapper:Proposition.ABOUTB", "statement": "FIXSET_B's roster, restated.",
+                 "subject_entity": entity_b, "relation": "has_members", "object_entity": "dapper:GeneSetCollection.Z"},
                 {"class_name": "Claim", "id": "dapper:Claim.ABOUTB", "proposition": "dapper:Proposition.ABOUTB"}]
         hint = {"claim_id": "dapper:Claim.ABOUTB", "method": "pigean", "predicate": "member_of",
                 "subject": {"category": "gene", "id": "NOD2"}, "object": {"category": "gene_set", "id": "SOME_OTHER_SET"},
                 "collection": "other-v9"}
-        assert client.post("/v1/claims", json={"objects": objs, "index_hints": [hint]}).status_code == 200
+        assert _deposit({"objects": objs, "index_hints": [hint]}).status_code == 200
         audit = subprocess.run([sys.executable, str(ROOT / "scripts" / "audit_objects.py")],
                                capture_output=True, text=True, env={**os.environ, "CLAIMS_DB": service_db.DB_PATH})
         out = audit.stdout + audit.stderr
-        assert audit.returncode != 0 and "dapper:Claim.ABOUTB for a different gene set (aud3-v1/FIXSET_B)" in out, out
+        assert audit.returncode != 0 and f"{R('dapper:Claim.ABOUTB')} for a different gene set (aud3-v1/FIXSET_B)" in out, out
 
 
 # --- admin API (consumed by the admin console in admin/) ---------------------
@@ -1698,7 +1692,6 @@ GATEWAY_SECRET = "test-gateway-secret-at-least-32-characters"
 
 def _gateway(monkeypatch, admins=("admin@example.org",)):
     monkeypatch.setattr(admin_gateway, "SECRET", GATEWAY_SECRET)
-    monkeypatch.setattr(admin_gateway, "ADMIN_EMAILS", set(admins))
 
 
 def _assertion(purpose="admin_read", secret=GATEWAY_SECRET, lifetime=120, **overrides):
@@ -1713,6 +1706,11 @@ def _assertion(purpose="admin_read", secret=GATEWAY_SECRET, lifetime=120, **over
 def _admin_get(path, token=None, **params):
     return client.get(f"/v1/admin/api/{path}", params=params,
                       headers={"Authorization": f"Bearer {token or _assertion()}"})
+
+
+def _admin_post(path, body, token=None):
+    return client.post(f"/v1/admin/api/{path}", json=body,
+                       headers={"Authorization": f"Bearer {token or _assertion('admin_write')}"})
 
 
 def test_admin_api_accepts_only_the_consoles_signed_assertion(monkeypatch):
@@ -1738,7 +1736,7 @@ def test_admin_api_accepts_only_the_consoles_signed_assertion(monkeypatch):
                            None, algorithm="none")
     assert _admin_get("me", unsigned).status_code == 401
     # The API's own allowlist and Google's verification both apply.
-    assert _admin_get("me", _assertion(email="intruder@example.org")).status_code == 403
+    assert _admin_get("me", _assertion(email="")).status_code == 403  # the console names a verified admin, always
     assert _admin_get("me", _assertion(email_verified=False)).status_code == 403
     # A sign-in audit assertion cannot read, and a read assertion cannot write the audit.
     assert _admin_get("me", _assertion(purpose="auth_event")).status_code == 403
@@ -1749,44 +1747,70 @@ def test_admin_api_accepts_only_the_consoles_signed_assertion(monkeypatch):
                                                     "detail": "not an approved admin"}).status_code == 204
     events = _admin_get("activity").json()["authEvents"]
     assert events[0]["event"] == "login_denied" and events[0]["email"] == "intruder@example.org"
-    assert "admin@example.org" in _admin_get("activity").json()["approvedAdmins"]
+    assert "approvedAdmins" not in _admin_get("activity").json()
 
 
-def test_admin_api_reports_claims_templates_tables_and_activity(monkeypatch):
+def test_admin_write_routes_take_only_write_assertions(monkeypatch, tmp_path):
     _gateway(monkeypatch)
+    # Registration on, so a refusal below can only come from the assertion's purpose.
+    monkeypatch.setenv("CLAIMS_COLLECTION_ROOTS", str(tmp_path))
+    body = {"collectionDir": str(tmp_path), "releaseFile": str(tmp_path / "release.yaml")}
+    for purpose in ("admin_read", "auth_event"):
+        for path in ("registration/check", "registration/jobs"):
+            refused = _admin_post(path, body, _assertion(purpose))
+            assert refused.status_code == 403, (purpose, path)
+            assert refused.json()["detail"] == "Admin assertion is not valid for this operation."
+    # ...and a write assertion reads nothing.
+    for path in ("me", "overview", "claims", "registration/sources", "registration/jobs"):
+        refused = _admin_get(path, _assertion("admin_write"))
+        assert refused.status_code == 403 and "not valid for this operation" in refused.json()["detail"], path
+    # The write purpose has the read purpose's admin checks.
+    assert _admin_post("registration/check", body, _assertion("admin_write", email_verified=False)).status_code == 403
+    assert _admin_post("registration/check", body, _assertion("admin_write", email_verified=False)).status_code == 403
+    assert client.post("/v1/admin/api/registration/check", json=body).status_code == 401
+    # A write assertion that passes the gateway reaches the route (here: an empty, valid root).
+    assert _admin_post("registration/check", body).status_code == 200
+
+
+def test_admin_api_reports_overview_claims_tables_and_activity(monkeypatch):
+    _gateway(monkeypatch)
+    monkeypatch.delenv("CLAIMS_COLLECTION_ROOTS", raising=False)
     _load_fixtures()
-    gene_claim = _index_claim_id("pigean_gene_associations", "gene", "FIXG1")
+    assert _deposit(_bundle()).status_code == 200
+    deposited = R("dapper:Claim.SYNTHG01")
     client.get("/v1/health")
-    client.get(f"/v1/objects/{gene_claim}")
+    client.get(f"/v1/objects/{deposited}")
 
     ov = _admin_get("overview").json()
-    fams = {f["family"]: f for f in ov["families"]}
-    assert set(fams) == {"gene", "gene_set", "roster"}
-    assert ov["claims"]["implied"] == sum(f["implied"] for f in ov["families"]) > 0
+    assert "families" not in ov and "phenotypes" not in ov
+    assert set(ov["claims"]) == {"minted", "uncollected", "assertions", "lastAssertedAt",
+                                 "minted24h", "asserted24h"}
+    # No collection is published in this database: every stored claim is uncollected.
+    assert ov["collections"] == []
+    assert ov["claims"]["uncollected"] >= 1
     assert len(ov["mintTimeline"]) == 30 and ov["database"]["backend"] == "sqlite"
+    assert ov["registration"] == {"enabled": False, "roots": []}
 
-    listed = _admin_get("claims", family="gene", page_size=100).json()
-    assert listed["total"] == fams["gene"]["implied"]
-    assert gene_claim in {r["claimId"] for r in listed["rows"]}
-    fixg1 = _admin_get("claims", q="fixg1").json()
-    assert {r["subject"] for r in fixg1["rows"]} == {"FIXG1"}
+    listed = _admin_get("claims", origin="uncollected", page_size=100).json()
+    assert listed["total"] == ov["claims"]["uncollected"]
+    assert deposited in {r["claimId"] for r in listed["rows"]}
+    assert all(r["collection"] is None and r["claimKey"] is None and r["subject"] is None for r in listed["rows"])
+    found = _admin_get("claims", q=deposited[-14:].lower()).json()  # search matches ids, case-insensitively
+    assert [r["claimId"] for r in found["rows"]] == [deposited]
     everything = _admin_get("claims", page_size=1).json()
-    assert everything["total"] == ov["claims"]["implied"] + ov["claims"]["deposited"]
-    assert _admin_get("claims", family="nope").status_code == 422
+    assert everything["total"] == ov["claims"]["uncollected"]  # no collection published here
+    assert _admin_get("claims", collection="pigean").json()["total"] == 0
+    for bad in ({"origin": "nope"}, {"sort": "nope"}, {"page_size": 101}):
+        assert _admin_get("claims", **bad).status_code == 422, bad
 
-    before = _times_seen(gene_claim)
-    detail = _admin_get(f"claims/{gene_claim}").json()
-    assert detail["verification"]["templateBacked"] and detail["verification"]["synthesizes"]
-    assert detail["indexRow"]["family"] == "gene" and detail["triple"]["subject"] == "FIXG1"
-    assert _times_seen(gene_claim) == before  # inspecting never asserts
+    before = _times_seen(deposited)
+    detail = _admin_get(f"claims/{deposited}").json()
+    assert detail["minted"] and detail["collection"] is None and detail["source"] is None
+    assert detail["verification"] == {"collectionBacked": False, "renders": None, "storedMatches": None, "error": None}
+    assert detail["claim"]["id"] == deposited and detail["triple"] is not None
+    assert _times_seen(deposited) == before  # inspecting never asserts
     assert _admin_get("claims/dapper:Claim.nonexistent").status_code == 404
-
-    templates = _admin_get("templates").json()
-    method = templates["methods"][0]
-    assert method["name"] == "pigean" and len(method["template"]["sha256"]) == 64
-    assert {m["metric"] for m in method["metrics"]} == {"combined", "log_bf", "prior", "beta", "beta_uncorrected"}
-    assert all(m["kindAgrees"] for m in method["metrics"])
-    assert any(q["name"] == "ibd-validation-challenge" for q in templates["queryTemplates"])
+    assert _admin_get("templates").status_code == 404  # removed with the PIGEAN-only views
 
     tables = _admin_get("tables", fresh="true").json()
     names = {t["name"]: t for t in tables["tables"]}

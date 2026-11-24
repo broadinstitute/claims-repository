@@ -32,9 +32,13 @@ const assertionColumns: ColumnDef<Assertion, unknown>[] = [
   { id: "lastAssertedAt", accessorKey: "lastAssertedAt", header: "Last asserted", meta: { muted: true }, cell: ({ row }) => <When value={row.original.lastAssertedAt} /> },
 ];
 
-const EVENT_TONE = { login: "good", logout: "neutral", login_denied: "bad" } as const;
+const EVENT_TONE: Record<string, "good" | "neutral" | "bad" | "info" | "warn"> = {
+  login: "good", logout: "neutral", login_denied: "bad",
+  collection_publish_started: "info", collection_publish_succeeded: "good", collection_publish_failed: "bad",
+  api_key_issued: "good", api_key_revoked: "warn",
+};
 const eventColumns: ColumnDef<AuthEvent, unknown>[] = [
-  { id: "event", accessorKey: "event", header: "Event", cell: ({ row }) => <Status tone={EVENT_TONE[row.original.event] ?? "neutral"}>{row.original.event.replace("_", " ")}</Status> },
+  { id: "event", accessorKey: "event", header: "Event", cell: ({ row }) => <Status tone={EVENT_TONE[row.original.event] ?? "neutral"}>{row.original.event.replaceAll("_", " ")}</Status> },
   { id: "email", accessorKey: "email", header: "Account", cell: ({ row }) => row.original.email ?? <span className="text-muted-foreground">Unknown</span> },
   { id: "detail", accessorKey: "detail", header: "Detail", enableSorting: false, meta: { muted: true }, cell: ({ row }) => <span className="text-xs">{row.original.detail}</span> },
   { id: "at", accessorKey: "at", header: "When", meta: { muted: true }, cell: ({ row }) => <When value={row.original.at} /> },
@@ -78,12 +82,12 @@ export default function ActivityPage() {
       </div>
       <div className="grid gap-4 xl:grid-cols-3">
         <div className="xl:col-span-2">
-          <Panel title="Admin sign-ins" description="Latest 50 sign-in, denial and sign-out events recorded by this console.">
-            <DataTable label="Admin sign-ins" data={d.authEvents} columns={eventColumns} getRowId={r => `${r.at}-${r.event}-${r.email}`} empty="No sign-in events yet." />
+          <Panel title="Admin events" description="Latest 50 sign-ins, denials, sign-outs, collection publishes and deposit key changes recorded by the console and the API.">
+            <DataTable label="Admin events" data={d.authEvents} columns={eventColumns} getRowId={r => `${r.at}-${r.event}-${r.email}-${r.detail}`} empty="No admin events yet." />
           </Panel>
         </div>
-        <Panel title="Approved admins" description="The API's CLAIMS_ADMIN_EMAILS. The console's ADMIN_EMAILS must also list an account." padded>
-          <ul className="list-disc space-y-1 pl-4 text-sm">{d.approvedAdmins.map(e => <li key={e}>{e}</li>)}</ul>
+        <Panel title="Approved admins" padded>
+          <p className="text-sm leading-6 text-muted-foreground">Admins are the console&apos;s <span className="font-mono text-xs">ADMIN_EMAILS</span> environment variable on Vercel, the only list. To add or remove someone, edit it in the Vercel project settings and redeploy; the API accepts whoever the console signs in.</p>
         </Panel>
       </div>
     </>}

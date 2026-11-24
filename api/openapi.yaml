@@ -10,15 +10,14 @@ info:
     This REST contract covers deposit, retrieval, and meta endpoints (Task 5).
     The query surface (Task 7) is GraphQL, composed from api/graphql/core.graphql
     plus per-method schema modules shipped by claim templates; see
-    docs/method-modules.md. Deposited documents are stored under DAPPER content-address IDs
-    (local-dev addresses are verified on deposit; validation against the
-    pinned DAPPER profile 0.2.0-a1 is Task-5 hardening). Provenance
+    docs/method-modules.md. Deposited documents are validated against the vendored DAPPER
+    schema and stored under their DAPPER-ID-1 content addresses (POST /v1/deposits). Provenance
     for referenced dapper:File / dapper:GeneSet IDs is returned as references;
     resolution belongs to broadinstitute/provenance-indexer (Task 6 wires the
-    join). All examples are synthetic fixtures: IDs with a .SYNTH… suffix are
-    placeholders for computed content addresses, and no example value is a
-    scientific result. Metric interpretations are provisional until the method
-    leads confirm them (Day-2 decision).
+    join). All examples are synthetic fixtures: the deposit example's objects
+    are valid DAPPER at their real addresses, the File, Activity and Agent it
+    references (.SYNTH… ids) are placeholders, and no example value is a
+    scientific result.
 servers:
   - url: http://127.0.0.1:8100
     description: Local development server.
@@ -30,11 +29,21 @@ tags:
   - name: Meta
     description: Liveness, pinned profile, and the queryable vocabulary (including identifier resolution).
   - name: Deposit
-    description: Write path — deposit bundles of DAPPER objects with index hints. Idempotent by content address.
+    description: >-
+      Write path — POST /v1/deposits takes DAPPER objects of any class, or a whole DAPPER document, validated against
+      the DAPPER schema and each object's DAPPER-ID-1 address. Idempotent by content address. Requires a depositor's
+      X-API-Key; every accepted bundle is recorded as a deposit, and the deposit records are readable by anyone.
   - name: Objects
     description: The resolver — dereference ANY dapper ID (Claim, Proposition, ClaimScore, GeneSet, EvidenceItem, ValueLocator, File, Activity, ...) to its stored document. Content-negotiated (JSON / landing page).
   - name: GraphQL
     description: The constrained query surface, composed from core + per-method modules.
+  - name: Collections
+    description: >-
+      Registered collections of method results (docs/collections.md). Each
+      describes itself (what it holds, its metrics and their meaning, its claim
+      templates and queries) and runs its own query templates. Collections are
+      published with scripts/publish_collection.py; a registration API is not
+      yet built.
 security: []
 paths:
   /v1/health:
@@ -141,70 +150,6 @@ paths:
                     description: Gene-set collections (the result files' gene_set_size tag).
                     items: { type: string }
                     examples: [['cfde-inc-v2']]
-  /v1/claims:
-    post:
-      operationId: depositClaims
-      tags: [Deposit]
-      summary: Deposit a bundle of DAPPER objects (Claims with their Propositions and ClaimScores)
-      description: >-
-        The only external write path. Stores objects idempotently by content
-        address: re-depositing identical content yields 'exists' and
-        increments times_seen. v0 checks structure (JSON objects with a
-        dapper:{class_name}.{digest} id of at most 128 characters, references
-        likewise) and interoperability (I-JSON: finite numbers, integer
-        literals within ±(2^53−1), valid Unicode strings, nesting at most 64
-        levels; digits beyond double precision are rounded on parse); typed
-        reference slots (Proposition subject/relation/object, Claim
-        proposition/has_score/has_evidence/was_derived_from, EvidenceItem
-        value_locators) must hold strings / lists of id strings; a
-        local-dev id (dapper:{Class}.local<hex>) must hash to its content, and a
-        different document at an existing address is refused. Full
-        DAPPER-profile validation and DAPPER-ID-1 address verification are
-        Task-5 hardening. Addresses the loaded data implies are
-        RESERVED: a Claim deposited at one must equal the claim the method
-        template synthesizes for it, else 400. index_hints make each claim's
-        graph edge explicit so indexing never guesses entity categories from
-        proposition text. A bundle is rejected whole on any error.
-      security:
-        - ApiKeyHeader: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/DepositBundle'
-            examples:
-              pigeanGeneClaim:
-                summary: Synthetic PIGEAN gene-phenotype claim bundle
-                externalValue: ./examples/deposit-bundle.request.json
-      responses:
-        '200':
-          description: Bundle accepted; per-object outcome reported.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [deposited]
-                properties:
-                  deposited:
-                    type: array
-                    items:
-                      type: object
-                      required: [id, class_name, status]
-                      properties:
-                        id: { type: string }
-                        class_name: { type: string }
-                        status: { type: string, enum: [created, exists] }
-                        times_deposited:
-                          type: integer
-                          description: >-
-                            The object's times_seen after this deposit: 1 on
-                            first deposit, +1 per idempotent re-deposit (for
-                            claims, also +1 per GraphQL serve).
-        '400':
-          $ref: '#/components/responses/ValidationProblem'
-        '401':
-          $ref: '#/components/responses/AuthProblem'
   /v1/objects:
     get:
       operationId: listObjects
@@ -217,7 +162,7 @@ paths:
         times_seen, resolver URL) in deterministic id order. Claims appear once
         asserted: when the scientific query surface (GraphQL) first serves the
         result behind them, or when a depositor deposits them via POST
-        /v1/claims.
+        /v1/deposits.
       parameters:
         - { name: class_name, in: query, schema: { type: string }, example: Claim }
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
@@ -247,10 +192,16 @@ paths:
         case-insensitively and literally (% and _ are not wildcards).
         `match=slot:value` (repeatable) is exact equality on a top-level string
         slot, e.g. match=relation:has_members or match=subject_entity:NOD2.
+        `deposited_by=<key id>` returns objects that depositor sent through
+        a deposit, and `deposit=<deposit id>` the objects one deposit
+        carried; objects the service minted when serving a query, or a loader
+        wrote, belong to no deposit.
         Deliberately no numeric filters: questions about metrics belong to
         GraphQL (docs/inputs-and-outputs.md).
       parameters:
         - { name: class_name, in: query, schema: { type: string }, example: Proposition }
+        - { name: deposited_by, in: query, schema: { type: string, pattern: '^key_[0-9a-f]{16}$' }, description: "A depositor's key id (400 if not one)." }
+        - { name: deposit, in: query, schema: { type: string, pattern: '^dep_[0-9a-f]{32}$' }, description: 'A deposit id (400 if not one).' }
         - { name: references, in: query, schema: { type: string }, description: 'A dapper ID the matched objects reference (400 if not a dapper identifier).' }
         - { name: q, in: query, schema: { type: string }, description: 'Substring of the statement, name, or description.' }
         - name: match
@@ -273,6 +224,290 @@ paths:
           $ref: '#/components/responses/ValidationProblem'
         '422':
           $ref: '#/components/responses/ParameterProblem'
+  /v1/deposits:
+    post:
+      operationId: deposit
+      tags: [Deposit]
+      summary: Deposit DAPPER objects of any class, validated
+      description: >-
+        The write path. Send exactly one of `document` — a DAPPER document, the
+        shape dapper's own tooling mints: lists of nodes and edges under
+        dapper's group names (claims, propositions, evidence_items, files,
+        activities, scientific_accounts, used_edges, ...), so a whole
+        ScientificAccount deposits in one request — or `objects`, a flat list
+        of DAPPER nodes. Every node must be valid for its class in the DAPPER
+        schema this service vendors (the response names its version): a
+        class that can be deposited (not a mixin or abstract class), known
+        slots only, required slots present, lists and single values where the
+        schema says, a string, number or boolean as the slot's type says
+        (dates and URIs are checked only to be strings) or a value of its
+        enum, and references to a class the slot's range allows, written
+        dapper:{Class}.{digest}. Its id must be the DAPPER-ID-1 address
+        of its content, computed with dapper's identity module. Nodes are
+        plain DAPPER: no `class_name` key is needed (the class is in the id),
+        and null slots are dropped. Edges have no ids; they are validated
+        against their edge class and stored with the deposit. Not checked:
+        the schema's conditional rules, dapper's provenance lint profiles, and
+        the inside of an inlined object. A bundle is stored whole or not at
+        all, at most 1,000 objects, 5,000 edges and 16 MB (413 beyond that);
+        send a larger document in parts. A busy store answers 503 with
+        Retry-After, having stored nothing. Idempotent: an object
+        already stored is `exists`. When a stored object has the same address
+        but differs in slots identity ignores (a File's location, an
+        Activity's timestamp), the first document stands and the outcome
+        carries `stored_differs: true`; nothing stored is ever rewritten, and
+        the deposit record keeps that this depositor held a different copy. If
+        the stored object does not itself hash to that address, or differs in
+        a slot identity does hash, the deposit is refused.
+        References that resolve neither in the bundle nor in the store are
+        reported in `unresolved_references`, not refused. Addresses the loaded
+        data implies are RESERVED: a Claim deposited at one must equal the
+        claim its data implies, else 400. Requires the
+        depositor's X-API-Key, checked before the body is read; the accepted
+        bundle is recorded as one deposit by that key.
+
+        A deposit may name an object collection (`collection`) and one of its
+        open releases (`release`; it may be left out while exactly one is
+        open). Its objects are then stored exactly as without a collection,
+        and also become members of that release, which the collection's named
+        queries read once the release is closed. The key must have been
+        granted the collection in the admin console (403 otherwise; a key
+        without the grant can still deposit with no collection). A closed or
+        unopened release answers 409. A catalog larger than one deposit goes
+        in several: open the release, send the parts, close it; resending a
+        part changes nothing. The receipt names the collection and release.
+      security:
+        - ApiKeyHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            examples:
+              pigeanGeneClaim:
+                summary: Synthetic PIGEAN gene-phenotype claim bundle (real DAPPER-ID-1 objects, an index hint)
+                externalValue: ./examples/deposit-bundle.request.json
+              catalogPart:
+                summary: One part of a catalog release
+                value:
+                  collection: dismech
+                  release: "2026.11.0"
+                  document:
+                    knowledge_gaps:
+                      - id: dapper:KnowledgeGap.zNV20nhHamt-a4CeAktQQPoAivOJe6xk
+                        text: Are the CAD PGS x context interactions causal, or readouts?
+                        gap_description: Contexts may be downstream readouts of disease.
+                        gap_kind: KNOWLEDGE_GAP
+                        scope: Coronary Artery Disease
+                        about_entities: ["http://purl.obolibrary.org/obo/MONDO_0021661"]
+            schema:
+              type: object
+              description: Exactly one of `document` and `objects`.
+              properties:
+                document:
+                  type: object
+                  description: A DAPPER document. Keys are dapper's node and edge group names; an unknown key is refused.
+                  additionalProperties:
+                    type: array
+                    items: { type: object }
+                objects:
+                  type: array
+                  minItems: 1
+                  maxItems: 1000
+                  items:
+                    $ref: '#/components/schemas/DapperObject'
+                index_hints:
+                  $ref: '#/components/schemas/IndexHints'
+                collection:
+                  type: string
+                  description: An object collection whose open release these objects also join. Needs a grant.
+                  example: dismech
+                release:
+                  type: string
+                  description: The open release (version) of `collection`; optional while exactly one is open.
+                  example: "2026.11.0"
+      responses:
+        '200':
+          description: >-
+            Bundle accepted; per-object outcome reported. With a collection, the receipt's
+            `collection` is {key, release, state, objects}; otherwise null.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deposit_id, depositor, deposited, edges, unresolved_references, validation]
+                properties:
+                  deposit_id: { type: string, examples: ['dep_0123456789abcdef0123456789abcdef'] }
+                  depositor: { $ref: '#/components/schemas/Depositor' }
+                  deposited:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, class_name, status, times_deposited]
+                      properties:
+                        id: { type: string }
+                        class_name: { type: string }
+                        status: { type: string, enum: [created, exists] }
+                        times_deposited: { type: integer }
+                        stored_differs:
+                          type: boolean
+                          description: Present and true when the stored object at this address differs in slots identity ignores; the stored one was kept.
+                  edges: { type: integer, description: Edges stored with this deposit. }
+                  unresolved_references:
+                    type: array
+                    description: dapper ids the bundle references that are neither in it nor in the store.
+                    items: { type: string }
+                  validation:
+                    type: object
+                    properties:
+                      identity_profile: { type: string, examples: ['DAPPER-ID-1'] }
+                      dapper_version: { type: string, examples: ['0.2.1-a1'] }
+        '400':
+          $ref: '#/components/responses/ValidationProblem'
+        '401':
+          $ref: '#/components/responses/AuthProblem'
+    get:
+      operationId: listDeposits
+      tags: [Deposit]
+      summary: Who deposited what
+      description: >-
+        Deposit records, newest first: every deposit, the deposits that carried
+        one object (`object=<dapper id>`), or the deposits one depositor sent
+        (`deposited_by=<key id>`). Open like every read. A depositor is a key
+        id and the name the key was issued under; the key is never served.
+        Objects the service minted when serving a query, or a loader wrote,
+        belong to no deposit.
+      parameters:
+        - { name: object, in: query, schema: { type: string }, description: 'A dapper ID (400 if not a dapper identifier).' }
+        - { name: deposited_by, in: query, schema: { type: string, pattern: '^key_[0-9a-f]{16}$' }, description: "A depositor's key id (400 if not one)." }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: Deposit records plus the filtered total.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [total, limit, offset, deposits]
+                properties:
+                  total: { type: integer }
+                  limit: { type: integer }
+                  offset: { type: integer }
+                  deposits:
+                    type: array
+                    items: { $ref: '#/components/schemas/Deposit' }
+        '400':
+          $ref: '#/components/responses/ValidationProblem'
+        '422':
+          $ref: '#/components/responses/ParameterProblem'
+  /v1/deposits/{deposit_id}:
+    get:
+      operationId: getDeposit
+      tags: [Deposit]
+      summary: One deposit and the objects it carried
+      description: >-
+        The depositor, when it was received, every object it carried (created or exists, and
+        stored_differs), its edges, and `collection`: {key, release, release_id, state} when the
+        deposit named an object collection, else null. GET /v1/deposits lists the same `collection`.
+      parameters:
+        - { name: deposit_id, in: path, required: true, schema: { type: string, pattern: '^dep_[0-9a-f]{32}$' } }
+      responses:
+        '200':
+          description: The deposit, with each object and whether this deposit created it or it already existed.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Deposit'
+                  - type: object
+                    required: [objects, edges]
+                    properties:
+                      objects:
+                        type: array
+                        items:
+                          type: object
+                          required: [id, class_name, status]
+                          properties:
+                            id: { type: string }
+                            class_name: { type: [string, 'null'] }
+                            status: { type: string, enum: [created, exists] }
+                            stored_differs: { type: boolean, description: "Present and true when this deposit's copy differed, in slots identity ignores, from the stored object, which was kept." }
+                      edges:
+                        type: array
+                        description: The document edges this deposit carried, in order, each with its edge class.
+                        items:
+                          type: object
+                          required: [class_name, subject, object]
+                          properties:
+                            class_name: { type: string, examples: [Used] }
+                            subject: { type: string }
+                            predicate: { type: string }
+                            object: { type: string }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/objects:batchGet:
+    post:
+      operationId: batchGetObjects
+      tags: [Objects]
+      summary: Many stored objects in one call
+      description: >-
+        Up to 500 distinct ids (duplicates are counted once). Found documents come back keyed by id,
+        presented as GET /v1/objects/{id} presents them; ids with no stored object are listed in
+        `missing`. A plain read: a claim the loaded data implies but nothing has asserted is missing, and
+        this call does not mint it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids]
+              properties:
+                ids: { type: array, maxItems: 500, items: { type: string } }
+            example:
+              ids: ["dapper:KnowledgeGap.zNV20nhHamt-a4CeAktQQPoAivOJe6xk", "dapper:Mechanism.kEJMDzCkDYE94DpWaXrQg-eC4gFGQyuX"]
+      responses:
+        '200':
+          description: '{objects: {id: document}, missing: [id]}'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  objects: { type: object, additionalProperties: { $ref: '#/components/schemas/DapperObject' } }
+                  missing: { type: array, items: { type: string } }
+        '400':
+          description: Not a list of ids, empty, or more than 500.
+  /v1/objects/{object_id}/lineage:
+    get:
+      operationId: objectLineage
+      tags: [Objects]
+      summary: An object's lineage as nodes and edges
+      description: >-
+        What the object references, followed to `depth` (1 to 3): every dapper id in its slots
+        (was_derived_from, was_generated_by, has_evidence, ...) and the deposited edges it is the subject
+        of (used_edges and other edge groups); and what references it, depth 1, from the reference
+        index. Each edge names the slot or edge class it comes from (`kind` reference or edge). Nodes
+        carry class, name, direction (self, outgoing, incoming), depth, and whether the object is stored.
+        At most 500 nodes; `truncated` says the graph was cut. A plain read.
+        Example: GET /v1/objects/dapper:KnowledgeGap.zNV20nhHamt-a4CeAktQQPoAivOJe6xk/lineage?depth=2
+      parameters:
+        - name: object_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: depth
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 3, default: 3 }
+      responses:
+        '200':
+          description: '{id, depth, nodes: [{id, class_name, name, stored, direction, depth}], edges: [{from, to, label, kind}], truncated}'
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
   /v1/objects/{object_id}:
     get:
       operationId: getObject
@@ -307,6 +542,330 @@ paths:
               schema: { type: string, description: 'Human landing page; referenced dapper IDs are resolver links.' }
         '404':
           $ref: '#/components/responses/NotFoundProblem'
+  /v1/collections:
+    get:
+      operationId: listCollections
+      tags: [Collections]
+      summary: Every registered collection with its current release
+      responses:
+        '200':
+          description: The collections.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  collections:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, examples: [pigean] }
+                        title: { type: string }
+                        description: { type: [string, 'null'] }
+                        methods: { type: array, items: { type: string } }
+                        current_release: { type: string, description: 'The DAPPER ResultCollection id.' }
+                        version: { type: string }
+                        datasets: { type: integer }
+  /v1/collections/{collection}:
+    get:
+      operationId: describeCollection
+      tags: [Collections]
+      summary: What a collection holds and how to read it
+      description: >-
+        From the release manifest: releases, datasets with their dimension
+        values and row counts, row and edge kinds, metrics with their meaning
+        and scale, tier rules, claim templates, query names, and how many of
+        the collection's claims have been minted.
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - { name: first, in: query, required: false, description: 'Datasets per page (0 to 500).', schema: { type: integer, minimum: 0, maximum: 500, default: 50 } }
+        - { name: offset, in: query, required: false, description: 'First dataset of the page; datasets_page.next_offset gives the next.', schema: { type: integer, minimum: 0, default: 0 } }
+        - name: release
+          in: query
+          required: false
+          description: A version or release id; default the current release.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The collection description.
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/queries:
+    get:
+      operationId: queryCatalog
+      tags: [Collections]
+      summary: Every query the repository answers, described for runQuery (start here)
+      description: >-
+        Returns {guide, queries}. `guide` explains how to call runQuery (GraphQL
+        or REST), its arguments, and the shape of a result row, join item and
+        claim envelope. Each entry in `queries` names a collection's query
+        template and gives its params (type, default, bounds; a dimension param
+        also gives a sample of its values and the URL that lists them all), the
+        rows it returns (kinds, entities, metrics with their meaning, joins),
+        the claim keys `claims` accepts, its plan, and a GraphQL and a REST
+        request that run as given. Derived from each collection's current
+        release manifest. GraphQL: `queries`.
+      parameters:
+        - name: collection
+          in: query
+          required: false
+          description: Only this collection's queries.
+          schema: { type: string }
+        - name: release
+          in: query
+          required: false
+          description: With `collection`, a version or release id instead of the current release.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The guide and the query entries.
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/collections/{collection}/dimensions/{dimension}:
+    get:
+      operationId: collectionDimensionValues
+      tags: [Collections]
+      summary: The values a dataset dimension takes (what to pass for a dimension param)
+      description: >-
+        Each value with its label, the other keys a query accepts for it (a
+        trait's legacy or PIGEAN key), and its number of datasets.
+        GraphQL: `dimensionValues`.
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: dimension
+          in: path
+          required: true
+          schema: { type: string }
+        - name: search
+          in: query
+          required: false
+          description: Case-insensitive match on value, label or accepted key.
+          schema: { type: string }
+        - name: first
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+        - name: release
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: '{collection, release, dimension, count, values: [{value, label, datasets, also_accepts}], truncated}'
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/collections/{collection}/releases:
+    post:
+      operationId: openObjectRelease
+      tags: [Collections]
+      summary: Open a release of an object collection
+      description: >-
+        An object collection (kind: objects) is registered from its directory
+        (scripts/publish_collection.py). A key granted the collection opens a release here, deposits
+        into it (POST /v1/deposits with `collection` and `release`, in as many parts as needed), then
+        closes it. 201 when opened; 200 when it was already open. 409 if the version is closed.
+      security:
+        - ApiKeyHeader: []
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                version: { type: string }
+            example: { version: "2026.11.0" }
+      responses:
+        '201':
+          description: '{collection, version, state: open, release_id: null, opened_at, closed_at: null}'
+          content:
+            application/json:
+              schema: { type: object }
+        '200':
+          description: Already open; returned unchanged.
+          content:
+            application/json:
+              schema: { type: object }
+        '403':
+          description: The key was not granted this collection.
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+        '409':
+          description: That version is closed (or a file-based release of it exists).
+  /v1/collections/{collection}/releases/{version}:
+    get:
+      operationId: objectReleaseStatus
+      tags: [Collections]
+      summary: An object collection release's state and contents
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: version
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: '{collection, version, state, release_id, opened_at, closed_at, objects, classes: {class: n}, deposits}'
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/collections/{collection}/releases/{version}:close:
+    post:
+      operationId: closeObjectRelease
+      tags: [Collections]
+      summary: Close an object collection release
+      description: >-
+        Mints the release's DAPPER ResultCollection (one Dataset per class of member objects, each with
+        a File listing their ids, plus the manifest and query template Files), records it, and makes it
+        the collection's current release: its named queries now read it. Closing again returns it
+        unchanged. The response adds `unresolved_references`: ids the members reference that this
+        repository does not hold (the first 100).
+        Example: POST /v1/collections/dismech/releases/2026.11.0:close
+      security:
+        - ApiKeyHeader: []
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: version
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The release status, closed, with its release_id.
+          content:
+            application/json:
+              schema: { type: object }
+        '403':
+          description: The key was not granted this collection.
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+        '409':
+          description: The release holds no objects.
+  /v1/collections/{collection}/releases/{version}/members:
+    get:
+      operationId: objectReleaseMembers
+      tags: [Collections]
+      summary: The member ids of one class in a closed object release
+      description: The bytes of the release's members File for that class (one id per line); its sha256 is in the release document.
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: version
+          in: path
+          required: true
+          schema: { type: string }
+        - name: class
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: One dapper id per line.
+          content:
+            text/plain:
+              schema: { type: string }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/collections/{collection}/queries:
+    get:
+      operationId: listCollectionQueries
+      tags: [Collections]
+      summary: A collection's entries from GET /v1/queries
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: release
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: '{collection, queries}: the same entries as GET /v1/queries, for one collection.'
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/collections/{collection}/queries/{name}:run:
+    post:
+      operationId: runCollectionQuery
+      tags: [Collections]
+      summary: Run a collection's query template
+      description: >-
+        Runs the named plan: the anchor step filters, orders and limits rows of
+        one kind before any join (ties break by entity ascending), and each join
+        keeps its own window per anchor. Each step filters and orders only on
+        its own kind's metrics. Serving a row asserts its claims (minted on
+        first serve, re-rendered and checked against their recorded ids on
+        every serve); the assertions are written only if the whole response
+        succeeded, as for GraphQL.
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: name
+          in: path
+          required: true
+          schema: { type: string, examples: [top-genes-with-sets] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                variables: { type: object, description: "The query's parameters (see the queries listing)." }
+                release: { type: string, description: 'A version or release id; default the current release.' }
+                claims:
+                  type: array
+                  items: { type: string }
+                  description: Claim keys to serve per row (default all; an empty list serves none).
+            examples:
+              ibd:
+                value: { variables: { trait: IBD, priorMax: 0.5, topGenes: 20, setsPerGene: 5 } }
+      responses:
+        '200':
+          description: Rows (each with its joined rows and claim envelopes) and warnings.
+          content:
+            application/json:
+              schema: { type: object }
+        '400':
+          $ref: '#/components/responses/ValidationProblem'
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/collections/{collection}/releases/{version}/document:
+    get:
+      operationId: collectionReleaseDocument
+      tags: [Collections]
+      summary: A release as a DAPPER document
+      description: >-
+        The ResultCollection with its Datasets, Files and Activities, lintable
+        with dapper's `result-collection` profile.
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+        - name: version
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The DAPPER document.
+          content:
+            application/json:
+              schema: { type: object }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
   /v1/graphql:
     get:
       operationId: graphiql
@@ -321,18 +880,15 @@ paths:
     post:
       operationId: graphql
       tags: [GraphQL]
-      summary: The query surface (GraphQL over composed method modules)
+      summary: The query surface (GraphQL)
       description: >-
-        Standard GraphQL-over-HTTP endpoint executing the schema composed from
-        api/graphql/core.graphql plus every registered method module in
-        api/graphql/methods/ (design: docs/method-modules.md). Introspection is
-        enabled; standard depth/complexity limits apply. Execution semantics
-        (anchor limits before joins, deterministic ties, empty-vs-missing
-        distinction, no score blending) are documented on the schema fields
-        themselves. The Day-10 CFDE validation challenge is the persisted query
-        api/graphql/queries/ibd-validation-challenge.graphql with its
-        researcher-editable variables. Clients cannot write through GraphQL (no
-        Mutation type; deposit stays on POST /v1/claims), but serving a result
+        Standard GraphQL-over-HTTP endpoint executing api/graphql/core.graphql
+        plus api/graphql/collections.graphql. Results are read only through
+        collections: `queries` lists every query template with what it takes
+        and returns, and `runQuery` runs one (the CFDE validation challenge is
+        the pigean collection's top-genes-with-sets). There are no per-method
+        fields. Introspection is enabled. Clients cannot write through GraphQL (no
+        Mutation type; deposit stays on POST /v1/deposits), but serving a result
         MINTS the claim it implies: the claim is synthesized from its index row,
         verified, and recorded with every assertion in one batch after the whole
         response succeeded (docs/inputs-and-outputs.md §3.5).
@@ -373,12 +929,21 @@ paths:
                   data: { type: [object, 'null'] }
                   errors: { type: array, items: { type: object } }
 components:
+  parameters:
+    Collection:
+      name: collection
+      in: path
+      required: true
+      schema: { type: string, examples: [pigean] }
   securitySchemes:
     ApiKeyHeader:
       type: apiKey
       in: header
       name: X-API-Key
-      description: Required for deposit. Read endpoints are open in the QA prototype; production auth is explicitly out of two-week scope.
+      description: >-
+        A depositor's key (clm_ followed by 43 characters), required for POST /v1/deposits and enforced. Keys are
+        issued and revoked by an operator, in the admin console or with scripts/api_key.py; the service stores only
+        a key's SHA-256. Read endpoints are open.
   responses:
     ValidationProblem:
       description: >-
@@ -397,7 +962,9 @@ components:
             properties:
               detail: { type: array, items: { type: object } }
     AuthProblem:
-      description: Missing or invalid API key (declared; not yet enforced in the QA prototype).
+      description: >-
+        The X-API-Key header is missing, is not a key, or names an unknown or revoked key. The answer is the same in
+        every case, and nothing was stored.
       content:
         application/json:
           schema:
@@ -420,43 +987,39 @@ components:
     DapperObject:
       type: object
       description: >-
-        A DAPPER document of any class. The pinned DAPPER profile — not this
-        contract — is the schema authority; this shape only names the
-        discriminator and ID. v0 deposit checks structure and verifies
-        local-dev content addresses; full profile validation is Task-5
-        hardening.
-      required: [class_name, id]
+        A DAPPER document of any class. The vendored DAPPER schema — not this
+        contract — is the schema authority; this shape only names the ID.
+        Deposited objects are plain DAPPER nodes at DAPPER-ID-1 addresses,
+        validated on the way in (POST /v1/deposits). The class is part of the
+        id; responses also give it as `class_name`, and a deposit may include
+        `class_name` only if it agrees with the id. Objects a loader wrote may
+        carry local-dev ids (dapper:{Class}.local<hex>); those are served but
+        cannot be deposited.
+      required: [id]
       properties:
-        class_name: { type: string, description: 'Any DAPPER class (Claim, Proposition, ClaimScore, EvidenceItem, ValueLocator, GeneSet, GeneSetCollection, File, Activity, Agent, ...).' }
-        id: { type: string, description: 'Computed DAPPER content address, dapper:{ClassName}.{digest} (hex for local-dev, base64url for DAPPER-ID-1).' }
+        class_name: { type: string, description: 'The DAPPER class (Claim, Proposition, ClaimScore, EvidenceItem, ValueLocator, GeneSet, File, Activity, ScientificAccount, ...).' }
+        id: { type: string, description: 'DAPPER content address, dapper:{ClassName}.{digest}: a 32-character base64url digest for DAPPER-ID-1.' }
       additionalProperties: true
-    DepositBundle:
-      type: object
-      required: [objects]
-      properties:
-        fixture_notice: { type: string, description: 'Present only on synthetic fixtures.' }
-        objects:
-          type: array
-          minItems: 1
-          maxItems: 1000
-          items:
-            $ref: '#/components/schemas/DapperObject'
-        index_hints:
-          type: array
-          description: One per Claim in objects; declares the claim's graph edge for indexing.
-          items:
-            type: object
-            required: [claim_id, method, predicate, subject, object]
-            properties:
-              claim_id: { type: string }
-              method: { type: string, examples: [pigean] }
-              predicate: { type: string, examples: [associated_with, member_of] }
-              subject:
-                $ref: '#/components/schemas/EntityRef'
-              object:
-                $ref: '#/components/schemas/EntityRef'
-              collection: { type: string, examples: [cfde-inc-v2] }
-              trait_group: { type: string, examples: [portal] }
+    IndexHints:
+      type: array
+      description: >-
+        Optional. Each declares the graph edge of one Claim (in this deposit or already stored) for the PIGEAN
+        index, so indexing never guesses entity categories from proposition text. A hint may not overwrite a loaded row.
+        Legacy: since 2026-11-18 no query reads the PIGEAN index (results are read through collections), so a
+        hint only records the edge; the deposited claim itself is served by claim(id) and /v1/objects either way.
+      items:
+        type: object
+        required: [claim_id, method, predicate, subject, object]
+        properties:
+          claim_id: { type: string }
+          method: { type: string, examples: [pigean] }
+          predicate: { type: string, examples: [associated_with, member_of] }
+          subject:
+            $ref: '#/components/schemas/EntityRef'
+          object:
+            $ref: '#/components/schemas/EntityRef'
+          collection: { type: string, examples: [cfde-inc-v2] }
+          trait_group: { type: string, examples: [portal] }
     EntityRef:
       type: object
       required: [category, id]
@@ -465,17 +1028,29 @@ components:
         id: { type: string, description: 'Canonical ID for the category: HGNC symbol, portal trait key, or full gene-set name.' }
     MetricSemantics:
       type: object
-      required: [score_kind, scale, better, confirmed, description]
+      required: [score_kind, scale, better, description]
       properties:
         score_kind:
           type: string
           enum: [PROBABILITY, POSTERIOR_PROBABILITY, EFFECT_ESTIMATE, LOADING, SCORE]
         scale: { type: string, examples: ['log posterior odds'] }
-        better: { type: string, enum: [higher, lower, n/a, unconfirmed] }
-        confirmed:
-          type: boolean
-          description: False until the method leads confirm the interpretation; UIs must surface unconfirmed semantics as provisional.
+        better: { type: string, enum: [higher, lower] }
         description: { type: string }
+    Depositor:
+      type: object
+      description: Who sent a deposit. Public; the key itself is never served.
+      required: [key_id, name]
+      properties:
+        key_id: { type: string, examples: ['key_0123456789abcdef'] }
+        name: { type: string, description: The name the key was issued under., examples: ['REVEAL agent service (QA)'] }
+    Deposit:
+      type: object
+      required: [deposit_id, received_at, object_count, depositor]
+      properties:
+        deposit_id: { type: string, examples: ['dep_0123456789abcdef0123456789abcdef'] }
+        received_at: { type: string, description: UTC time the bundle was accepted. }
+        object_count: { type: integer, description: Distinct objects the bundle carried. }
+        depositor: { $ref: '#/components/schemas/Depositor' }
     ObjectSummaryPage:
       type: object
       required: [total, limit, offset, objects]

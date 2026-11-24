@@ -1,0 +1,427 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://broadinstitute.github.io/claims-repository/api/collections/collection.schema.json",
+  "title": "Collection manifest",
+  "description": "A collection's structure: dimensions, entities, row and edge kinds, file roles, metrics, tier rules, and the template and query files it uses.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "collection",
+    "title",
+    "methods",
+    "dapper_profile",
+    "dataset_dimensions",
+    "entities",
+    "row_kinds",
+    "file_roles",
+    "metrics",
+    "templates"
+  ],
+  "properties": {
+    "collection": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "owners": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "methods": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "dapper_profile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "attribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent"
+      ],
+      "properties": {
+        "agent": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "prefixes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "format": "uri"
+      }
+    },
+    "relations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "dataset_dimensions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          }
+        }
+      }
+    },
+    "entities": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "\\{value\\}"
+          },
+          "mint": {
+            "enum": [
+              "GeneSet"
+            ]
+          },
+          "members_from": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "library_dimension": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "dimension": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          }
+        }
+      }
+    },
+    "row_kinds": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "subject",
+          "object",
+          "metrics"
+        ],
+        "properties": {
+          "subject": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "entity"
+            ],
+            "properties": {
+              "entity": {
+                "type": "string"
+              },
+              "column": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "object": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "entity"
+            ],
+            "properties": {
+              "entity": {
+                "type": "string"
+              },
+              "column": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "metrics": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]*$"
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "keep": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]*$"
+            }
+          }
+        }
+      }
+    },
+    "edge_kinds": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "from",
+          "to"
+        ],
+        "properties": {
+          "from": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "entity"
+            ],
+            "properties": {
+              "entity": {
+                "type": "string"
+              },
+              "column": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "to": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "entity"
+            ],
+            "properties": {
+              "entity": {
+                "type": "string"
+              },
+              "column": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    "file_roles": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "format",
+          "yields"
+        ],
+        "properties": {
+          "format": {
+            "enum": [
+              "ndjson"
+            ]
+          },
+          "media_type": {
+            "type": "string",
+            "minLength": 1
+          },
+          "yields": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "dimension_columns": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Columns that must agree with the dataset's dimension values on every row, e.g. {trait: phenotype}."
+          }
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "score_kind",
+          "interpretation"
+        ],
+        "properties": {
+          "score_kind": {
+            "enum": [
+              "PROBABILITY",
+              "POSTERIOR_PROBABILITY",
+              "EFFECT_ESTIMATE",
+              "LOADING",
+              "SCORE"
+            ]
+          },
+          "scale": {
+            "type": "string",
+            "minLength": 1
+          },
+          "better": {
+            "enum": [
+              "higher",
+              "lower"
+            ]
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "interpretation": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "tier_rules": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "tiers",
+          "direction"
+        ],
+        "properties": {
+          "version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          },
+          "tiers": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "label"
+              ],
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "min": {
+                  "type": "number"
+                }
+              }
+            }
+          },
+          "direction": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "supports_min",
+              "otherwise"
+            ],
+            "properties": {
+              "supports_min": {
+                "type": "number"
+              },
+              "otherwise": {
+                "enum": [
+                  "NEUTRAL",
+                  "DISPUTES",
+                  "UNKNOWN"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "templates": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "queries": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "mappings": {
+      "type": "object",
+      "description": "Per dataset dimension, a TSV under the collection directory: the collection's own vocabulary for it. Columns key, id (a CURIE) and label, and optionally more columns describing the id (e.g. category, trait_type, concept_id, concept_label). The only way a key becomes an id: the service reads no registry. Not part of the minting section.",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "xrefs": {
+      "type": "object",
+      "description": "Per mapped dataset dimension, an SSSOM-style TSV of the mapped ids' cross-references to other vocabularies (columns subject_id, predicate_id, object_id; optionally object_label, confidence, mapping_justification, source). Served with the dimension's values. Not part of the minting section.",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "unmapped": {
+      "type": "object",
+      "description": "Per dataset dimension, what to do with a key its mapping does not resolve: keep-raw (default), refuse, or skip the dataset.",
+      "additionalProperties": {
+        "enum": [
+          "keep-raw",
+          "refuse",
+          "skip"
+        ]
+      }
+    }
+  }
+}

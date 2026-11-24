@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://broadinstitute.github.io/claims-repository/api/collections/object-query.schema.json",
+  "title": "Object query template",
+  "description": "A bounded plan over an object collection's current release: an anchor step selecting objects of one class by their fields, then steps that follow links (outgoing) or find objects whose link names each anchor (incoming). Variables are $name; a condition whose variable is unset is dropped.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "query",
+    "description",
+    "params",
+    "plan",
+    "example"
+  ],
+  "$defs": {
+    "where": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "minProperties": 1,
+        "properties": {
+          "eq": {},
+          "ne": {},
+          "lt": {},
+          "lte": {},
+          "gt": {},
+          "gte": {},
+          "contains": {}
+        }
+      }
+    },
+    "order": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field"
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "dir": {
+          "enum": [
+            "asc",
+            "desc"
+          ]
+        }
+      }
+    },
+    "limit": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^\\$[A-Za-z][A-Za-z0-9_]*$"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "query": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "params": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "enum": [
+              "string",
+              "number",
+              "integer",
+              "boolean"
+            ]
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "default": {},
+          "min": {
+            "type": "number"
+          },
+          "max": {
+            "type": "number"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "plan": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "prefixItems": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "anchor"
+          ],
+          "properties": {
+            "anchor": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "class",
+                "limit"
+              ],
+              "properties": {
+                "class": {
+                  "type": "string",
+                  "pattern": "^[A-Z][A-Za-z0-9]*$"
+                },
+                "where": {
+                  "$ref": "#/$defs/where"
+                },
+                "order": {
+                  "$ref": "#/$defs/order"
+                },
+                "limit": {
+                  "$ref": "#/$defs/limit"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "minProperties": 1,
+        "maxProperties": 1,
+        "properties": {
+          "follow": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "as",
+              "link"
+            ],
+            "description": "Outgoing: the objects the anchor's link slot names.",
+            "properties": {
+              "as": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "link": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "class": {
+                "type": "string"
+              },
+              "where": {
+                "$ref": "#/$defs/where"
+              },
+              "limit_per_anchor": {
+                "$ref": "#/$defs/limit"
+              }
+            }
+          },
+          "referenced_by": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "as",
+              "class",
+              "link"
+            ],
+            "description": "Incoming: objects of `class` in the release whose `link` names the anchor.",
+            "properties": {
+              "as": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "class": {
+                "type": "string",
+                "pattern": "^[A-Z][A-Za-z0-9]*$"
+              },
+              "link": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]*$"
+              },
+              "where": {
+                "$ref": "#/$defs/where"
+              },
+              "order": {
+                "$ref": "#/$defs/order"
+              },
+              "limit_per_anchor": {
+                "$ref": "#/$defs/limit"
+              }
+            }
+          }
+        }
+      }
+    },
+    "example": {
+      "type": "object"
+    }
+  }
+}

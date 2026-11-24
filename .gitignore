@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 claims.db
+claims.db-journal
 .DS_Store
 .pytest_cache/
 site/

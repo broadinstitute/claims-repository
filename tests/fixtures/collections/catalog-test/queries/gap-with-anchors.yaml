@@ -1,0 +1,15 @@
+query: gap-with-anchors
+description: One knowledge gap, with the mechanisms it is about.
+params:
+  gap:
+    type: string
+    required: true
+    description: The gap's dapper:KnowledgeGap id.
+plan:
+  - anchor:
+      class: KnowledgeGap
+      where: {id: {eq: $gap}}
+      limit: 1
+  - follow: {as: anchors, link: about, class: Mechanism}
+example:
+  gap: dapper:KnowledgeGap.example

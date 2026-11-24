@@ -3,3 +3,10 @@ fastapi>=0.115
 uvicorn>=0.30
 pyyaml>=6
 pyjwt>=2.8,<3
+# DAPPER-ID-1 minting through dapper's own identity module (vendor/dapper).
+rdflib>=7,<8
+linkml-runtime>=1.9,<2
+# Collection manifest, template and query validation.
+jsonschema>=4.18,<5
+# MySQL (QA and prod, when CLAIMS_MYSQL_HOST is set) and scripts/migrate.py.
+PyMySQL>=1.1,<2

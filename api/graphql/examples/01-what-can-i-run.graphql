@@ -1,0 +1,15 @@
+# 1. Start here: what can I run?
+#
+# Every query the repository answers is a collection's query template, run
+# with runQuery. `queries` lists them all, each with:
+#   params   what it takes (type, default, bounds); a dimension param such as
+#            `trait` also shows a sample of its values and where to list all
+#   returns  the rows it returns: kinds, entities, metrics and their meaning,
+#            and joins
+#   claims   the claim keys runQuery's `claims` argument accepts
+#   run      a GraphQL and a REST request that run as given
+# `guide` explains runQuery's arguments and the shape of a result.
+# The same catalog is at GET /v1/queries.
+query WhatCanIRun {
+  queries
+}

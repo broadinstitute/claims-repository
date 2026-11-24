@@ -1,0 +1,10 @@
+# The PIGEAN fixture files (tests/fixtures/pigean) as one release of the
+# PIGEAN collection (tests/fixtures/collections/pigean, a copy of the
+# toolkit's collections/pigean kept in sync by test_collections.py).
+version: 0.0.1-test
+datasets:
+  - dimensions: {trait: FIXPHENO, library: fixture-v1}
+    files:
+      gene_stats: {path: ../pigean/combined_gene_stats.json}
+      gene_set_stats: {path: ../pigean/combined_gene_set_stats.json}
+      membership: {path: ../pigean/gene_gene_set_stats.json}

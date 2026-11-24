@@ -1,0 +1,48 @@
+# One gene across every trait: the traits where a gene has the strongest PIGEAN
+# support, each with the gene's strongest gene sets for that trait. Compare a
+# gene's direct GWAS support (log_bf) and gene-set support (prior) between
+# related traits, e.g. T2D and T2D adjusted for BMI.
+query: gene-across-traits
+description: >-
+  The traits where a gene has the strongest PIGEAN support (combined score),
+  each with the gene's strongest gene sets for that trait by marginal effect.
+params:
+  gene:
+    type: string
+    required: true
+    description: An HGNC gene symbol, e.g. FTO.
+  library:
+    type: string
+    default: mouse_msigdb
+    description: Gene-set library.
+  minCombined:
+    type: number
+    description: Keep traits where the gene's combined score is above this. Omit for no filter.
+  topTraits:
+    type: integer
+    default: 50
+    min: 0
+    max: 500
+  setsPerTrait:
+    type: integer
+    default: 3
+    min: 0
+    max: 50
+plan:
+  - anchor:
+      kind: gene_phenotype
+      dimensions: {library: $library}
+      subject: $gene
+      where: {combined: {gt: $minCombined}}
+      order: {metric: combined, dir: desc}
+      limit: $topTraits
+  - join:
+      as: sets
+      via: member_of
+      kind: gene_set_phenotype
+      order: {metric: beta_uncorrected, dir: desc}
+      limit_per_anchor: $setsPerTrait
+example:
+  gene: FTO
+  topTraits: 20
+  setsPerTrait: 0

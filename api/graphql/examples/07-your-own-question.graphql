@@ -1,0 +1,26 @@
+# 7. Ask your own question, in GraphQL
+#
+# When no template asks it, query the rows directly. Here: genes with no direct
+# GWAS signal in T2D adjusted for BMI (log_bf 0), ranked by their gene-set
+# support (prior), each with its measurement claim and its three gene sets of
+# largest joint effect. Pick a row kind and its metrics from example 1's
+# `collections`; a condition or order must use a metric of the kind it applies
+# to. At most 500 rows, and 50 joined rows per row.
+query YourOwnQuestion($trait: String!) {
+  rows(collection: "pigean", kind: "gene_phenotype",
+       dimensions: [{name: "trait", value: $trait}],
+       where: [{metric: "log_bf", eq: 0}],
+       orderBy: {metric: "prior", dir: DESC}, first: 10) {
+    warnings
+    rows {
+      subject { id value }
+      prior: metric(name: "prior")
+      combined: metric(name: "combined")
+      claim(key: "measurement") { id triple { subject predicate object } }
+      joined(via: "member_of", kind: "gene_set_phenotype", orderBy: {metric: "beta", dir: DESC}, first: 3) {
+        row { subject { value } beta: metric(name: "beta") marginal: metric(name: "beta_uncorrected") }
+        edge { claim(key: "roster") { id } }
+      }
+    }
+  }
+}

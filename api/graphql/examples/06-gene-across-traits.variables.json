@@ -1,0 +1,7 @@
+{
+  "variables": {
+    "gene": "FTO",
+    "topTraits": 20,
+    "setsPerTrait": 1
+  }
+}

@@ -3,22 +3,32 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { signOut } from "next-auth/react";
-import { Activity, Database, FileCode2, LayoutDashboard, ScrollText } from "lucide-react";
+import { Activity, Boxes, Database, FileText, KeyRound, Library, LayoutDashboard, PackagePlus, ScrollText } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 const NAV = [
   { href: "/admin", label: "Overview", icon: LayoutDashboard },
+  { href: "/admin/collections", label: "Collections", icon: Library },
+  { href: "/admin/register", label: "Add collection", icon: PackagePlus },
   { href: "/admin/claims", label: "Claims", icon: ScrollText },
-  { href: "/admin/templates", label: "Templates", icon: FileCode2 },
+  { href: "/admin/accounts", label: "Accounts", icon: FileText },
+  { href: "/admin/objects", label: "Objects", icon: Boxes },
+  { href: "/admin/keys", label: "Keys", icon: KeyRound },
   { href: "/admin/tables", label: "Tables", icon: Database },
   { href: "/admin/activity", label: "Activity", icon: Activity },
 ];
 
+/** The section a path belongs to: Overview only on /admin itself, the others on their own path and anything below it. */
+function activeItem(pathname: string) {
+  const path = pathname.replace(/\/+$/, "") || "/";
+  return NAV.find(item => item.href !== "/admin" && (path === item.href || path.startsWith(`${item.href}/`))) ?? NAV[0];
+}
+
 /** Sidebar + the Admin V2 top bar; page titles start at the same height everywhere. */
 export function AdminShell({ email, name, bypass, children }: { email: string; name: string | null; bypass: boolean; children: ReactNode }) {
   const pathname = usePathname();
-  const current = NAV.find(item => (item.href === "/admin" ? pathname === "/admin" : pathname.startsWith(item.href))) ?? NAV[0];
+  const current = activeItem(pathname);
   return (
     <div className="grid min-h-svh md:grid-cols-[224px_minmax(0,1fr)]">
       <aside className="flex flex-wrap items-center gap-1 border-b border-sidebar-border bg-sidebar p-3 text-sidebar-foreground md:sticky md:top-0 md:h-svh md:flex-col md:flex-nowrap md:items-stretch md:border-r md:border-b-0">

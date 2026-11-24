@@ -6,14 +6,13 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { Family } from "@/lib/admin/api";
+import type { DimensionValues } from "@/lib/admin/api";
 
 // Formatting and building blocks modeled on akleao's Admin V2 shared.tsx.
 
 const nf = new Intl.NumberFormat("en-US");
 export const number = (value: number | null | undefined) => (value === null || value === undefined ? "—" : nf.format(value));
 export const plural = (n: number, one: string, many = `${one}s`) => `${number(n)} ${n === 1 ? one : many}`;
-export const percent = (part: number, whole: number) => (whole ? `${Math.round((part / whole) * 1000) / 10}%` : "—");
 export const ms = (v: number | null | undefined) => (v === null || v === undefined ? "—" : v < 10 ? `${v.toFixed(1)} ms` : `${Math.round(v)} ms`);
 export const bytes = (v: number | null | undefined) => {
   if (v === null || v === undefined) return "—";
@@ -110,7 +109,7 @@ export function Metric({ title, value, hint, href }: { title: string; value: str
     : <div className={style}>{content}</div>;
 }
 
-type Tone = "neutral" | "good" | "warn" | "bad" | "info";
+export type Tone = "neutral" | "good" | "warn" | "bad" | "info";
 const TONES: Record<Tone, string> = {
   neutral: "border-border/50 text-muted-foreground",
   good: "border-emerald-500/25 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300",
@@ -122,9 +121,42 @@ export function Status({ children, tone = "neutral" }: { children: ReactNode; to
   return <Badge variant="outline" className={`whitespace-nowrap rounded-md text-[11px] font-medium ${TONES[tone]}`}>{children}</Badge>;
 }
 
-export const FAMILY_LABEL: Record<Family, string> = { gene: "gene", gene_set: "gene set", roster: "roster", deposited: "deposited" };
-export const FamilyBadge = ({ family }: { family: Family }) => <Status tone={family === "deposited" ? "info" : "neutral"}>{FAMILY_LABEL[family]}</Status>;
-export const MintBadge = ({ minted }: { minted: boolean }) => minted ? <Status tone="good">minted</Status> : <Status tone="warn">implied</Status>;
+export const MintBadge = ({ minted }: { minted: boolean }) => minted ? <Status tone="good">minted</Status> : <Status>not minted</Status>;
+/** Marker for a stored claim that no collection produces; the console does not guess where it came from. */
+export const NoCollection = () => <Status>no collection</Status>;
+
+/** A block-level notice in one of the status tones. */
+export function Callout({ tone = "neutral", children, role }: { tone?: Tone; children: ReactNode; role?: "alert" | "status" }) {
+  return <div role={role} className={`rounded-lg border px-4 py-3 text-sm leading-6 ${TONES[tone]}`}>{children}</div>;
+}
+
+/** Preformatted text (multi-line API messages, templates, commands) that wraps instead of widening the page. */
+export function Pre({ children, className = "" }: { children: ReactNode; className?: string }) {
+  return <pre className={`max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border/50 bg-muted/30 p-3 font-mono text-[11.5px] leading-5 ${className}`}>{children}</pre>;
+}
+
+/** Dataset dimension values as a compact "name: label" list; the stored value shows on hover when a label replaces it. */
+export function Dimensions({ value, className = "" }: { value: DimensionValues | null | undefined; className?: string }) {
+  const entries = Object.entries(value ?? {});
+  if (!entries.length) return <span className="text-muted-foreground">—</span>;
+  return (
+    <span className={`inline-flex flex-wrap gap-x-3 gap-y-0.5 text-xs ${className}`}>
+      {entries.map(([name, v]) => (
+        <span key={name} title={v.label && v.label !== v.value ? v.value : undefined}>
+          <span className="text-muted-foreground">{name}</span> {v.label ?? v.value}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+export const Mono = ({ children, className = "" }: { children: ReactNode; className?: string }) => <span className={`break-all font-mono text-xs ${className}`}>{children}</span>;
+
+/** A sha256 shortened to 12 characters, with a copy button for the full value. */
+export function Hash({ value }: { value: string | null | undefined }) {
+  if (!value) return <span className="text-muted-foreground">—</span>;
+  return <span className="inline-flex flex-wrap items-center gap-2"><span className="font-mono text-xs" title={value}>{value.slice(0, 12)}</span><CopyButton text={value} /></span>;
+}
 
 export function Empty({ children }: { children: ReactNode }) {
   return <p className="px-4 py-8 text-sm text-muted-foreground">{children}</p>;
@@ -139,15 +171,6 @@ export function Pagination({ page, total, pageSize, onPage, fetching }: { page: 
         <Button size="sm" variant="outline" disabled={page <= 1 || fetching} onClick={() => onPage(page - 1)}>Previous</Button>
         <Button size="sm" variant="outline" disabled={page >= pages || fetching} onClick={() => onPage(page + 1)}>Next</Button>
       </div>
-    </div>
-  );
-}
-
-export function Meter({ part, whole }: { part: number; whole: number }) {
-  const width = whole ? Math.min(100, (part / whole) * 100) : 0;
-  return (
-    <div className="h-1.5 min-w-16 flex-1 overflow-hidden rounded-full bg-muted" role="meter" aria-valuemin={0} aria-valuemax={whole} aria-valuenow={part} aria-label={percent(part, whole)}>
-      <span className="block h-full rounded-full bg-bar" style={{ width: `${width}%` }} />
     </div>
   );
 }

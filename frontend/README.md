@@ -6,9 +6,12 @@ Next.js app for the claims repository, deployed on Vercel. Only the admin consol
 src/app/
   page.tsx                  /  (redirects to /admin until the public frontend exists)
   admin/signin/             /admin/signin  Google sign-in for approved admins
-  admin/(console)/          /admin, /admin/claims, /admin/templates, /admin/tables, /admin/activity
+  admin/(console)/          /admin, /admin/collections (+ /[ref], a collection's UUID or handle), /admin/register (add a collection), /admin/claims, /admin/keys (deposit keys), /admin/tables, /admin/activity
   api/auth/[...nextauth]/   NextAuth (Google)
   api/admin/[...path]/      same-origin proxy to the claims admin API, with a signed assertion
+                            (GET reads; POST only for collection registration (registration/check,
+                            registration/jobs) and deposit keys (keys, keys/<key id>/revoke): JSON,
+                            same origin, 16 KB)
 src/components/ui/          shadcn/ui components (shared)
 src/components/admin/       admin console building blocks
 src/lib/auth.ts             NextAuth options and adminAccess()
@@ -25,19 +28,23 @@ cp .env.example .env.local   # fill in AUTH_SECRET and CLAIMS_ADMIN_GATEWAY_SECR
 npm run dev                  # http://localhost:3000/admin
 ```
 
-The API must run with the same gateway secret and list your email:
+The API must run with the same gateway secret:
 
 ```bash
-CLAIMS_ADMIN_GATEWAY_SECRET=<same value> CLAIMS_ADMIN_EMAILS=<you> \
+CLAIMS_ADMIN_GATEWAY_SECRET=<same value> \
   ../.venv/bin/python -m uvicorn service.app:app --port 8100 --app-dir ..
 ```
 
 Google sign-in uses the claims repository's own OAuth client. Put `AUTH_GOOGLE_ID` and `AUTH_GOOGLE_SECRET` in `.env.local`; the client must allow `http://localhost:3000/api/auth/callback/google`. Or set `ADMIN_DEV_BYPASS=true` to skip sign-in under `next dev`.
 
+The Keys page (`/admin/keys`) issues, lists and revokes deposit keys, which depositors send as `X-API-Key` on `POST /v1/deposits`. A key is shown once, when it is issued; the console keeps it only in that page's memory and the API stores only its SHA-256.
+
+To try Add collection locally, also start the API with `CLAIMS_COLLECTION_ROOTS` set to the directory that holds the collection, for example a local kpn-dapper-toolkit checkout (`CLAIMS_COLLECTION_ROOTS=$HOME/src/kpn-dapper-toolkit`). Separate several directories with `:`. Without it the page explains what to set, and registration stays off.
+
 ## Checks
 
 ```bash
-npm test          # access policy
+npm test          # access policy and proxy path/origin rules
 npm run typecheck
 npm run build
 ```

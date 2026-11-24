@@ -1,0 +1,9 @@
+# 5. Just the ranking
+#
+# Example 3's template for T2D, with no prior filter and setsPerGene 0: the top genes by combined score,
+# with no gene sets. Every row comes with its claims (the measurement and the
+# evidence tiers), so each number has an id to cite. Pass claims: ["measurement"]
+# for the measurement only.
+query TopGenes($variables: JSON) {
+  runQuery(collection: "pigean", query: "top-genes-with-sets", variables: $variables)
+}

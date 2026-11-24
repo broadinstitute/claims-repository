@@ -1,0 +1,63 @@
+# 4. The PIGEAN validation challenge, in your own GraphQL
+#
+# The same challenge as example 3, written with `rows`, so you choose exactly
+# the fields and claims that come back: IBD genes whose gene-set prior is below
+# 0.5, top 20 by combined score, each with its 5 gene sets of largest marginal
+# effect (beta_uncorrected). Same rows as example 3. The settings are the
+# variables below, each with the challenge's value as its default; change one
+# in the variables pane, or in place.
+#
+# Each gene carries its measurement claim and its three tier claims; each gene
+# set its measurement claim and its two tier claims; each gene-to-set edge the
+# set's roster claim. The claim keys and tier thresholds are in example 3.
+query ValidationChallengeCustom(
+  $trait: String! = "IBD"
+  $library: String! = "mouse_msigdb"
+  $priorMax: Float = 0.5
+  $topGenes: Int = 20
+  $setsPerGene: Int = 5
+) {
+  rows(
+    collection: "pigean"
+    kind: "gene_phenotype"
+    dimensions: [{name: "trait", value: $trait}, {name: "library", value: $library}]
+    where: [{metric: "prior", lt: $priorMax}]
+    orderBy: {metric: "combined", dir: DESC}
+    first: $topGenes
+  ) {
+    release { version }
+    warnings
+    rows {
+      subject { id value }
+      object { id label }
+      combined: metric(name: "combined")
+      log_bf: metric(name: "log_bf")
+      prior: metric(name: "prior")
+      measurement: claim(key: "measurement") { ...Claim }
+      tierCombined: claim(key: "tier-combined") { ...Claim }
+      tierDirect: claim(key: "tier-direct") { ...Claim }
+      tierIndirect: claim(key: "tier-indirect") { ...Claim }
+      sets: joined(via: "member_of", kind: "gene_set_phenotype",
+                   orderBy: {metric: "beta_uncorrected", dir: DESC}, first: $setsPerGene) {
+        row {
+          subject { value }
+          beta: metric(name: "beta")
+          beta_uncorrected: metric(name: "beta_uncorrected")
+          measurement: claim(key: "measurement") { ...Claim }
+          tierJoint: claim(key: "tier-joint") { ...Claim }
+          tierMarginal: claim(key: "tier-marginal") { ...Claim }
+        }
+        edge { roster: claim(key: "roster") { ...Claim } }
+      }
+    }
+  }
+}
+
+# A claim: its id, the claim document (its statement, which for a tier claim
+# names the tier, and its direction), its triple and its scores.
+fragment Claim on ClaimEnvelope {
+  id
+  claim
+  triple { subject predicate object }
+  scores { metric value interpretation }
+}

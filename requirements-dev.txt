@@ -1,4 +1,4 @@
--r requirements.txt
+-r requirements-cli.txt
 pytest>=8
 httpx>=0.27
 pyyaml>=6

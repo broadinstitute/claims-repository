@@ -1,0 +1,10 @@
+# 6. One gene across every trait
+#
+# pigean's gene-across-traits query: the traits where a gene has the strongest
+# PIGEAN support, each with the gene's strongest gene sets for that trait.
+# FTO leads in obesity and BMI traits, ranks 7th in T2D, and loses most of its
+# direct GWAS support (log_bf) in T2D adjusted for BMI. Try KCNJ11 or TCF7L2,
+# or gene-set-across-traits with a gene set's name.
+query GeneAcrossTraits($variables: JSON) {
+  runQuery(collection: "pigean", query: "gene-across-traits", variables: $variables, claims: ["measurement"])
+}

@@ -1,0 +1,7 @@
+{
+  "variables": {
+    "trait": "T2D",
+    "topGenes": 25,
+    "setsPerGene": 0
+  }
+}

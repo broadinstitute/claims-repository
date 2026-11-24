@@ -1,0 +1,36 @@
+# One gene set across every trait: the traits where a gene set has the largest
+# PIGEAN effect. beta_uncorrected is the set's marginal effect; beta is its
+# effect estimated jointly with the other selected sets (near 0 when other sets
+# explain the same signal).
+query: gene-set-across-traits
+description: >-
+  The traits where a gene set has the largest PIGEAN marginal effect
+  (beta_uncorrected), with its joint effect (beta) beside it.
+params:
+  geneSet:
+    type: string
+    required: true
+    description: The gene set's name as the library gives it, e.g. mp_type_2_diabetes_mellitus.
+  library:
+    type: string
+    default: mouse_msigdb
+    description: Gene-set library.
+  minBeta:
+    type: number
+    description: Keep traits where the joint effect (beta) is above this. Omit for no filter.
+  topTraits:
+    type: integer
+    default: 50
+    min: 0
+    max: 500
+plan:
+  - anchor:
+      kind: gene_set_phenotype
+      dimensions: {library: $library}
+      subject: $geneSet
+      where: {beta: {gt: $minBeta}}
+      order: {metric: beta_uncorrected, dir: desc}
+      limit: $topTraits
+example:
+  geneSet: mp_type_2_diabetes_mellitus
+  topTraits: 20

@@ -1,9 +1,7 @@
-# Claims repository GraphQL contract — CORE schema (v0.2).
-# This file defines only method-agnostic types. Every method (PIGEAN, EAGGL, …)
-# contributes its own SDL module under api/graphql/methods/ that `extend`s these
-# types; the service concatenates core + registered modules and builds one
-# executable schema at startup. Modules may only extend — they never redefine
-# core types. See docs/method-modules.md for the design.
+# Claims repository GraphQL contract — CORE schema (v0.3).
+# Method-agnostic types only. Results are read through collections
+# (collections.graphql): `queries` lists every query template with what it
+# takes and returns, and runQuery runs one. There are no per-method fields.
 #
 # Read-only surface: deposit stays on the REST contract (api/openapi.yaml);
 # there is deliberately no Mutation type.
@@ -14,23 +12,6 @@ schema {
 
 type Query {
   health: Health!
-
-  """
-  A phenotype by any of its keys: a canonical KPN trait ID
-  (KPN.TRAIT:0000505), a legacy portal key (IBD), or a PIGEAN phenotype key —
-  resolved through the KPN trait registry (broadinstitute/kpn-data-models).
-  """
-  phenotype(id: ID!): Phenotype
-  phenotypes(search: String, first: Int = 20): [Phenotype!]!
-
-  gene(symbol: ID!): Gene
-  """
-  A gene set by name. With `phenotype` (any key), the set as that phenotype's
-  PIGEAN run observed it — its GeneSet entity, and members default to that
-  phenotype; without it, the first observation in (collection, phenotype)
-  order.
-  """
-  geneSet(name: ID!, collection: String, phenotype: ID): GeneSet
 
   """
   A claim by dapper:Claim ID: a deposited claim, or one the loaded data
@@ -56,9 +37,6 @@ type Query {
   """
   dapperObject(id: ID!): JSON
 
-  "Registered method modules and their metric semantics, for UI rendering."
-  methods: [MethodInfo!]!
-
   """
   The identifier story for clients: the canonical CURIE form, this service's
   resolver URL template (how any dapper ID becomes a shareable link), and the
@@ -76,24 +54,6 @@ type Health {
   dapperProfile: String!
 }
 
-type MethodInfo {
-  "Module name, e.g. pigean."
-  name: String!
-  "Semantics of every metric the module exposes; mirrors the SDL field docstrings."
-  metrics: [MetricSemantics!]!
-}
-
-type MetricSemantics {
-  "Exact source metric name as it appears in DAPPER ClaimScore.metric, e.g. beta_uncorrected."
-  metric: String!
-  scoreKind: ScoreKind!
-  scale: String!
-  better: Better!
-  "False until the method leads confirm the interpretation; UIs must render unconfirmed semantics as provisional."
-  confirmed: Boolean!
-  description: String!
-}
-
 "DAPPER ClaimScoreKindEnum."
 enum ScoreKind {
   PROBABILITY
@@ -101,125 +61,6 @@ enum ScoreKind {
   EFFECT_ESTIMATE
   LOADING
   SCORE
-}
-
-enum Better {
-  HIGHER
-  LOWER
-  NA
-  UNCONFIRMED
-}
-
-enum SortDir {
-  ASC
-  DESC
-}
-
-"Comparison filter for float metrics; conditions are ANDed."
-input FloatFilter {
-  lt: Float
-  lte: Float
-  gt: Float
-  gte: Float
-  eq: Float
-  ne: Float
-}
-
-input IntFilter {
-  lt: Int
-  lte: Int
-  gt: Int
-  gte: Int
-  eq: Int
-  ne: Int
-}
-
-type Phenotype {
-  """
-  Canonical KPN trait ID (KPN.TRAIT:…, from broadinstitute/kpn-data-models)
-  when the phenotype is registered; otherwise the key as loaded.
-  """
-  id: ID!
-  "Legacy portal trait key the result files use, e.g. IBD."
-  legacyId: String
-  "KPN trait name, e.g. Inflammatory bowel disease (IBD)."
-  name: String
-  "Trait group of the loaded result rows, e.g. portal."
-  traitGroup: String
-  "KPN trait category (registry trait_group), e.g. digestive."
-  category: String
-  "KPN trait type, e.g. disease, measurement."
-  traitType: String
-  "Primary ontology concept from the KPN registry, e.g. EFO:0003767."
-  conceptId: String
-  conceptLabel: String
-  "Cross-ontology mappings from the KPN registry (SSSOM), optionally for one ontology (EFO, MONDO, MESH, DOID, HP, ORPHANET, ...)."
-  mappings(ontology: String): [TraitMapping!]!
-}
-
-"One SSSOM mapping of a KPN trait to an ontology term."
-type TraitMapping {
-  targetId: ID!
-  ontology: String!
-  "SKOS / SSSOM predicate, e.g. skos:exactMatch."
-  predicate: String!
-  label: String
-  confidence: Float
-  justification: String
-  "Where the mapping came from (curated table, EFO cross-reference, ...)."
-  source: String
-}
-
-type Gene {
-  "HGNC symbol as it appears in the result files."
-  symbol: ID!
-  """
-  Gene-set memberships, each backed by its set's roster claim (one claim per
-  gene set, from the PIGEAN run's gene_gene_set_stats). Observations are
-  phenotype-scoped: pass `phenotype` for one run's (plus collection-wide
-  deposited) memberships; without it every observation is listed.
-  """
-  memberships(collection: String, phenotype: ID, first: Int = 100): [GeneSetMembership!]!
-}
-
-type GeneSet {
-  "Full gene-set name from the result files."
-  name: ID!
-  "Upstream source tag, e.g. lincs, geobulk___igvf."
-  source: String!
-  "Gene-set collection / run tag (the result files' gene_set_size field), e.g. cfde-inc-v2."
-  collection: String!
-  "dapper:GeneSet ID when known; resolves via provenance-indexer."
-  dapperGeneSetId: String
-  "Member genes, each backed by its set's roster claim; `phenotype` as on Gene.memberships."
-  members(phenotype: ID, first: Int = 100): [GeneSetMembership!]!
-}
-
-"A gene's membership in a gene set, backed by the set's roster claim (gene_set has_members, pinning the exact roster) or by a deposited membership claim. No scores in v0; if a method later emits per-membership weights they arrive as LOADING scores on the claim."
-type GeneSetMembership {
-  gene: Gene!
-  geneSet: GeneSet!
-  claim: ClaimEnvelope!
-}
-
-"""
-Shared shape of any method's gene-phenotype association. Concrete per-method
-types add their typed metric fields. There is deliberately no cross-method
-ordering: order-by enums exist only on concrete method types, so unlike scores
-cannot be blended by construction.
-"""
-interface GenePhenotypeAssociation {
-  gene: Gene!
-  phenotype: Phenotype!
-  collection: String!
-  claim: ClaimEnvelope!
-}
-
-interface GeneSetPhenotypeAssociation {
-  geneSet: GeneSet!
-  phenotype: Phenotype!
-  collection: String!
-  claim: ClaimEnvelope!
 }
 
 """
