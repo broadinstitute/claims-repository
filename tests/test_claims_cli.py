@@ -135,3 +135,12 @@ def test_generated_templates_render_claims_for_every_kind(tmp_path):
     scaffold.set_templates_list(col_dir / "collection.yaml", sorted(generated))
     col = load_collection(col_dir)
     assert sorted(t.rel for t in col.templates) == [f"templates/{n}" for n in sorted(generated)]
+
+
+def test_validate_reports_an_object_collection():
+    """kind: objects has object kinds, not metrics or claim templates; validate must not assume them."""
+    out = subprocess.run([sys.executable, "-m", "claims_cli.main", "collection", "validate",
+                          str(ROOT / "tests" / "fixtures" / "collections" / "catalog-test")],
+                         cwd=ROOT, capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert "catalog-test (objects): 4 object kind(s)" in out.stdout

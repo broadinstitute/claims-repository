@@ -491,10 +491,14 @@ def cmd_collection_validate(args):
     except ManifestError as exc:
         sys.exit(f"invalid: {exc}")
     d = col.doc
-    print(f"manifest     ok   {col.key}: {len(d['metrics'])} metrics, {len(d.get('tier_rules') or {})} tier rules, "
-          f"{len(d.get('relations') or {})} relations")
-    print("templates    ok   " + ", ".join(f"{t.doc['template']} ({len(t.doc['claims'])} claims)" for t in col.templates)
-          + "; every placeholder resolves")
+    if d.get("kind") == "objects":  # built from deposits: object kinds, no metrics or claim templates
+        print(f"manifest     ok   {col.key} (objects): {len(d.get('object_kinds') or {})} object kind(s): "
+              + ", ".join(d.get("object_kinds") or {}))
+    else:
+        print(f"manifest     ok   {col.key}: {len(d['metrics'])} metrics, {len(d.get('tier_rules') or {})} tier rules, "
+              f"{len(d.get('relations') or {})} relations")
+        print("templates    ok   " + ", ".join(f"{t.doc['template']} ({len(t.doc['claims'])} claims)"
+                                               for t in col.templates) + "; every placeholder resolves")
     print("queries      ok   " + ", ".join(col.queries) + ": no step orders or filters on another kind's metric")
     commit, dirty, _ = _git_info(col.manifest.path)
     git = (f"{commit[:7]}{', uncommitted changes' if dirty else ', clean'}" if commit
