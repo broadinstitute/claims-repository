@@ -683,6 +683,25 @@ def test_object_search_is_literal_case_insensitive_and_validated():
     paged = [search(q="gene", class_name="Proposition", limit=2, offset=offset).json() for offset in (0, 2)]
     assert [o["id"] for page in paged for o in page["objects"]] == [o["id"] for o in everything["objects"]][:4]
     assert {page["total"] for page in paged} == {everything["total"]}
+    assert "total_capped" not in everything
+    # A text search counts its matches up to a cap: beyond it the total is the cap, flagged, and pages stop there.
+    from service import app as service_app
+    saved = service_app.TEXT_TOTAL_CAP
+    service_app.TEXT_TOTAL_CAP = 3
+    try:
+        capped = search(q="gene", class_name="Proposition", limit=2).json()
+        assert (capped["total"], capped["total_capped"]) == (3, True)
+        assert [o["id"] for o in capped["objects"]] == [o["id"] for o in everything["objects"]][:2]
+        assert [o["id"] for o in search(q="gene", class_name="Proposition", limit=5, offset=2).json()["objects"]] == \
+            [everything["objects"][2]["id"]]
+        assert search(q="gene", class_name="Proposition", offset=3).json()["objects"] == []
+        exact = search(q="fixg1 fixpheno", class_name="Proposition").json()      # under the cap: exact, unflagged
+        assert "total_capped" not in exact and exact["total"] == len(exact["objects"])
+    finally:
+        service_app.TEXT_TOTAL_CAP = saved
+    # The class filter reads only that class's ids.
+    condition, params, _ = text_index.match_sql(service_db.connect(), "gene", class_name="Proposition")
+    assert "t.object_id >= ? AND t.object_id < ?" in condition and params[-2:] == ["dapper:Proposition.", "dapper:Proposition/"]
 
 
 def test_the_text_index_holds_exactly_the_words_of_every_stored_text_field():
@@ -720,6 +739,33 @@ def test_the_text_index_holds_exactly_the_words_of_every_stored_text_field():
     assert text_index.words("mp_abnormal_glucose_homeostasis") == " mp abnormal glucose homeostasis"   # '_' separates
     assert text_index.fulltext_query(["the", "il", "nod2", "bowel", "naïve"]) == "+nod2* +bowel*"
     assert text_index.fulltext_query(["of", "c3"]) is None
+    assert text_index.fulltext_query(["nod2", "gene", "bowel"], common={"gene"}) == "+nod2* +bowel*"
+    assert text_index.fulltext_query(["gene", "associated"], common={"gene", "associated"}) is None
+    assert text_index.class_range("Proposition") == ("dapper:Proposition.", "dapper:Proposition/")
+
+
+def test_a_word_in_a_large_share_of_the_index_is_estimated_common_from_a_sample(monkeypatch):
+    """Common words are kept away from the FULLTEXT index: InnoDB collects every row holding a word, so a word in most
+    rows costs time and memory in proportion. Ids are digests, so a class's first rows in id order are a random sample."""
+    from service import text_index
+    _load_fixtures()
+    con = service_db.connect()
+    try:
+        monkeypatch.setattr(text_index, "_samples", {})
+        monkeypatch.setattr(text_index, "COMMON_ROWS", 3)          # the fixture is small: more than 3 rows is "common"
+        sampled = text_index.samples(con)
+        assert "Proposition" in sampled and sampled["Proposition"][0] > 3
+        rows, words = sampled["Proposition"]
+        assert 0 < len(words) <= text_index.SAMPLE_ROWS and all(text.startswith(" ") for text in words)
+        assert text_index.samples(con) is sampled                    # read once, then kept for a while
+        common = text_index.common_words(con, ["gene", "fixg1", "zzzznotthere"], "Proposition")
+        assert "gene" in common and "zzzznotthere" not in common
+        assert text_index.common_words(con, ["gene"], "NoSuchClass") == set()
+        monkeypatch.setattr(text_index, "COMMON_ROWS", 10**9)        # nothing is common in a small repository
+        monkeypatch.setattr(text_index, "_samples", {})
+        assert text_index.samples(con) == {} and text_index.common_words(con, ["gene"]) == set()
+    finally:
+        con.close()
     assert text_index.query_words("NOD2, nod2;  Bowel") == ["nod2", "bowel"]
     assert client.get("/v1/objects/search", params={"references": "not-an-id"}).status_code == 400
     assert client.get("/v1/objects/search", params={"class_name": "Claim;--"}).status_code == 400

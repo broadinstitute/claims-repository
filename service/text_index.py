@@ -14,10 +14,16 @@ inflammatory bowel disease.", `inflam` finds it too, `od2` does not, and
 `words` stores a field's words lowercased, each preceded by one space, so
 "begins a word" is `words LIKE '% <word>%'` on SQLite and MySQL alike. On MySQL
 a FULLTEXT index over the same column narrows the rows first; it is only an
-accelerator, and the LIKE conditions decide every match. For a word that is in
-nearly every row the index is slower than reading the table, so the search
-gives the index a short budget and then reads the table instead
-(`fulltext=False`).
+accelerator, and the LIKE conditions decide every match.
+
+The index is given only words that are rare. InnoDB answers a full-text query
+by collecting every row that holds the word, so a word that is in a large
+share of the rows ("gene" in PIGEAN's statements) costs seconds and memory in
+proportion (it took down a 2 GB test server). How common a word is, is
+estimated from a sample: ids are content digests, so the first rows of a
+class in id order are a random sample of it (`common_words`). A search with
+no rare word reads the index table in id order instead, which stops at the
+first matches when they are many.
 """
 from __future__ import annotations
 
@@ -39,6 +45,11 @@ INNODB_STOPWORDS = frozenset(
     "a about an are as at be by com de en for from how i in is it la of on or that the this to was what when "
     "where who will with und www".split())
 MAX_FULLTEXT_TERMS = 8
+# A word estimated to be in more index rows than this is not given to the FULLTEXT index.
+COMMON_ROWS = 50_000
+SAMPLE_ROWS = 1_000          # per class, the first in id order
+SAMPLE_TTL_SECONDS = 600
+_samples: dict = {}          # {database: (expires, {class: (rows in the index, [sampled words])})}
 
 
 def tokens(text: str) -> list[str]:
@@ -82,10 +93,53 @@ def query_words(q: str) -> list[str]:
     return list(dict.fromkeys(tokens(q)))[:MAX_QUERY_WORDS]
 
 
-def fulltext_query(found: list[str]) -> str | None:
-    """The boolean-mode FULLTEXT query that narrows rows for these words, or None when no word can use the index."""
-    terms = [word for word in found if _FULLTEXT_TERM.fullmatch(word) and word not in INNODB_STOPWORDS][:MAX_FULLTEXT_TERMS]
+def fulltext_query(found: list[str], common=frozenset()) -> str | None:
+    """The boolean-mode FULLTEXT query that narrows rows for these words, or None when no word can use the index:
+    words the index holds (long enough, not a stopword) that are not `common`."""
+    terms = [word for word in found if _FULLTEXT_TERM.fullmatch(word) and word not in INNODB_STOPWORDS
+             and word not in common][:MAX_FULLTEXT_TERMS]
     return " ".join(f"+{word}*" for word in terms) or None
+
+
+def class_range(class_name: str) -> tuple[str, str]:
+    """The ids of one class as a range of the index's primary key: an id begins dapper:<Class>."""
+    return f"dapper:{class_name}.", f"dapper:{class_name}/"
+
+
+def samples(con) -> dict:
+    """{class: (index rows, [words of its first SAMPLE_ROWS rows in id order])} for the classes large enough to make
+    a word common, read once per process every SAMPLE_TTL_SECONDS."""
+    import time
+
+    from . import db
+
+    key = (con.dialect.backend, db.MYSQL_DATABASE if not con.dialect.sqlite else db.DB_PATH)
+    cached = _samples.get(key)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+    sizes = {r["class_name"]: r["c"] for r in con.execute("SELECT class_name, COUNT(*) AS c FROM object_text GROUP BY class_name")}
+    found = {}
+    for name, rows in sizes.items():
+        if rows >= COMMON_ROWS:
+            low, high = class_range(name)
+            found[name] = (rows, [r["words"] for r in con.execute(
+                "SELECT words FROM object_text WHERE object_id >= ? AND object_id < ? ORDER BY object_id LIMIT ?",
+                (low, high, SAMPLE_ROWS))])
+    _samples[key] = (time.monotonic() + SAMPLE_TTL_SECONDS, found)
+    return found
+
+
+def common_words(con, found: list[str], class_name=None) -> set[str]:
+    """The words of a query estimated to begin a word in more than COMMON_ROWS index rows (of `class_name`, or of
+    every class): each class's sample share of rows with the word, times the class's size."""
+    estimate = dict.fromkeys(found, 0.0)
+    for name, (rows, sample) in samples(con).items():
+        if class_name and name != class_name:
+            continue
+        for word in found:
+            needle = " " + word
+            estimate[word] += rows * sum(1 for text in sample if needle in text) / max(1, len(sample))
+    return {word for word, rows in estimate.items() if rows > COMMON_ROWS}
 
 
 def match_sql(con, q: str, *, fields=None, class_name=None, alias: str = "t", fulltext: bool = True):
@@ -98,7 +152,7 @@ def match_sql(con, q: str, *, fields=None, class_name=None, alias: str = "t", fu
         return None
     where, params, indexed = [], [], False
     if fulltext and not con.dialect.sqlite:
-        narrowed = fulltext_query(found)
+        narrowed = fulltext_query(found, common_words(con, found, class_name))
         if narrowed:
             where.append(f"MATCH({alias}.words) AGAINST (? IN BOOLEAN MODE)")
             params.append(narrowed)
@@ -112,6 +166,10 @@ def match_sql(con, q: str, *, fields=None, class_name=None, alias: str = "t", fu
     if class_name:
         where.append(f"{alias}.class_name = ?")
         params.append(class_name)
+        # An object's id begins with its class (dapper:<Class>.<digest>), and the index is stored in id order: the
+        # same class as a range of the primary key lets a read touch only that class's rows.
+        where.append(f"{alias}.object_id >= ? AND {alias}.object_id < ?")
+        params.extend(class_range(class_name))
     return " AND ".join(where), params, indexed
 
 

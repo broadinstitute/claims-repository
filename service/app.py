@@ -1727,11 +1727,13 @@ def _label(payload: dict) -> str | None:
 MAX_OFFSET = 10_000_000
 
 
-# Budgets (ms) MySQL enforces on a text search, so it never holds a connection. The FULLTEXT index answers an ordinary
-# query in milliseconds; for a word that is in nearly every object it is slower than reading the index table, so it gets
-# a short budget and the search then reads the table instead, under the longer one.
-FULLTEXT_BUDGET_MS = 1500
-SEARCH_BUDGET_MS = 8000
+# Budgets (ms) MySQL enforces on a text search, so it never holds a connection. The FULLTEXT index is given rare words
+# only (text_index.common_words) and answers in milliseconds; should it still run long, the search reads the index
+# table in id order instead, under the longer budget.
+FULLTEXT_BUDGET_MS = 2000
+SEARCH_BUDGET_MS = 9000
+# A text search counts its matches up to here; beyond it `total` is this number and `total_capped` is true.
+TEXT_TOTAL_CAP = 10_000
 
 
 def _search_fields(fields):
@@ -1800,48 +1802,67 @@ def _object_search(con, *, class_name=None, q=None, references=None, match=None,
         where.append(f"({con.dialect.json_is_string('o.payload', slot)} AND {je('o.payload', slot)} = ?)")
         params.append(value)
     text_only = bool(q) and not (references or deposited_by or deposit or match)
+    capped = False
 
-    def run(fulltext: bool):
-        """(total, rows) with the text condition built with or without the FULLTEXT index."""
-        if not q:
-            where_sql = (" WHERE " + " AND ".join(where)) if where else ""
-            base = f"FROM dapper_objects o{joins}{where_sql}"
-            total = con.execute(f"SELECT COUNT(*) AS c {base}", params).fetchone()["c"]
-            return total, con.execute(
-                f"SELECT o.id, o.class_name, o.payload, o.times_seen {base} ORDER BY o.id LIMIT ? OFFSET ?",
-                [*params, limit, offset]).fetchall()
+    def text_ids(fulltext: bool):
+        """(matching object ids in id order, at most TEXT_TOTAL_CAP + 1; whether the FULLTEXT index was used). One
+        statement finds the page and the count together."""
         condition, text_params, indexed = text_index.match_sql(con, q, fields=fields, class_name=class_name, fulltext=fulltext)
-        budget = FULLTEXT_BUDGET_MS if indexed else SEARCH_BUDGET_MS
-        hint = "" if con.dialect.sqlite else f"/*+ MAX_EXECUTION_TIME({budget}) */ "
-        if text_only:
-            # Text is the only filter (with class_name, which the index carries): count and page inside the
-            # index, and read the documents of that one page only.
-            total = con.execute(
-                f"SELECT {hint}COUNT(DISTINCT t.object_id) AS c FROM object_text t WHERE {condition}", text_params).fetchone()["c"]
-            return total, con.execute(
-                f"SELECT {hint}o.id, o.class_name, o.payload, o.times_seen FROM "
-                f"(SELECT DISTINCT t.object_id AS id FROM object_text t WHERE {condition} ORDER BY t.object_id LIMIT ? OFFSET ?) m "
-                "JOIN dapper_objects o ON o.id = m.id ORDER BY o.id",
-                [*text_params, limit, offset]).fetchall()
+        hint = "" if con.dialect.sqlite else f"/*+ MAX_EXECUTION_TIME({FULLTEXT_BUDGET_MS if indexed else SEARCH_BUDGET_MS}) */ "
+        found = con.execute(
+            f"SELECT {hint}DISTINCT t.object_id AS id FROM object_text t WHERE {condition} ORDER BY t.object_id LIMIT ?",
+            [*text_params, TEXT_TOTAL_CAP + 1]).fetchall()
+        return [r["id"] for r in found], indexed
+
+    def filtered(fulltext: bool):
+        """(total, rows) when text is one filter among others: those narrow the objects, the text index checks them."""
+        condition, text_params, indexed = text_index.match_sql(con, q, fields=fields, class_name=class_name, fulltext=fulltext)
+        hint = "" if con.dialect.sqlite else f"/*+ MAX_EXECUTION_TIME({FULLTEXT_BUDGET_MS if indexed else SEARCH_BUDGET_MS}) */ "
         clauses = [*where, f"o.id IN (SELECT t.object_id FROM object_text t WHERE {condition})"]
         base = f"FROM dapper_objects o{joins} WHERE " + " AND ".join(clauses)
         total = con.execute(f"SELECT {hint}COUNT(*) AS c {base}", [*params, *text_params]).fetchone()["c"]
         return total, con.execute(
             f"SELECT {hint}o.id, o.class_name, o.payload, o.times_seen {base} ORDER BY o.id LIMIT ? OFFSET ?",
-            [*params, *text_params, limit, offset]).fetchall()
+            [*params, *text_params, limit, offset]).fetchall(), indexed
+
+    def with_fallback(find):
+        """find(True), and when the FULLTEXT index was the slow way to answer, find(False): the same rows, read."""
+        try:
+            return find(True)
+        except Exception as exc:
+            # Only a search that used the index has another way to run.
+            if not _too_broad(exc) or not text_index.match_sql(con, q, fields=fields, class_name=class_name)[2]:
+                raise
+        return find(False)
 
     try:
-        try:
-            total, rows = run(True)
-        except Exception as exc:
-            if not _too_broad(exc):
-                raise
-            total, rows = run(False)   # the index was the slow way to find this; read the table
+        if not q:
+            where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+            base = f"FROM dapper_objects o{joins}{where_sql}"
+            total = con.execute(f"SELECT COUNT(*) AS c {base}", params).fetchone()["c"]
+            rows = con.execute(
+                f"SELECT o.id, o.class_name, o.payload, o.times_seen {base} ORDER BY o.id LIMIT ? OFFSET ?",
+                [*params, limit, offset]).fetchall()
+        elif text_only:
+            # Text is the only filter (with class_name, which the index carries): find the ids in the index, and
+            # read the documents of that one page only.
+            ids, _ = with_fallback(text_ids)
+            capped = len(ids) > TEXT_TOTAL_CAP
+            total = min(len(ids), TEXT_TOTAL_CAP)
+            page = ids[:TEXT_TOTAL_CAP][offset:offset + limit]
+            rows = con.execute(
+                f"SELECT id, class_name, payload, times_seen FROM dapper_objects WHERE id IN ({', '.join('?' * len(page))}) ORDER BY id",
+                page).fetchall() if page else []
+        else:
+            total, rows, _ = with_fallback(filtered)
+    except HTTPException:
+        raise
     except Exception as exc:
         if _too_broad(exc):
             raise HTTPException(status_code=400, detail=(
-                "This text search matches too many objects to count and order in time. Add a more specific word, "
-                "name a class_name (for example Proposition or Claim), or limit fields (for example fields=statement)."))
+                "This text search could not finish in time: its words are too short or too common to find quickly. "
+                "Add a more specific word, name a class_name (for example Proposition or Claim), or limit fields "
+                "(for example fields=statement)."))
         raise
     objects = [
         {
@@ -1853,7 +1874,10 @@ def _object_search(con, *, class_name=None, q=None, references=None, match=None,
         }
         for r in rows
     ]
-    return {"total": total, "limit": limit, "offset": offset, "objects": objects}
+    result = {"total": total, "limit": limit, "offset": offset, "objects": objects}
+    if capped:   # more matches than a text search counts: total is the cap, and pages stop there
+        result["total_capped"] = True
+    return result
 
 
 @app.get("/v1/objects")

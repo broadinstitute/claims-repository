@@ -195,8 +195,11 @@ paths:
         `nod2 bowel` finds "The gene NOD2 is associated with inflammatory bowel
         disease."; `od2` does not. `fields` limits which of the three are
         searched, and class_name keeps one class: together they make a search
-        specific and fast (it runs on an index of those fields). A search whose
-        words are in nearly every object is refused with 400 and what to add.
+        specific and fast (it runs on an index of those fields). A text search
+        counts its matches up to 10,000: beyond that `total` is 10000,
+        `total_capped` is true and pages stop there, so narrow it. One whose
+        words are too short or too common to find in time is refused with 400
+        and what to add.
         `match=slot:value` (repeatable) is exact equality on a top-level string
         slot, e.g. match=relation:has_members or match=subject_entity:NOD2.
         `deposited_by=<key id>` returns objects that depositor sent through
