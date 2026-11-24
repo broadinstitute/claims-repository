@@ -71,9 +71,17 @@ REQUIRED_COLUMNS = {
     "release_object_fields": {"collection_key", "version", "object_id", "field", "value", "num"},
     "deposit_objects": {"deposit_id", "object_id", "status"},
     "deposit_edges": {"deposit_id", "seq", "class_name", "subject_id", "object_id", "payload"},
+    # 010_device_login.sql
+    "device_codes": {"device_code_sha256", "user_code", "status", "client", "host", "ip", "requested_at", "expires_at",
+                     "last_polled_at", "decided_by", "decided_at", "token_id"},
+    "publisher_tokens": {"token_id", "token_sha256", "email", "host", "created_at", "expires_at", "last_used_at",
+                         "revoked_at", "revoked_by"},
 }
 REQUIRED_PRIMARY_KEYS = {
     "claim_memberships": ["phenotype", "collection", "gene", "gene_set"],
+    # 010_device_login.sql
+    "device_codes": ["device_code_sha256"],
+    "publisher_tokens": ["token_id"],
     # 006_collections.sql
     "collection_releases": ["release_id"],
     "result_claims": ["claim_id"],
