@@ -121,16 +121,18 @@ _FIELD_SQL = {
 }
 
 
-def rebuild_object_text(con, batch: int = 5000, progress=None, after: str = "") -> int:
+def rebuild_object_text(con, batch: int = 5000, progress=None, after: str = "", since: str | None = None) -> int:
     """Index every stored document that is not indexed yet (backfill after the migration, or repair). Reads only
     the text fields, in id order, a batch at a time; each batch is its own short transaction. Returns the number of
     index rows offered (already-present rows are ignored). `after` resumes an interrupted run: only objects whose
-    id sorts after it are read."""
+    id sorts after it are read. `since` (a UTC 'YYYY-MM-DD HH:MM:SS') reads only objects first stored at or after
+    that time: the quick way to cover what a service without the index stored while a backfill was running."""
     select = ", ".join(_FIELD_SQL[con.dialect.sqlite].format(f=field) + f" AS {field}" for field in TEXT_FIELDS)
     written, last = 0, after
     while True:
+        recent, params = ("AND created_at >= ? ", (last, since, batch)) if since else ("", (last, batch))
         rows = con.execute(
-            f"SELECT id, class_name, {select} FROM dapper_objects WHERE id > ? ORDER BY id LIMIT ?", (last, batch)).fetchall()
+            f"SELECT id, class_name, {select} FROM dapper_objects WHERE id > ? {recent}ORDER BY id LIMIT ?", params).fetchall()
         if not rows:
             break
         last = rows[-1]["id"]

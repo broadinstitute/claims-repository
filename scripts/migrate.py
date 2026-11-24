@@ -158,6 +158,9 @@ def main() -> int:
                         help="recompute object_refs from every stored document")
     parser.add_argument("--index-text", action="store_true",
                         help="add the object_text rows missing for stored documents (idempotent)")
+    parser.add_argument("--index-text-since", default=None, metavar="UTC",
+                        help="with --index-text: only objects first stored at or after this UTC time "
+                             "('YYYY-MM-DD HH:MM:SS'), to cover what was stored while a backfill ran")
     parser.add_argument("--index-text-after", default="", metavar="ID",
                         help="with --index-text: resume an interrupted run after this object id (the last one a "
                              "progress line printed)")
@@ -260,7 +263,7 @@ def main() -> int:
                 batches[0] += 1
                 if batches[0] % 100 == 0:
                     print(f"  object_text: through {last} ({offered} rows offered)", flush=True)
-            offered = rebuild_object_text(svc, progress=progress, after=args.index_text_after)
+            offered = rebuild_object_text(svc, progress=progress, after=args.index_text_after, since=args.index_text_since)
             now = svc.execute("SELECT COUNT(*) AS c FROM object_text").fetchone()["c"]
             print(f"indexed object_text: {offered} rows offered from {objects} objects; {indexed} rows before, {now} now")
     finally:

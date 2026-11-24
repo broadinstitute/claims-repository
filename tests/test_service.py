@@ -707,6 +707,8 @@ def test_the_text_index_holds_exactly_the_words_of_every_stored_text_field():
                  for r in con.execute("SELECT object_id, class_name, field, words FROM object_text")}
         assert again == expected and offered == len(expected)
         assert text_index.rebuild_object_text(con, batch=7) == len(expected)   # offered again, all ignored
+        assert text_index.rebuild_object_text(con, since="2000-01-01 00:00:00") == len(expected)   # everything is newer
+        assert text_index.rebuild_object_text(con, since="2999-01-01 00:00:00") == 0                # nothing is
         middle = sorted(row[0] for row in expected)[len(expected) // 2]
         resumed = text_index.rebuild_object_text(con, batch=7, after=middle)       # an interrupted run picks up after an id
         assert 0 < resumed == sum(1 for row in expected if row[0] > middle) < len(expected)
