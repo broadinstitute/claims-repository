@@ -8,3 +8,5 @@ rdflib>=7,<8
 linkml-runtime>=1.9,<2
 # Collection manifest, template and query validation.
 jsonschema>=4.18,<5
+# MySQL (QA and prod, when CLAIMS_MYSQL_HOST is set) and scripts/migrate.py.
+PyMySQL>=1.1,<2

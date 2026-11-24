@@ -556,13 +556,13 @@ def _connect_sqlite(path: str | None) -> Connection:
 
 
 def _connect_mysql() -> Connection:
-    import pymysql
-    import pymysql.cursors
-
     if not MYSQL_DATABASE:
         # No default: an unset name must not silently select (or a migration
         # create) some other database.
         raise RuntimeError("CLAIMS_MYSQL_DATABASE must be set when CLAIMS_MYSQL_HOST is")
+
+    import pymysql
+    import pymysql.cursors
     kwargs = dict(
         host=MYSQL_HOST,
         port=MYSQL_PORT,
