@@ -11,10 +11,12 @@
     claims sources verify <collection dir> 2026.11.1
     claims query run pigean top-genes-with-sets --var trait=IBD --var topGenes=5
     claims serve --port 8100
+    claims login [--api URL] [--no-wait | --continue]     (also: claims whoami, claims logout)
 
 Every command that touches a deployment needs --db (the control-plane SQLite
 file) and --index-dir (the Parquet index), or CLAIMS_DB and CLAIMS_INDEX_DIR.
 It refuses to run when CLAIMS_MYSQL_HOST is set: this CLI is for local stacks.
+`claims login` signs in to a deployed API instead (device code; docs/cli-login.md).
 
 A collection directory holds the manifest (collection.yaml), templates,
 queries, and source.yaml, which says where the result files live:
@@ -59,6 +61,7 @@ _require_cli_packages()
 
 import yaml  # noqa: E402
 
+from . import auth  # noqa: E402
 from . import scaffold  # noqa: E402
 from . import vocab  # noqa: E402
 from . import sources as src  # noqa: E402
@@ -1201,6 +1204,8 @@ def main(argv=None):
     p.add_argument("--code-version")
     p.add_argument("--out", help="path inside the collection (default provenance/run.dapper.yaml)")
     p.set_defaults(func=cmd_provenance_draft)
+
+    auth.add_commands(sub)
 
     p = sub.add_parser("serve", help="run the service over the local deployment")
     p.add_argument("--port", type=int, default=8100)

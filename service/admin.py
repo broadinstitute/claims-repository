@@ -27,6 +27,11 @@ Deposit keys (service/api_keys.py) are issued and revoked here too: POST /keys
 and POST /keys/{key_id}/revoke, purpose admin_write, audited in
 admin_auth_events with the admin's email. A key is returned once, by the
 issue response, and is never stored, logged or listed.
+CLI sign-in (service/device_login.py): GET /device/{user_code} and POST
+/device/{user_code}/approve and /deny take their own purpose, device_approve,
+and the approver is the assertion's email. Publisher tokens are listed
+(GET /tokens, admin_read; never a token or its hash) and revoked
+(POST /tokens/{token_id}/revoke, admin_write).
 """
 from __future__ import annotations
 
@@ -43,6 +48,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import admin_gateway as gateway
 from . import api_keys
+from . import device_login
 from . import db
 from . import telemetry
 from .collections import engine as cengine
@@ -566,9 +572,13 @@ def _claim_detail(con, claim_id) -> dict | None:
 
 # --- tables -------------------------------------------------------------------
 
+# Never listed by the table browser: their hashes are what authenticate a CLI sign-in and a publisher token.
+HIDDEN_TABLES = {"device_codes", "publisher_tokens"}
+
+
 def _tables_known() -> list[str]:
     import re
-    return re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", db.SQLITE_DDL)
+    return [t for t in re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", db.SQLITE_DDL) if t not in HIDDEN_TABLES]
 
 
 # Never served by the table browser. A deposit key's hash is not the key, but it is what authenticates one.
@@ -1251,6 +1261,75 @@ async def keys_revoke(key_id: str, admin: dict = Depends(gateway.require_admin_w
             con.close()
     await run_in_threadpool(run)
     return _json({"keyId": key_id, "revoked": True})
+
+
+# --- CLI sign-in and publisher tokens ------------------------------------------------
+
+def _user_code(raw: str) -> str:
+    code = device_login.normalize_user_code(raw)
+    if code is None:
+        raise HTTPException(status_code=404, detail="No sign-in is waiting with this code. Check it, or run `claims login` again.")
+    return code
+
+
+@router.get("/device/{user_code}")
+async def device_request(user_code: str, _: dict = Depends(gateway.require_device_approve)):
+    """A pending CLI sign-in: the host and IP that asked, the client, and when. 404 for an unknown, expired or
+    decided code."""
+    request = await _read(device_login.pending, _user_code(user_code))
+    if request is None:
+        raise HTTPException(status_code=404, detail="No sign-in is waiting with this code. It may have expired "
+                                                    "(10 minutes) or been decided already.")
+    return _json(request)
+
+
+def _decide(user_code: str, email: str, approve: bool) -> dict:
+    con = db.connect()
+    try:
+        with con:
+            decided = device_login.decide(con, user_code, email, approve)
+    finally:
+        con.close()
+    if decided is None:
+        raise HTTPException(status_code=404, detail="No sign-in is waiting with this code. It may have expired "
+                                                    "(10 minutes) or been decided already.")
+    return decided
+
+
+@router.post("/device/{user_code}/approve")
+async def device_approve(user_code: str, admin: dict = Depends(gateway.require_device_approve)):
+    """Approve a CLI sign-in as the signed-in admin: the CLI's next poll receives a publisher token for them."""
+    return _json(await run_in_threadpool(_decide, _user_code(user_code), admin["email"], True))
+
+
+@router.post("/device/{user_code}/deny")
+async def device_deny(user_code: str, admin: dict = Depends(gateway.require_device_approve)):
+    return _json(await run_in_threadpool(_decide, _user_code(user_code), admin["email"], False))
+
+
+@router.get("/tokens")
+async def tokens_list(_: dict = Depends(gateway.require_admin)):
+    """CLI sessions: publisher tokens, newest first. Never a token or its hash."""
+    return _json({"asOf": _ts(datetime.now(timezone.utc)), "tokens": await _read(device_login.list_tokens)})
+
+
+@router.post("/tokens/{token_id}/revoke")
+async def tokens_revoke(token_id: str, admin: dict = Depends(gateway.require_admin_write)):
+    """End a CLI session at once."""
+    if not device_login.TOKEN_ID_RE.match(token_id):
+        raise HTTPException(status_code=404, detail="Unknown token.")
+    def run():
+        con = db.connect()
+        try:
+            with con:
+                if con.execute("SELECT 1 FROM publisher_tokens WHERE token_id = ?", (token_id,)).fetchone() is None:
+                    raise HTTPException(status_code=404, detail="Unknown token.")
+                if not device_login.revoke(con, token_id, admin["email"]):
+                    raise HTTPException(status_code=409, detail="This session is already revoked.")
+        finally:
+            con.close()
+    await run_in_threadpool(run)
+    return _json({"tokenId": token_id, "revoked": True})
 
 
 # --- registration (the Add collection flow) --------------------------------------

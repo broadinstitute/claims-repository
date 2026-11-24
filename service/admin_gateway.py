@@ -12,8 +12,9 @@ An assertion must carry:
   iat, exp (lifetime at most MAX_LIFETIME seconds), jti, sub
   purpose  "admin_read" for the read API, "admin_write" for the write routes
            (collection registration, deposit keys), "auth_event" for the
-           sign-in audit
-For admin_read and admin_write: email + email_verified true. Which emails are
+           sign-in audit, "device_approve" for looking up, approving and
+           denying a CLI sign-in (service/device_login.py)
+For admin_read, admin_write and device_approve: email + email_verified true. Which emails are
 admins is the console's decision alone: only its server holds the secret, so
 an assertion it signed already names an approved admin (a second list here
 would protect nothing against a leaked secret, which can name any email). A
@@ -77,6 +78,12 @@ def require_admin_write(request: Request) -> dict:
     """FastAPI dependency for the write routes: the same admin checks under
     their own purpose, so a leaked read assertion cannot publish."""
     return _admin(request, "admin_write")
+
+
+def require_device_approve(request: Request) -> dict:
+    """FastAPI dependency for approving a CLI sign-in: its own purpose, so a leaked read or write assertion
+    cannot approve a login. The approver's email comes from the assertion, never from the request body."""
+    return _admin(request, "device_approve")
 
 
 def require_auth_event(request: Request) -> dict:

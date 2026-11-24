@@ -44,6 +44,11 @@ tags:
       templates and queries) and runs its own query templates. Collections are
       published with scripts/publish_collection.py; a registration API is not
       yet built.
+  - name: Auth
+    description: >-
+      Sign-in for the claims CLI by device code (RFC 8628; docs/cli-login.md). The CLI starts a sign-in, an admin
+      approves its user code in the admin console, and the CLI exchanges the device code, once, for a publisher token
+      (clp_ followed by 43 characters, 30 days) that it sends as a Bearer token. Only SHA-256 hashes are stored.
 security: []
 paths:
   /v1/health:
@@ -66,6 +71,110 @@ paths:
                     type: string
                     description: Pinned DAPPER release/commit used for validation.
                     examples: ['0.2.0-a1']
+  /v1/auth/device:
+    post:
+      operationId: startDeviceLogin
+      tags: [Auth]
+      summary: Start a CLI sign-in
+      description: >-
+        Returns a secret device code for the CLI to poll with and a user code to approve at verification_uri. The
+        code expires after expires_in seconds. At most 5 sign-ins per address may wait for approval at once (429).
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                client: { type: string, maxLength: 64, description: 'The CLI and its version, e.g. claims-cli/0.1.' }
+                host: { type: string, maxLength: 255, description: 'The hostname the CLI runs on, shown to the approver.' }
+      responses:
+        '200':
+          description: The sign-in was started.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [device_code, user_code, verification_uri, verification_uri_complete, expires_in, interval]
+                properties:
+                  device_code: { type: string }
+                  user_code: { type: string, examples: ['WDJB-MJHT'] }
+                  verification_uri: { type: string, format: uri }
+                  verification_uri_complete: { type: string, format: uri }
+                  expires_in: { type: integer, examples: [600] }
+                  interval: { type: integer, examples: [5] }
+        '400': { description: 'client or host is not printable text.' }
+        '429': { description: Too many sign-ins are waiting for approval. }
+  /v1/auth/device/token:
+    post:
+      operationId: exchangeDeviceCode
+      tags: [Auth]
+      summary: Poll a CLI sign-in
+      description: >-
+        Until the sign-in is approved, 400 with error authorization_pending (or slow_down when polled faster than the
+        interval). access_denied, expired_token and invalid_grant end it. Once approved, the publisher token is
+        returned once and the device code is consumed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_code]
+              properties:
+                device_code: { type: string }
+      responses:
+        '200':
+          description: The publisher token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [access_token, token_type, expires_in, email, token_id, expires_at]
+                properties:
+                  access_token: { type: string, description: 'clp_ followed by 43 characters. Shown once.' }
+                  token_type: { type: string, enum: [Bearer] }
+                  expires_in: { type: integer }
+                  email: { type: string, description: The admin who approved the sign-in. }
+                  token_id: { type: string, examples: ['tok_0123456789abcdef'] }
+                  expires_at: { type: string, format: date-time }
+        '400':
+          description: Not (yet) a token.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: { type: string, enum: [authorization_pending, slow_down, access_denied, expired_token, invalid_grant] }
+                  error_description: { type: string }
+  /v1/auth/whoami:
+    get:
+      operationId: whoami
+      tags: [Auth]
+      summary: Who a publisher token signs in as
+      security: [{ PublisherToken: [] }]
+      responses:
+        '200':
+          description: The token's holder and expiry.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [email, token_id, expires_at]
+                properties:
+                  email: { type: string }
+                  token_id: { type: string }
+                  expires_at: { type: string, format: date-time }
+        '401': { description: 'No valid publisher token: missing, unknown, expired or revoked (one answer for all).' }
+  /v1/auth/logout:
+    post:
+      operationId: logout
+      tags: [Auth]
+      summary: Revoke the publisher token this request carries
+      security: [{ PublisherToken: [] }]
+      responses:
+        '200': { description: The token is revoked. }
+        '401': { description: No valid publisher token. }
   /v1/vocabulary:
     get:
       operationId: getVocabulary
@@ -953,6 +1062,12 @@ components:
       required: true
       schema: { type: string, examples: [pigean] }
   securitySchemes:
+    PublisherToken:
+      type: http
+      scheme: bearer
+      description: >-
+        A publisher token from `claims login` (POST /v1/auth/device, then /v1/auth/device/token): clp_ followed by 43
+        characters, valid 30 days, revocable in the admin console or with POST /v1/auth/logout.
     ApiKeyHeader:
       type: apiKey
       in: header
