@@ -14,6 +14,7 @@ nav:
   - Inputs and outputs: inputs-and-outputs.md
   - Collections: collections.md
   - Creating a collection: creating-a-collection.md
+  - Publishing a PIGEAN run: publishing-a-pigean-run.md
   - Method modules: method-modules.md
   - Graph-query contract design: query-graph-design.md
   - Admin console: admin-console.md

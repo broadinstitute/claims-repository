@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from service import db  # noqa: E402
 from service import pigean_template as tpl  # noqa: E402
 from service.refs import dapper_refs  # noqa: E402
+from service import text_index  # noqa: E402
 
 TOOLKIT_DATA = Path("/Users/cyakaboski/src/research/kpn-dapper-toolkit/data/pigean/IBD")
 S3_PREFIX = "s3://dig-analysis-cfde/catalog_v2/out/pigean"
@@ -518,6 +519,7 @@ def load(con, gene_stats: Path, gene_set_stats: Path, membership_stats: Path | N
             [(o["id"], o["class_name"], tpl.IDENTITY_PROFILE, tpl.canonical(o)) for o in unique_objects.values()],
         )
         con.executemany(con.dialect.insert_ref, ref_rows)
+        text_index.index_objects(con, [(o["id"], o["class_name"], o) for o in unique_objects.values()])
         con.executemany(
             f"{replace} pigean_gene_associations (phenotype, collection, gene, prior, combined, log_bf, n, trait_group, claim_id, proposition_id, synthesis_inputs) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             gene_rows,
