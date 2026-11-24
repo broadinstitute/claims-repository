@@ -158,6 +158,9 @@ def main() -> int:
                         help="recompute object_refs from every stored document")
     parser.add_argument("--index-text", action="store_true",
                         help="add the object_text rows missing for stored documents (idempotent)")
+    parser.add_argument("--index-text-after", default="", metavar="ID",
+                        help="with --index-text: resume an interrupted run after this object id (the last one a "
+                             "progress line printed)")
     args = parser.parse_args()
 
     database = os.environ.get("CLAIMS_MYSQL_DATABASE")
@@ -256,8 +259,8 @@ def main() -> int:
             def progress(last, offered):
                 batches[0] += 1
                 if batches[0] % 100 == 0:
-                    print(f"  object_text: through {last[:40]} ({offered} rows offered)", flush=True)
-            offered = rebuild_object_text(svc, progress=progress)
+                    print(f"  object_text: through {last} ({offered} rows offered)", flush=True)
+            offered = rebuild_object_text(svc, progress=progress, after=args.index_text_after)
             now = svc.execute("SELECT COUNT(*) AS c FROM object_text").fetchone()["c"]
             print(f"indexed object_text: {offered} rows offered from {objects} objects; {indexed} rows before, {now} now")
     finally:
