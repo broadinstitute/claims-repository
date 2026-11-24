@@ -51,7 +51,10 @@ MAX_FULLTEXT_TERMS = 8
 COMMON_ROWS = 3_000
 SAMPLE_ROWS = 3_000          # per class, the first in id order
 SAMPLED_CLASS_ROWS = 50_000  # classes smaller than this cannot make a word common and are not sampled
-SAMPLE_TTL_SECONDS = 600
+# Counting the index rows per class takes 2 s at 5.7 million rows (the optimizer's estimate of a class's id range is off
+# by up to 6 times, so it is counted), and the search that finds the sample expired waits for it. Class sizes and word
+# shares move slowly, so the sample is kept for hours.
+SAMPLE_TTL_SECONDS = 6 * 3600
 _samples: dict = {}          # {database: (expires, {class: (rows in the index, [sampled words])})}
 
 
