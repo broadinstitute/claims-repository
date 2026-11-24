@@ -17,6 +17,7 @@ import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +31,13 @@ def api_base(value: str | None) -> str:
     base = (value or os.environ.get("CLAIMS_API") or QA).strip().rstrip("/")
     if base.endswith("/v1"):
         base = base[:-3]
-    if not base.startswith(("https://", "http://127.0.0.1", "http://localhost")):
+    try:
+        url = urllib.parse.urlsplit(base)
+        url.port  # noqa: B018  (raises on a malformed port)
+    except ValueError:
+        sys.exit(f"claims: {base} is not a URL.")
+    local = url.scheme == "http" and url.hostname in ("127.0.0.1", "localhost", "::1")
+    if (url.scheme != "https" and not local) or not url.hostname or url.username or url.password:
         sys.exit(f"claims: {base} is not an https URL. Tokens are only sent over https (or to this machine).")
     return base
 

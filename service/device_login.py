@@ -47,7 +47,7 @@ DEVICE_TTL = 600            # seconds a device code may wait for a decision
 INTERVAL = 5                # seconds between polls
 TOKEN_TTL = 30 * 24 * 3600  # a publisher token's lifetime
 MAX_PENDING_PER_IP = 5
-MAX_PENDING = 100           # all IPs together: unauthenticated callers cannot fill the table
+MAX_PENDING = 1000          # all addresses together: a bound on the table, far above real use
 KEEP_DECIDED = timedelta(days=1)  # expired codes are deleted after this; the audit table keeps the history
 MAX_HOST = 255
 MAX_CLIENT = 64
@@ -123,7 +123,13 @@ def _label(value, limit: int, what: str) -> str | None:
 def client_ip(request: Request) -> str | None:
     """The caller's address: the rightmost public address in X-Forwarded-For plus the connecting peer. Proxies
     append the address they saw, so entries a client sends itself sit to the left and are skipped. Without a
-    public address (local runs, tests) it is the connecting peer."""
+    public address (local runs, tests) it is the connecting peer. IPv6 addresses count by /64, the block one
+    client usually holds.
+
+    This assumes uvicorn does not rewrite the peer from X-Forwarded-For: it trusts only 127.0.0.1 unless
+    FORWARDED_ALLOW_IPS is set, and the platform does not set it. Never set it to `*` for this service: uvicorn
+    would then take the leftmost entry, which the client writes. The address is shown to the approver and
+    counted for the per-address cap; it is not an identity."""
     chain = [p.strip() for p in request.headers.get("x-forwarded-for", "").split(",") if p.strip()]
     peer = request.client.host if request.client else None
     hops = chain + ([peer] if peer else [])
@@ -133,6 +139,8 @@ def client_ip(request: Request) -> str | None:
         except ValueError:
             continue
         if address.is_global:
+            if address.version == 6:
+                return str(ipaddress.ip_network(f"{address}/64", strict=False))
             return str(address)
     return (peer or None) and peer[:64]
 
@@ -337,12 +345,26 @@ def _connected(fn, *args):
         con.close()
 
 
+START_LOCK = "claims_device_start"
+
+
 @router.post("/device")
 async def device_start(body: DeviceRequest, request: Request):
     """Start a CLI sign-in: a device code for the CLI to poll with, and a user code for an admin to approve."""
     def run(con):
-        with con:
-            return start(con, body.client, body.host, client_ip(request))
+        # On MySQL, starts run one at a time (a named lock), so concurrent starts cannot both pass the caps or
+        # deadlock on the purge. SQLite already serializes writers.
+        locked = False
+        if not con.dialect.sqlite:
+            locked = con.execute("SELECT GET_LOCK(?, 10) AS got", (START_LOCK,)).fetchone()["got"] == 1
+            if not locked:
+                raise TooManyPending("The service is busy starting other sign-ins. Try again in a moment.")
+        try:
+            with con:
+                return start(con, body.client, body.host, client_ip(request))
+        finally:
+            if locked:
+                con.execute("SELECT RELEASE_LOCK(?)", (START_LOCK,))
     try:
         started = await run_in_threadpool(_connected, run)
     except ValueError as exc:

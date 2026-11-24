@@ -129,7 +129,10 @@ def test_claims_token_overrides_the_file(api, capsys, monkeypatch):
 
 
 def test_only_https_or_this_machine():
-    with pytest.raises(SystemExit, match="not an https URL"):
-        auth.api_base("http://api.example.org/api/claims")
+    for bad in ("http://api.example.org/api/claims", "http://localhost.evil.example", "http://127.0.0.1.nip.io",
+                "http://localhost@evil.example", "https://user@x.example.org", "ftp://x.example.org"):
+        with pytest.raises(SystemExit, match="not an https URL"):
+            auth.api_base(bad)
+    assert auth.api_base("http://localhost:8110") == "http://localhost:8110"
     assert auth.api_base(None) == auth.QA
     assert auth.api_base("https://x.example.org/api/claims/v1/") == "https://x.example.org/api/claims"

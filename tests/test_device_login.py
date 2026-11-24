@@ -244,3 +244,11 @@ def test_the_contract_lists_the_public_auth_routes():
     contract = client.get("/v1/openapi.yaml").text
     for path in ("/v1/auth/device:", "/v1/auth/device/token:", "/v1/auth/whoami:", "/v1/auth/logout:", "PublisherToken:"):
         assert path in contract
+
+
+def test_ipv6_addresses_count_by_their_64():
+    a = _start(ip="2600:1f18:1:2:aaaa::1")
+    b = _start(ip="2600:1f18:1:2:bbbb::2")
+    ips = {r["ip"] for r in _rows("SELECT ip FROM device_codes WHERE device_code_sha256 IN (?, ?)",
+                                  (device_login._hash(a["device_code"]), device_login._hash(b["device_code"])))}
+    assert ips == {"2600:1f18:1:2::/64"}
