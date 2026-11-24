@@ -15,7 +15,7 @@ nav:
   - Collections: collections.md
   - Creating a collection: creating-a-collection.md
   - Publishing a PIGEAN run: publishing-a-pigean-run.md
-  - CLI login (design): cli-login.md
+  - CLI login: cli-login.md
   - Method modules: method-modules.md
   - Graph-query contract design: query-graph-design.md
   - Admin console: admin-console.md

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { signOut } from "next-auth/react";
-import { Activity, Boxes, Database, FileText, KeyRound, Library, LayoutDashboard, PackagePlus, ScrollText } from "lucide-react";
+import { Activity, Boxes, Database, FileText, KeyRound, Library, LayoutDashboard, PackagePlus, ScrollText, Terminal } from "lucide-react";
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
@@ -15,6 +15,7 @@ const NAV = [
   { href: "/admin/accounts", label: "Accounts", icon: FileText },
   { href: "/admin/objects", label: "Objects", icon: Boxes },
   { href: "/admin/keys", label: "Keys", icon: KeyRound },
+  { href: "/admin/device", label: "CLI sign-in", icon: Terminal },
   { href: "/admin/tables", label: "Tables", icon: Database },
   { href: "/admin/activity", label: "Activity", icon: Activity },
 ];

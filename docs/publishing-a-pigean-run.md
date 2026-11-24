@@ -14,8 +14,9 @@ full reference.
 
 **What works today.** The CLI publishes into a *local deployment*: a SQLite control database plus a
 Parquet index on the server's disk, which `claims serve` serves over HTTP. Publishing into the shared QA
-service will need a `claims login` (device-code sign-in, so it works on a remote machine) and a publish
-path into the deployed store. Neither is built yet. Everything you prepare here (the S3 layout and the
+service needs a `claims login` (device-code sign-in, so it works on a remote machine; built, see
+[cli-login.md](cli-login.md)) and a publish path into the deployed store that requires it (not built
+yet). Everything you prepare here (the S3 layout and the
 collection directory) carries over unchanged, because both paths read the same `collection.yaml` and
 `source.yaml`.
 

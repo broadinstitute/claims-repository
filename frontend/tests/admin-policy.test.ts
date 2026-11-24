@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { adminBypass, allowedAdmin, jsonContentType, readablePath, sameOrigin, writablePath } from "../src/lib/admin/policy";
+import { adminBypass, allowedAdmin, deviceReadPath, deviceWritePath, jsonContentType, normalizeUserCode, readablePath, safeNext, sameOrigin, writablePath } from "../src/lib/admin/policy";
 
 const LIST = " chase@broadinstitute.org , Cyakabos@Broadinstitute.org ";
 
@@ -103,4 +103,43 @@ test("writes must come from the same origin", () => {
     ["file://claims-repository.vercel.app", "claims-repository.vercel.app"],
     ["https://claims-repository.vercel.app", "evil.example"],
   ] as const) assert.equal(sameOrigin(origin, host), false, `${origin} vs ${host}`);
+});
+
+test("CLI sign-in paths: their own purpose, never the read or write lists", () => {
+  assert.equal(deviceReadPath("device/WDJBMJHT"), true);
+  assert.equal(deviceWritePath("device/WDJBMJHT/approve"), true);
+  assert.equal(deviceWritePath("device/WDJBMJHT/deny"), true);
+  for (const bad of ["device/WDJB-MJHT", "device/wdjbmjht", "device/AEIOUBCD", "device/WDJBMJH", "device/WDJBMJHTX",
+    "device/WDJBMJHT/approve/", "device/WDJBMJHT/revoke", "device", "device/"]) {
+    assert.equal(deviceReadPath(bad) || deviceWritePath(bad), false, bad);
+  }
+  for (const path of ["device/WDJBMJHT", "device/WDJBMJHT/approve", "device/WDJBMJHT/deny"]) {
+    assert.equal(readablePath(path), false, path);
+    assert.equal(writablePath(path), false, path);
+  }
+  assert.equal(deviceReadPath("device/WDJBMJHT/approve"), false);
+  assert.equal(deviceWritePath("device/WDJBMJHT"), false);
+  // CLI sessions ride on admin_read and admin_write.
+  assert.equal(readablePath("tokens"), true);
+  assert.equal(writablePath("tokens/tok_0123456789abcdef/revoke"), true);
+  for (const bad of ["tokens/tok_x/revoke", "tokens/TOK_0123456789abcdef/revoke", "tokens/tok_0123456789ABCDEF/revoke", "tokens/tok_0123456789abcdef"]) {
+    assert.equal(writablePath(bad) || readablePath(bad), false, bad);
+  }
+});
+
+test("user codes normalize from what people type", () => {
+  assert.equal(normalizeUserCode("wdjb-mjht"), "WDJBMJHT");
+  assert.equal(normalizeUserCode(" WDJB MJHT "), "WDJBMJHT");
+  assert.equal(normalizeUserCode("WDJB-MJHA"), null);
+  assert.equal(normalizeUserCode("WDJB-MJH"), null);
+  assert.equal(normalizeUserCode(undefined), null);
+});
+
+test("sign-in returns only to console paths", () => {
+  assert.equal(safeNext("/admin/device?code=WDJBMJHT"), "/admin/device?code=WDJBMJHT");
+  assert.equal(safeNext("/admin/keys"), "/admin/keys");
+  for (const bad of ["https://evil.example/admin", "//evil.example/admin", "/administrator.evil", "/admin\\@evil", "/admin/device?code=x y",
+    "/admin/../api", "/docs", "", undefined, "/admin/device?next=https://evil.example"]) {
+    assert.equal(safeNext(bad), "/admin", String(bad));
+  }
 });

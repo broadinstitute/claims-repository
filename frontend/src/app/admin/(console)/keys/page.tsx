@@ -10,6 +10,7 @@ import { DataTable } from "@/components/admin/data-table";
 import { Callout, CopyButton, Mono, PageHeading, Panel, Pre, QueryFeedback, Status, When, clock, number, plural } from "@/components/admin/shared";
 import { adminGet, adminPost, type DepositKey, type DepositKeyList, type IssuedDepositKey, type RevokedDepositKey } from "@/lib/admin/api";
 import { Grants } from "./grants";
+import { CliSessions } from "./sessions";
 
 const KEYS = ["admin", "keys"];
 const MAX_NAME = 120;
@@ -192,5 +193,7 @@ export default function KeysPage() {
           empty="No deposit keys yet. Deposits are refused until a key is issued: POST /v1/deposits answers 401 without a valid key." />
       </>}
     </Panel>
+
+    <CliSessions />
   </>;
 }

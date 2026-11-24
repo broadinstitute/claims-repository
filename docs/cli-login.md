@@ -1,9 +1,9 @@
 # CLI login (device code)
 
-> **Status (2026-11-24): design, not built.** This is the plan for `claims login`. It is the first half of
-> publishing from the CLI to a deployed service. The second half, the publish endpoint that takes a
-> collection built in a local DuckDB deployment into the deployed store, is designed separately and
-> uses the token defined here.
+> **Status (2026-11-24): built.** `claims login`, `claims whoami` and `claims logout` work against QA, and
+> the admin console approves sign-ins at `/admin/device` and lists them under Keys, CLI sessions. This is
+> the first half of publishing from the CLI to a deployed service. Nothing consumes the token yet: the
+> second half, a publish path into the deployed store that requires it (`require_publisher`), is next.
 
 Publishing a collection to a shared deployment must say who did it, and not everyone may do it. The
 `claims` CLI often runs on a remote server, sometimes driven by an agent, where no browser is
@@ -180,6 +180,18 @@ the file, for unattended runs. The CLI never prints a token.
   credentials file mode; `CLAIMS_TOKEN`.
 - **End to end:** `claims login` from a remote server against QA, approved in the console, then
   `claims whoami`.
+
+## Using it
+
+```bash
+./bin/claims login                 # prints a link and a code; approve it in the console
+./bin/claims login --no-wait       # for an agent: print the link and code, return at once ...
+./bin/claims login --continue      # ... then finish after you approve
+./bin/claims whoami
+./bin/claims logout
+```
+
+`--api` defaults to `$CLAIMS_API`, else QA (`https://api-qa.hugeampkpnbi.org/api/claims`).
 
 ## Rollout
 

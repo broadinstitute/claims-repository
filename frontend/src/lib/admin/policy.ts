@@ -19,6 +19,9 @@ export function adminBypass(env: Env): boolean {
 const KEY = "[a-z0-9][a-z0-9._-]{0,127}";
 const JOB = "[A-Za-z0-9_-]{1,64}";
 const KEY_ID = "key_[0-9a-f]{16}";
+const TOKEN_ID = "tok_[0-9a-f]{16}";
+// A CLI sign-in's user code as the API stores it: 8 of these 20 consonants, upper case, no dash.
+const USER_CODE = "[BCDFGHJKLMNPQRSTVWXZ]{8}";
 const DAPPER = "dapper:[A-Za-z]+\\.[A-Za-z0-9_-]{1,200}";
 const exact = (pattern: string) => new RegExp(`^${pattern}$`);
 
@@ -30,7 +33,7 @@ const READ_PATHS = [
   "objects", "objects/classes", `objects/${DAPPER}`, "deposits", "accounts", `accounts/${DAPPER}`,
   "tables", "tables/[a-z_]{1,64}/rows", "activity",
   "registration/sources", "registration/jobs", `registration/jobs/${JOB}`,
-  "keys",
+  "keys", "tokens",
 ].map(exact);
 export function readablePath(path: string): boolean {
   return READ_PATHS.some(re => re.test(path));
@@ -38,9 +41,36 @@ export function readablePath(path: string): boolean {
 
 /** Admin API paths the browser may write through the proxy (POST, purpose admin_write). */
 const WRITE_PATHS = ["registration/check", "registration/jobs", "keys", `keys/${KEY_ID}/revoke`,
-  `keys/${KEY_ID}/grants`, `keys/${KEY_ID}/grants/${KEY}/withdraw`].map(exact);
+  `keys/${KEY_ID}/grants`, `keys/${KEY_ID}/grants/${KEY}/withdraw`, `tokens/${TOKEN_ID}/revoke`].map(exact);
 export function writablePath(path: string): boolean {
   return WRITE_PATHS.some(re => re.test(path));
+}
+
+/**
+ * CLI sign-in paths, signed with their own purpose (device_approve), never admin_read or admin_write: GET looks a
+ * pending sign-in up, POST approves or denies it. Kept out of READ_PATHS and WRITE_PATHS.
+ */
+const DEVICE_READ = exact(`device/${USER_CODE}`);
+const DEVICE_WRITE = exact(`device/${USER_CODE}/(approve|deny)`);
+export function deviceReadPath(path: string): boolean {
+  return DEVICE_READ.test(path);
+}
+export function deviceWritePath(path: string): boolean {
+  return DEVICE_WRITE.test(path);
+}
+
+/** A user code as typed or linked (any case, a dash or spaces) in the stored form, or null. */
+export function normalizeUserCode(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const code = raw.replace(/[\s-]/g, "").toUpperCase();
+  return new RegExp(`^${USER_CODE}$`).test(code) ? code : null;
+}
+
+/** Where sign-in may return to: a console path on this site, never another origin. */
+export function safeNext(next: unknown): string {
+  if (typeof next !== "string" || !next.startsWith("/admin") || next.startsWith("//") || /[\\\s]/.test(next)) return "/admin";
+  if (!/^\/admin(\/[A-Za-z0-9/_-]*)?(\?[A-Za-z0-9=&_-]*)?$/.test(next)) return "/admin";
+  return next;
 }
 
 /** Writes accept JSON only (`application/json`, parameters such as charset allowed). */
