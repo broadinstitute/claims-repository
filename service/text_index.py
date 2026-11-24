@@ -45,9 +45,12 @@ INNODB_STOPWORDS = frozenset(
     "a about an are as at be by com de en for from how i in is it la of on or that the this to was what when "
     "where who will with und www".split())
 MAX_FULLTEXT_TERMS = 8
-# A word estimated to be in more index rows than this is not given to the FULLTEXT index.
-COMMON_ROWS = 50_000
-SAMPLE_ROWS = 1_000          # per class, the first in id order
+# A word estimated to be in more index rows than this is not given to the FULLTEXT index. Measured on the shared
+# cluster at 5.7 million rows: the index answers a word in a few hundred rows in 0.25 s, takes over 2 s for one in
+# 7,000, and reading a 1.8-million-row class takes 3.5 s whatever the word.
+COMMON_ROWS = 3_000
+SAMPLE_ROWS = 3_000          # per class, the first in id order
+SAMPLED_CLASS_ROWS = 50_000  # classes smaller than this cannot make a word common and are not sampled
 SAMPLE_TTL_SECONDS = 600
 _samples: dict = {}          # {database: (expires, {class: (rows in the index, [sampled words])})}
 
@@ -120,7 +123,7 @@ def samples(con) -> dict:
     sizes = {r["class_name"]: r["c"] for r in con.execute("SELECT class_name, COUNT(*) AS c FROM object_text GROUP BY class_name")}
     found = {}
     for name, rows in sizes.items():
-        if rows >= COMMON_ROWS:
+        if rows >= SAMPLED_CLASS_ROWS:
             low, high = class_range(name)
             found[name] = (rows, [r["words"] for r in con.execute(
                 "SELECT words FROM object_text WHERE object_id >= ? AND object_id < ? ORDER BY object_id LIMIT ?",

@@ -753,6 +753,7 @@ def test_a_word_in_a_large_share_of_the_index_is_estimated_common_from_a_sample(
     try:
         monkeypatch.setattr(text_index, "_samples", {})
         monkeypatch.setattr(text_index, "COMMON_ROWS", 3)          # the fixture is small: more than 3 rows is "common"
+        monkeypatch.setattr(text_index, "SAMPLED_CLASS_ROWS", 3)   # ...and every class with more is sampled
         sampled = text_index.samples(con)
         assert "Proposition" in sampled and sampled["Proposition"][0] > 3
         rows, words = sampled["Proposition"]
@@ -761,7 +762,7 @@ def test_a_word_in_a_large_share_of_the_index_is_estimated_common_from_a_sample(
         common = text_index.common_words(con, ["gene", "fixg1", "zzzznotthere"], "Proposition")
         assert "gene" in common and "zzzznotthere" not in common
         assert text_index.common_words(con, ["gene"], "NoSuchClass") == set()
-        monkeypatch.setattr(text_index, "COMMON_ROWS", 10**9)        # nothing is common in a small repository
+        monkeypatch.setattr(text_index, "SAMPLED_CLASS_ROWS", 10**9)  # no class of a small repository is sampled
         monkeypatch.setattr(text_index, "_samples", {})
         assert text_index.samples(con) == {} and text_index.common_words(con, ["gene"]) == set()
     finally:

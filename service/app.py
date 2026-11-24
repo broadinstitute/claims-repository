@@ -1731,7 +1731,7 @@ MAX_OFFSET = 10_000_000
 # only (text_index.common_words) and answers in milliseconds; should it still run long, the search reads the index
 # table in id order instead, under the longer budget.
 FULLTEXT_BUDGET_MS = 2000
-SEARCH_BUDGET_MS = 9000
+SEARCH_BUDGET_MS = 12000
 # A text search counts its matches up to here; beyond it `total` is this number and `total_capped` is true.
 TEXT_TOTAL_CAP = 10_000
 
