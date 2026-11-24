@@ -145,3 +145,31 @@ def test_provenance_nodes_must_be_true_addresses(tmp_path):
     (tmp_path / "provenance" / "run.dapper.yaml").write_text(yaml.safe_dump(doc))
     with pytest.raises(PublishError, match="not a true DAPPER-ID-1 address"):
         _publish(tmp_path, {**spec, "provenance": [{"path": "provenance/run.dapper.yaml"}]})
+
+
+def test_a_membership_file_of_only_its_ends_and_dimensions_mints_the_same_gene_sets(tmp_path):
+    """docs/publishing-a-pigean-run.md recommends cutting the membership file to gene, gene_set and
+    the two dimension columns: only the (gene, gene set) pairs are read, so every roster is unchanged.
+    (Gene set ids still change, since each set cites the membership file it was read from.)"""
+    spec, _, _ = _setup(tmp_path)
+    full, full_db = _publish(tmp_path, spec)
+    slim = tmp_path / "slim.json"
+    keep = ("gene", "gene_set", "phenotype", "gene_set_size")
+    lines = (FIX / "pigean" / ROLES["membership"]).read_text().splitlines()
+    slim.write_text("".join(json.dumps({k: json.loads(l)[k] for k in keep}) + "\n" for l in lines if l.strip()))
+    slim_spec = {**spec, "version": "0.4.0-slim"}
+    slim_spec["datasets"] = [{**spec["datasets"][0], "files": {**spec["datasets"][0]["files"],
+                                                              "membership": {"path": str(slim),
+                                                                             "location": "s3://bucket/run/slim.json"}}}]
+    _, slim_db = _publish(tmp_path, slim_spec)
+
+    def gene_sets(db_path):
+        con = service_db.connect(db_path)
+        try:
+            docs = [json.loads(r["payload"]) for r in
+                    con.execute("SELECT payload FROM dapper_objects WHERE class_name = 'GeneSet'")]
+            return {(d["name"], tuple(d.get("members", ()))) for d in docs}
+        finally:
+            con.close()
+
+    assert gene_sets(full_db) and gene_sets(full_db) == gene_sets(slim_db)

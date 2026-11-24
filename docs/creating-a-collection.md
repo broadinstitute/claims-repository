@@ -74,6 +74,8 @@ into the local deployment.
 
 ### Starting from an existing collection
 
+[publishing-a-pigean-run.md](publishing-a-pigean-run.md) walks through this for a new PIGEAN run, including how to lay out its files on S3.
+
 A new collection that reads files laid out like an existing one (another PIGEAN run, say) can start from a
 copy of that collection's directory instead of Step 2. The PIGEAN collection is kept in
 [kpn-dapper-toolkit](https://github.com/broadinstitute/kpn-dapper-toolkit) under `collections/pigean/`.
