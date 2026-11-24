@@ -34,6 +34,7 @@ from . import dapper_validation as dval
 from . import db
 from . import pigean_template as tpl
 from . import telemetry
+from . import text_index
 from .collections import catalog as ccatalog
 from .collections import identity as cidn
 from .collections import objects as cobjects
@@ -279,6 +280,7 @@ def _store_object(con, obj, identity_profile):
     refs = sorted(dapper_refs(obj))
     if refs:
         con.executemany(con.dialect.insert_ref, [(obj["id"], ref) for ref in refs])
+    text_index.index_objects(con, [(obj["id"], obj["class_name"], obj)])
 
 
 _ENVELOPE_COLS = "payload, class_name, times_seen, created_at, last_seen_at"
@@ -483,6 +485,7 @@ def _flush_assertions(con):
                         "VALUES (?, ?, ?, ?)",
                         [(oid, cidn.class_of(oid), cidn.PROFILE, cidn.canonical(doc)) for oid, doc in items])
         con.executemany(con.dialect.insert_ref, sorted({(oid, ref) for oid, doc in items for ref in dapper_refs(doc)}))
+        text_index.index_objects(con, [(oid, cidn.class_of(oid), doc) for oid, doc in items])
     assertions = getattr(con, "assertions", None) or {}
     if not assertions:
         return
@@ -505,6 +508,7 @@ def _flush_assertions(con):
         refs = [(cid, ref) for cid, a in new for ref in a["refs"]]
         if refs:
             con.executemany(con.dialect.insert_ref, refs)
+        text_index.index_objects(con, [(cid, "Claim", json.loads(a["payload"])) for cid, a in new])
 
 
 def _is_lock_conflict(exc) -> bool:
@@ -1482,6 +1486,7 @@ def _write_deposit(depositor, prepared, hints, edges=(), collection=None, releas
                     refs = sorted(dapper_refs(obj))
                     if refs:
                         con.executemany(con.dialect.insert_ref, [(oid, ref) for ref in refs])
+                    text_index.index_objects(con, [(oid, cls, obj)])
                 if cls == "Claim":
                     # Register every deposited Claim with its proposition so
                     # the GraphQL fan-in (Query.proposition) sees claims that
@@ -1701,7 +1706,7 @@ API: <a href="{_href(PUBLIC_BASE + "/v1/docs")}">REST docs</a> · <a href="{_hre
 # the dereferenced claim envelope and proposition fan-in live there too.
 
 _SLOT_RE = re.compile(r"^[a-z_][a-z0-9_]*\Z")
-_TEXT_SLOTS = ("statement", "name", "description")
+_TEXT_SLOTS = text_index.TEXT_FIELDS
 
 
 def _label(payload: dict) -> str | None:
@@ -1722,12 +1727,39 @@ def _label(payload: dict) -> str | None:
 MAX_OFFSET = 10_000_000
 
 
+# Budgets (ms) MySQL enforces on a text search, so it never holds a connection. The FULLTEXT index is given rare words
+# only (text_index.common_words) and answers in milliseconds; should it still run long, the search reads the index
+# table in id order instead, under the longer budget.
+FULLTEXT_BUDGET_MS = 2000
+SEARCH_BUDGET_MS = 12000
+# A text search counts its matches up to here; beyond it `total` is this number and `total_capped` is true.
+TEXT_TOTAL_CAP = 10_000
+
+
+def _search_fields(fields):
+    """The text fields a search names (`fields=statement,name`, repeatable), validated; None for all of them."""
+    if not fields:
+        return None
+    named = [part.strip() for value in fields for part in str(value).split(",") if part.strip()]
+    unknown = sorted(set(named) - set(text_index.TEXT_FIELDS))
+    if unknown:
+        raise HTTPException(status_code=400, detail=(
+            f"fields must be among {', '.join(text_index.TEXT_FIELDS)}; got {', '.join(unknown)[:140]}"))
+    return [field for field in text_index.TEXT_FIELDS if field in named] or None
+
+
+def _too_broad(exc) -> bool:
+    """MySQL error 3024: the statement ran past its MAX_EXECUTION_TIME."""
+    return type(exc).__module__.startswith("pymysql") and getattr(exc, "args", (None,))[0] == 3024
+
+
 def _object_search(con, *, class_name=None, q=None, references=None, match=None,
-                   deposited_by=None, deposit=None, limit=50, offset=0):
+                   deposited_by=None, deposit=None, fields=None, limit=50, offset=0):
     """Shared engine for GET /v1/objects and /v1/objects/search: filters
     ANDed, deterministic id order, total computed over the same filters.
-    Text matching is case-insensitive and literal (wildcards escaped) on both
-    backends."""
+    Text matching goes through the object_text index (service/text_index.py):
+    every word of `q` must begin a word of one searched field, the same on
+    both backends."""
     limit = max(1, min(int(limit), 500))
     offset = max(0, min(int(offset), MAX_OFFSET))
     if class_name is not None and not _CLASS_RE.match(class_name):
@@ -1755,11 +1787,11 @@ def _object_search(con, *, class_name=None, q=None, references=None, match=None,
     if class_name:
         where.append("o.class_name = ?")
         params.append(class_name)
-    if q:
-        where.append("(" + " OR ".join(
-            f"({con.dialect.json_is_string('o.payload', s)} AND {con.dialect.like_ci(je('o.payload', s))})"
-            for s in _TEXT_SLOTS) + ")")
-        params.extend([f"%{db.like_escape(q)}%"] * len(_TEXT_SLOTS))
+    fields = _search_fields(fields)
+    if fields and not q:
+        raise HTTPException(status_code=400, detail="fields names where q is searched; give q too")
+    if q and text_index.match_sql(con, q) is None:   # no word in q: nothing can match
+        return {"total": 0, "limit": limit, "offset": offset, "objects": []}
     for clause in match or []:
         slot, sep, value = clause.partition(":")
         if not sep or not _SLOT_RE.match(slot):
@@ -1769,13 +1801,69 @@ def _object_search(con, *, class_name=None, q=None, references=None, match=None,
             )
         where.append(f"({con.dialect.json_is_string('o.payload', slot)} AND {je('o.payload', slot)} = ?)")
         params.append(value)
-    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
-    base = f"FROM dapper_objects o{joins}{where_sql}"
-    total = con.execute(f"SELECT COUNT(*) AS c {base}", params).fetchone()["c"]
-    rows = con.execute(
-        f"SELECT o.id, o.class_name, o.payload, o.times_seen {base} ORDER BY o.id LIMIT ? OFFSET ?",
-        [*params, limit, offset],
-    ).fetchall()
+    text_only = bool(q) and not (references or deposited_by or deposit or match)
+    capped = False
+
+    def text_ids(fulltext: bool):
+        """(matching object ids in id order, at most TEXT_TOTAL_CAP + 1; whether the FULLTEXT index was used). One
+        statement finds the page and the count together."""
+        condition, text_params, indexed = text_index.match_sql(con, q, fields=fields, class_name=class_name, fulltext=fulltext)
+        hint = "" if con.dialect.sqlite else f"/*+ MAX_EXECUTION_TIME({FULLTEXT_BUDGET_MS if indexed else SEARCH_BUDGET_MS}) */ "
+        found = con.execute(
+            f"SELECT {hint}DISTINCT t.object_id AS id FROM object_text t WHERE {condition} ORDER BY t.object_id LIMIT ?",
+            [*text_params, TEXT_TOTAL_CAP + 1]).fetchall()
+        return [r["id"] for r in found], indexed
+
+    def filtered(fulltext: bool):
+        """(total, rows) when text is one filter among others: those narrow the objects, the text index checks them."""
+        condition, text_params, indexed = text_index.match_sql(con, q, fields=fields, class_name=class_name, fulltext=fulltext)
+        hint = "" if con.dialect.sqlite else f"/*+ MAX_EXECUTION_TIME({FULLTEXT_BUDGET_MS if indexed else SEARCH_BUDGET_MS}) */ "
+        clauses = [*where, f"o.id IN (SELECT t.object_id FROM object_text t WHERE {condition})"]
+        base = f"FROM dapper_objects o{joins} WHERE " + " AND ".join(clauses)
+        total = con.execute(f"SELECT {hint}COUNT(*) AS c {base}", [*params, *text_params]).fetchone()["c"]
+        return total, con.execute(
+            f"SELECT {hint}o.id, o.class_name, o.payload, o.times_seen {base} ORDER BY o.id LIMIT ? OFFSET ?",
+            [*params, *text_params, limit, offset]).fetchall(), indexed
+
+    def with_fallback(find):
+        """find(True), and when the FULLTEXT index was the slow way to answer, find(False): the same rows, read."""
+        try:
+            return find(True)
+        except Exception as exc:
+            # Only a search that used the index has another way to run.
+            if not _too_broad(exc) or not text_index.match_sql(con, q, fields=fields, class_name=class_name)[2]:
+                raise
+        return find(False)
+
+    try:
+        if not q:
+            where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+            base = f"FROM dapper_objects o{joins}{where_sql}"
+            total = con.execute(f"SELECT COUNT(*) AS c {base}", params).fetchone()["c"]
+            rows = con.execute(
+                f"SELECT o.id, o.class_name, o.payload, o.times_seen {base} ORDER BY o.id LIMIT ? OFFSET ?",
+                [*params, limit, offset]).fetchall()
+        elif text_only:
+            # Text is the only filter (with class_name, which the index carries): find the ids in the index, and
+            # read the documents of that one page only.
+            ids, _ = with_fallback(text_ids)
+            capped = len(ids) > TEXT_TOTAL_CAP
+            total = min(len(ids), TEXT_TOTAL_CAP)
+            page = ids[:TEXT_TOTAL_CAP][offset:offset + limit]
+            rows = con.execute(
+                f"SELECT id, class_name, payload, times_seen FROM dapper_objects WHERE id IN ({', '.join('?' * len(page))}) ORDER BY id",
+                page).fetchall() if page else []
+        else:
+            total, rows, _ = with_fallback(filtered)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if _too_broad(exc):
+            raise HTTPException(status_code=400, detail=(
+                "This text search could not finish in time: its words are too short or too common to find quickly. "
+                "Add a more specific word, name a class_name (for example Proposition or Claim), or limit fields "
+                "(for example fields=statement)."))
+        raise
     objects = [
         {
             "id": r["id"],
@@ -1786,7 +1874,10 @@ def _object_search(con, *, class_name=None, q=None, references=None, match=None,
         }
         for r in rows
     ]
-    return {"total": total, "limit": limit, "offset": offset, "objects": objects}
+    result = {"total": total, "limit": limit, "offset": offset, "objects": objects}
+    if capped:   # more matches than a text search counts: total is the cap, and pages stop there
+        result["total_capped"] = True
+    return result
 
 
 @app.get("/v1/objects")
@@ -1807,7 +1898,8 @@ def list_objects(
 @app.get("/v1/objects/search")
 def search_objects(
     class_name: str | None = None,
-    q: str | None = None,
+    q: str | None = Query(default=None, max_length=300),
+    fields: list[str] | None = Query(default=None),
     references: str | None = None,
     match: list[str] | None = Query(default=None),
     deposited_by: str | None = None,
@@ -1817,8 +1909,9 @@ def search_objects(
 ):
     """General search over every dapper object. `references` = objects whose
     document points at that dapper ID (claims of a proposition, evidence for
-    a proposition, propositions about a GeneSet, ...); `q` substring-matches
-    the statement / name / description text; `match=slot:value` (repeatable)
+    a proposition, propositions about a GeneSet, ...); `q` is a word search of
+    the statement / name / description text (every word of q must begin a
+    word of one field; `fields` limits which); `match=slot:value` (repeatable)
     is exact equality on a top-level string slot (e.g. relation:has_members,
     subject_entity:NOD2); `deposited_by=<key id>` = objects that depositor sent
     in a deposit, and `deposit=<deposit id>` = objects one deposit
@@ -1826,7 +1919,7 @@ def search_objects(
     con = db.connect()
     try:
         return _object_search(con, class_name=class_name, q=q, references=references, match=match,
-                              deposited_by=deposited_by, deposit=deposit, limit=limit, offset=offset)
+                              deposited_by=deposited_by, deposit=deposit, fields=fields, limit=limit, offset=offset)
     finally:
         con.close()
 

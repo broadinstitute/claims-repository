@@ -136,6 +136,16 @@ CREATE TABLE IF NOT EXISTS object_refs (
   PRIMARY KEY (from_id, to_id)
 );
 CREATE INDEX IF NOT EXISTS idx_refs_to ON object_refs (to_id);
+-- Text index (service/text_index.py): each stored object's text fields as
+-- lowercased words; backs GET /v1/objects/search?q=.
+CREATE TABLE IF NOT EXISTS object_text (
+  object_id TEXT NOT NULL,
+  field TEXT NOT NULL,
+  class_name TEXT NOT NULL,
+  words TEXT NOT NULL,
+  PRIMARY KEY (object_id, field)
+);
+CREATE INDEX IF NOT EXISTS idx_ot_class ON object_text (class_name);
 CREATE INDEX IF NOT EXISTS idx_do_class ON dapper_objects (class_name);
 -- KPN trait registry (broadinstitute/kpn-data-models release, loaded by
 -- scripts/load_kpn_traits.py): canonical KPN.TRAIT IDs, the legacy portal /
@@ -426,6 +436,17 @@ class Dialect:
         return (
             "INSERT INTO object_refs (from_id, to_id) VALUES (?, ?) "
             "ON DUPLICATE KEY UPDATE to_id = to_id"
+        )
+
+    @property
+    def insert_text(self) -> str:
+        """Idempotent text-index insert (service/text_index.py): a stored
+        object's document never changes, so an existing row stands."""
+        if self.sqlite:
+            return "INSERT OR IGNORE INTO object_text (object_id, class_name, field, words) VALUES (?, ?, ?, ?)"
+        return (
+            "INSERT INTO object_text (object_id, class_name, field, words) VALUES (?, ?, ?, ?) "
+            "ON DUPLICATE KEY UPDATE object_id = object_id"
         )
 
     def json_is_string(self, col: str, path: str) -> str:

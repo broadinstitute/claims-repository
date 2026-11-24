@@ -188,8 +188,18 @@ paths:
         `references` returns objects whose document points at the given dapper
         ID — e.g. class_name=Claim&references=<proposition id> is every claim
         assessing that proposition; references=<GeneSet id> is everything about
-        that set. `q` substring-matches statement / name / description text,
-        case-insensitively and literally (% and _ are not wildcards).
+        that set. `q` is a word search of the statement / name / description
+        text: every word of q must begin a word of ONE of those fields, in any
+        order, case-insensitively (words are runs of letters and digits;
+        punctuation and underscore separate them, and nothing is a wildcard).
+        `nod2 bowel` finds "The gene NOD2 is associated with inflammatory bowel
+        disease."; `od2` does not. `fields` limits which of the three are
+        searched, and class_name keeps one class: together they make a search
+        specific and fast (it runs on an index of those fields). A text search
+        counts its matches up to 10,000: beyond that `total` is 10000,
+        `total_capped` is true and pages stop there, so narrow it. One whose
+        words are too short or too common to find in time is refused with 400
+        and what to add.
         `match=slot:value` (repeatable) is exact equality on a top-level string
         slot, e.g. match=relation:has_members or match=subject_entity:NOD2.
         `deposited_by=<key id>` returns objects that depositor sent through
@@ -203,7 +213,14 @@ paths:
         - { name: deposited_by, in: query, schema: { type: string, pattern: '^key_[0-9a-f]{16}$' }, description: "A depositor's key id (400 if not one)." }
         - { name: deposit, in: query, schema: { type: string, pattern: '^dep_[0-9a-f]{32}$' }, description: 'A deposit id (400 if not one).' }
         - { name: references, in: query, schema: { type: string }, description: 'A dapper ID the matched objects reference (400 if not a dapper identifier).' }
-        - { name: q, in: query, schema: { type: string }, description: 'Substring of the statement, name, or description.' }
+        - { name: q, in: query, schema: { type: string, maxLength: 300 }, description: 'Words to find; each must begin a word of the statement, name, or description.' }
+        - name: fields
+          in: query
+          description: "With q: which text fields to search (statement, name, description), comma-separated or repeated. Default all three."
+          schema: { type: array, items: { type: string, enum: [statement, name, description] } }
+          style: form
+          explode: true
+          example: [ statement ]
         - name: match
           in: query
           description: "Repeatable 'slot:value' exact match on a top-level string slot."

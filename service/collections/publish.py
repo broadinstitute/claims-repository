@@ -46,6 +46,7 @@ from . import identity as idn
 from .manifest import Collection, ManifestError, SourceFile
 from .traits import MappingError, Vocabulary, collection_vocabulary, resolve_dimension, unmapped_policy, vocabulary_files
 from ..refs import dapper_refs
+from .. import text_index
 
 
 class PublishError(ValueError):
@@ -924,3 +925,4 @@ def _store_objects(con, objects: dict) -> None:
     con.executemany(con.dialect.upsert_object, rows)
     refs = sorted({(oid, ref) for oid, (_, d) in objects.items() for ref in dapper_refs(d)})
     con.executemany(con.dialect.insert_ref, refs)
+    text_index.index_objects(con, [(oid, cls, d) for oid, (cls, d) in sorted(objects.items())])

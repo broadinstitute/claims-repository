@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from service import db as service_db  # noqa: E402
 from service import pigean_template as tpl  # noqa: E402
+from service import text_index  # noqa: E402
 from service.app import app  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -650,6 +651,123 @@ def test_object_search_is_literal_case_insensitive_and_validated():
     assert lower["total"] == 1  # case-insensitive on every backend
     assert client.get("/v1/objects/search", params={"q": "F_XG1"}).json()["total"] == 0  # '_' is literal
     assert client.get("/v1/objects/search", params={"q": "%"}).json()["total"] == 0      # '%' is literal
+    # Words, not a phrase: every word of q begins a word of one field, in any order; a word is matched from its
+    # start, never from its middle.
+    search = lambda **params: client.get("/v1/objects/search", params=params)
+    one = lower["objects"][0]["id"]
+    for q in ("fixg1 fixpheno", "FIXPHENO  fixg1", "fixg1 assoc", "fixg1, associated: fixpheno!"):
+        found = search(class_name="Proposition", q=q, limit=500).json()["objects"]
+        assert one in [o["id"] for o in found], q
+        # Every result has every word of q at the start of one of its words (other tests add propositions too).
+        for o in found:
+            have = text_index.tokens(o["label"])
+            assert all(any(word.startswith(wanted) for word in have) for wanted in text_index.tokens(q)), (q, o["label"])
+    for q in ("ixg1", "fixg1 nosuchword", "fixg1x", "f_xg1"):
+        assert search(class_name="Proposition", q=q).json()["total"] == 0, q
+    # `fields` says where to look. A Proposition has a statement and no name.
+    assert search(q="fixg1 fixpheno", fields="statement").json()["total"] >= 1
+    assert search(class_name="Proposition", q="fixg1 fixpheno", fields="name").json()["total"] == 0
+    assert search(class_name="Proposition", q="fixg1 fixpheno", fields="name,statement").json()["total"] == \
+        search(class_name="Proposition", q="fixg1 fixpheno").json()["total"] >= 1
+    assert client.get("/v1/objects/search", params=[("q", "fixg1"), ("fields", "statement"), ("fields", "description")]).status_code == 200
+    refused = search(q="fixg1", fields="payload")
+    assert refused.status_code == 400 and "fields must be among statement, name, description" in refused.json()["detail"]
+    assert search(fields="statement").status_code == 400            # fields without q
+    assert search(q="x" * 301).status_code == 422
+    # Text with the other filters: the claims assessing the propositions a search finds.
+    both = search(q="fixg1", references=one, class_name="Claim").json()
+    assert both["total"] == 0 or all(o["class_name"] == "Claim" for o in both["objects"])
+    # Paging is stable and totals agree with the pages.
+    everything = search(q="gene", class_name="Proposition", limit=500).json()
+    assert everything["total"] == len(everything["objects"]) > 2
+    paged = [search(q="gene", class_name="Proposition", limit=2, offset=offset).json() for offset in (0, 2)]
+    assert [o["id"] for page in paged for o in page["objects"]] == [o["id"] for o in everything["objects"]][:4]
+    assert {page["total"] for page in paged} == {everything["total"]}
+    assert "total_capped" not in everything
+    # A text search counts its matches up to a cap: beyond it the total is the cap, flagged, and pages stop there.
+    from service import app as service_app
+    saved = service_app.TEXT_TOTAL_CAP
+    service_app.TEXT_TOTAL_CAP = 3
+    try:
+        capped = search(q="gene", class_name="Proposition", limit=2).json()
+        assert (capped["total"], capped["total_capped"]) == (3, True)
+        assert [o["id"] for o in capped["objects"]] == [o["id"] for o in everything["objects"]][:2]
+        assert [o["id"] for o in search(q="gene", class_name="Proposition", limit=5, offset=2).json()["objects"]] == \
+            [everything["objects"][2]["id"]]
+        assert search(q="gene", class_name="Proposition", offset=3).json()["objects"] == []
+        exact = search(q="fixg1 fixpheno", class_name="Proposition").json()      # under the cap: exact, unflagged
+        assert "total_capped" not in exact and exact["total"] == len(exact["objects"])
+    finally:
+        service_app.TEXT_TOTAL_CAP = saved
+    # The class filter reads only that class's ids.
+    condition, params, _ = text_index.match_sql(service_db.connect(), "gene", class_name="Proposition")
+    assert "t.object_id >= ? AND t.object_id < ?" in condition and params[-2:] == ["dapper:Proposition.", "dapper:Proposition/"]
+
+
+def test_the_text_index_holds_exactly_the_words_of_every_stored_text_field():
+    """Every write path indexes what it stores: object_text equals the words recomputed from the documents."""
+    from service import text_index
+    _load_fixtures()
+    con = service_db.connect()
+    try:
+        stored = {(r["object_id"], r["class_name"], r["field"], r["words"])
+                  for r in con.execute("SELECT object_id, class_name, field, words FROM object_text")}
+        expected = set(text_index.expected_rows(con))
+        # Only a row another test wrote straight into the table (identity_profile 'unverified…', never through a
+        # write path) may be missing from the index; nothing in the index is stale.
+        planted = {r["id"] for r in con.execute("SELECT id FROM dapper_objects WHERE identity_profile LIKE 'unverified%'")}
+        assert stored <= expected and {row[0] for row in expected - stored} <= planted and len(stored) > 10
+        assert {field for _, _, field, _ in stored} <= set(text_index.TEXT_FIELDS)
+        # The backfill adds only what is missing, and is safe to run again.
+        con.execute("DELETE FROM object_text WHERE field = 'statement'")
+        con.commit()
+        offered = text_index.rebuild_object_text(con, batch=7)
+        again = {(r["object_id"], r["class_name"], r["field"], r["words"])
+                 for r in con.execute("SELECT object_id, class_name, field, words FROM object_text")}
+        assert again == expected and offered == len(expected)
+        assert text_index.rebuild_object_text(con, batch=7) == len(expected)   # offered again, all ignored
+        assert text_index.rebuild_object_text(con, since="2000-01-01 00:00:00") == len(expected)   # everything is newer
+        assert text_index.rebuild_object_text(con, since="2999-01-01 00:00:00") == 0                # nothing is
+        middle = sorted(row[0] for row in expected)[len(expected) // 2]
+        resumed = text_index.rebuild_object_text(con, batch=7, after=middle)       # an interrupted run picks up after an id
+        assert 0 < resumed == sum(1 for row in expected if row[0] > middle) < len(expected)
+        assert con.execute("SELECT COUNT(*) AS c FROM object_text").fetchone()["c"] == len(expected)
+    finally:
+        con.close()
+    assert text_index.words("The gene NOD2 (CARD15) is associated with Crohn's disease.") == " the gene nod2 card15 is associated with crohn s disease"
+    assert text_index.words("  ...  ") is None and text_index.words(None) is None and text_index.words(7) is None
+    assert text_index.words("mp_abnormal_glucose_homeostasis") == " mp abnormal glucose homeostasis"   # '_' separates
+    assert text_index.fulltext_query(["the", "il", "nod2", "bowel", "naïve"]) == "+nod2* +bowel*"
+    assert text_index.fulltext_query(["of", "c3"]) is None
+    assert text_index.fulltext_query(["nod2", "gene", "bowel"], common={"gene"}) == "+nod2* +bowel*"
+    assert text_index.fulltext_query(["gene", "associated"], common={"gene", "associated"}) is None
+    assert text_index.class_range("Proposition") == ("dapper:Proposition.", "dapper:Proposition/")
+
+
+def test_a_word_in_a_large_share_of_the_index_is_estimated_common_from_a_sample(monkeypatch):
+    """Common words are kept away from the FULLTEXT index: InnoDB collects every row holding a word, so a word in most
+    rows costs time and memory in proportion. Ids are digests, so a class's first rows in id order are a random sample."""
+    from service import text_index
+    _load_fixtures()
+    con = service_db.connect()
+    try:
+        monkeypatch.setattr(text_index, "_samples", {})
+        monkeypatch.setattr(text_index, "COMMON_ROWS", 3)          # the fixture is small: more than 3 rows is "common"
+        monkeypatch.setattr(text_index, "SAMPLED_CLASS_ROWS", 3)   # ...and every class with more is sampled
+        sampled = text_index.samples(con)
+        assert "Proposition" in sampled and sampled["Proposition"][0] > 3
+        rows, words = sampled["Proposition"]
+        assert 0 < len(words) <= text_index.SAMPLE_ROWS and all(text.startswith(" ") for text in words)
+        assert text_index.samples(con) is sampled                    # read once, then kept for a while
+        common = text_index.common_words(con, ["gene", "fixg1", "zzzznotthere"], "Proposition")
+        assert "gene" in common and "zzzznotthere" not in common
+        assert text_index.common_words(con, ["gene"], "NoSuchClass") == set()
+        monkeypatch.setattr(text_index, "SAMPLED_CLASS_ROWS", 10**9)  # no class of a small repository is sampled
+        monkeypatch.setattr(text_index, "_samples", {})
+        assert text_index.samples(con) == {} and text_index.common_words(con, ["gene"]) == set()
+    finally:
+        con.close()
+    assert text_index.query_words("NOD2, nod2;  Bowel") == ["nod2", "bowel"]
     assert client.get("/v1/objects/search", params={"references": "not-an-id"}).status_code == 400
     assert client.get("/v1/objects/search", params={"class_name": "Claim;--"}).status_code == 400
     assert client.get("/v1/objects", params={"offset": 10**12}).status_code == 422
