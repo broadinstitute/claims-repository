@@ -69,8 +69,8 @@ Trait suggestions in `collection init` and `vocab check` read a KPN trait releas
 (or `--traits`) at `versions/trait/v0.0.2/kpn_trait_collection.yaml` in that clone. Without it the commands
 still run and only the suggestions are missing.
 
-`claims login` and publishing to a deployed API with a publisher key are planned; today the CLI publishes
-into the local deployment.
+`claims login` signs in to a deployed API with a device code ([cli-login.md](cli-login.md)). Publishing to a
+deployed API with that token is planned; today the CLI publishes into the local deployment.
 
 ### Starting from an existing collection
 
@@ -835,7 +835,7 @@ and query answers as release 2026.11.1 on QA.
 
 | Step | Command | State |
 | --- | --- | --- |
-| 0 | setup, `claims login` | setup built (`requirements-cli.txt`); `claims login` planned. The local CLI writes to the deployment named by `--db` and `--index-dir` (or `CLAIMS_DB` and `CLAIMS_INDEX_DIR`), and refuses to run when `CLAIMS_MYSQL_HOST` is set. |
+| 0 | setup, `claims login` | setup built (`requirements-cli.txt`); `claims login`, `whoami` and `logout` built (device code, docs/cli-login.md). The local CLI writes to the deployment named by `--db` and `--index-dir` (or `CLAIMS_DB` and `CLAIMS_INDEX_DIR`), and refuses to run when `CLAIMS_MYSQL_HOST` is set. |
 | 1 | `claims sources check` | built (S3 through the aws CLI) |
 | 2 | `claims collection init` | built: samples files from S3, infers the path pattern, row and edge kinds, identifiers and metrics, writes a draft with `TODO`s and a `GUIDE.md` |
 | 3 | `source.yaml` | built: location, path pattern, roles with `optional` and `requires`, `run`, `where` |

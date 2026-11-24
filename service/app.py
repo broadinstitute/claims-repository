@@ -2054,5 +2054,8 @@ def _triple_of(prop) -> dict | None:
 # the console server's signed assertion. Imported last: it reads this
 # module's helpers at request time.
 from . import admin as _admin  # noqa: E402
+from . import device_login as _device_login  # noqa: E402
 
 app.include_router(_admin.router)
+# CLI sign-in (device code) and publisher tokens: docs/cli-login.md.
+app.include_router(_device_login.router)

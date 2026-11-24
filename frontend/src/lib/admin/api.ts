@@ -260,3 +260,11 @@ export type Activity = {
   recentAssertions: { claimId: string; timesAsserted: number; mintedAt: string | null; lastAssertedAt: string | null; triple: Triple | null }[];
   authEvents: { at: string; event: string; email: string | null; detail: string | null }[];
 };
+
+/** A CLI sign-in waiting for approval (GET device/{code}). Host and client are what the CLI reported. */
+export type DeviceRequest = { userCode: string; client: string | null; host: string | null; ip: string | null; requestedAt: string; expiresAt: string };
+export type DeviceDecision = DeviceRequest & { status: "approved" | "denied" };
+/** A CLI session: a publisher token issued by an approved sign-in. Never the token itself. */
+export type CliSession = { tokenId: string; email: string; host: string | null; createdAt: string; expiresAt: string;
+  lastUsedAt: string | null; revokedAt: string | null; revokedBy: string | null; state: "active" | "expired" | "revoked" };
+export type CliSessionList = { asOf: string; tokens: CliSession[] };

@@ -1,6 +1,6 @@
 import { adminAccess } from "@/lib/auth";
-import { jsonContentType, readablePath, sameOrigin, writablePath } from "@/lib/admin/policy";
-import { apiBase, assertion } from "@/lib/admin/gateway";
+import { deviceReadPath, deviceWritePath, jsonContentType, readablePath, sameOrigin, writablePath } from "@/lib/admin/policy";
+import { apiBase, assertion, type Purpose } from "@/lib/admin/gateway";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -11,7 +11,7 @@ const MAX_BODY = 16 * 1024;
 const fail = (error: string, status: number) => Response.json({ error }, { status, headers: HEADERS });
 
 /** Forwards one call with a fresh assertion and maps the API's `{detail}` errors to `{error}`. */
-async function forward(target: string, init: { method: "GET" | "POST"; search?: string; body?: string; purpose: "admin_read" | "admin_write"; email: string; timeoutMs: number }) {
+async function forward(target: string, init: { method: "GET" | "POST"; search?: string; body?: string; purpose: Purpose; email: string; timeoutMs: number }) {
   try {
     const token = await assertion(init.email, init.purpose, { email: init.email, email_verified: true });
     const encoded = target.split("/").map(encodeURIComponent).join("/");
@@ -66,22 +66,25 @@ async function readCapped(request: Request, limit: number): Promise<string | nul
 export async function GET(request: Request, context: { params: Promise<{ path: string[] }> }) {
   const { path } = await context.params;
   const target = decodeTarget(path);
-  if (target === null || !readablePath(target)) return fail("Unknown admin route.", 404);
+  const device = target !== null && deviceReadPath(target);
+  if (target === null || !(device || readablePath(target))) return fail("Unknown admin route.", 404);
   const access = await adminAccess();
   if (!access.allowed) return fail("Admin access required.", access.signedIn ? 403 : 401);
-  return forward(target, { method: "GET", search: new URL(request.url).search, purpose: "admin_read", email: access.email, timeoutMs: 30_000 });
+  return forward(target, { method: "GET", search: device ? "" : new URL(request.url).search, purpose: device ? "device_approve" : "admin_read",
+    email: access.email, timeoutMs: 30_000 });
 }
 
 /**
- * Registration writes (check, start a publish job) and deposit key writes
- * (issue, revoke). Only the writable paths,
+ * Registration writes (check, start a publish job), deposit key and CLI session
+ * writes (issue, revoke), and CLI sign-in decisions. Only the writable paths,
  * only JSON, only from this origin, at most 16 KB, forwarded as-is under an
  * admin_write assertion.
  */
 export async function POST(request: Request, context: { params: Promise<{ path: string[] }> }) {
   const { path } = await context.params;
   const target = decodeTarget(path);
-  if (target === null || !writablePath(target)) return fail("Unknown admin route.", 404);
+  const device = target !== null && deviceWritePath(target);
+  if (target === null || !(device || writablePath(target))) return fail("Unknown admin route.", 404);
   const access = await adminAccess();
   if (!access.allowed) return fail("Admin access required.", access.signedIn ? 403 : 401);
   if (!jsonContentType(request.headers.get("content-type"))) return fail("Send the request body as application/json.", 415);
@@ -89,5 +92,6 @@ export async function POST(request: Request, context: { params: Promise<{ path: 
   const body = await readCapped(request, MAX_BODY);
   if (body === null) return fail("The request body is larger than 16 KB.", 413);
   // A check hashes every result file, which can take a while for a large release.
-  return forward(target, { method: "POST", body, purpose: "admin_write", email: access.email, timeoutMs: 120_000 });
+  // Approving or denying a CLI sign-in is signed device_approve, its own purpose.
+  return forward(target, { method: "POST", body, purpose: device ? "device_approve" : "admin_write", email: access.email, timeoutMs: 120_000 });
 }

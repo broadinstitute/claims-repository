@@ -280,6 +280,35 @@ CREATE TABLE IF NOT EXISTS admin_auth_events (
   detail TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_aae_at ON admin_auth_events (at);
+-- CLI device-code sign-in and publisher tokens (010_device_login.sql; service/device_login.py).
+CREATE TABLE IF NOT EXISTS device_codes (
+  device_code_sha256 TEXT PRIMARY KEY,
+  user_code TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL,
+  client TEXT,
+  host TEXT,
+  ip TEXT,
+  requested_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  last_polled_at TEXT,
+  decided_by TEXT,
+  decided_at TEXT,
+  token_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dc_ip ON device_codes (ip, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_dc_expires ON device_codes (expires_at);
+CREATE TABLE IF NOT EXISTS publisher_tokens (
+  token_id TEXT PRIMARY KEY,
+  token_sha256 TEXT NOT NULL UNIQUE,
+  email TEXT NOT NULL,
+  host TEXT,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  last_used_at TEXT,
+  revoked_at TEXT,
+  revoked_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pt_email ON publisher_tokens (email);
 -- Collections (006_collections.sql): any method's results, registered as data.
 CREATE TABLE IF NOT EXISTS collections (
   collection_key TEXT PRIMARY KEY,

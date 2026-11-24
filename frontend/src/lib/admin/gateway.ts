@@ -13,9 +13,9 @@ function secret() {
   return new TextEncoder().encode(value);
 }
 
-// admin_read: GET proxy; admin_write: the registration and deposit key POSTs; auth_event: sign-in audit.
-// The API accepts each purpose only on its own routes.
-type Purpose = "admin_read" | "admin_write" | "auth_event";
+// admin_read: GET proxy; admin_write: the registration, deposit key and token POSTs; auth_event: sign-in audit;
+// device_approve: looking up, approving and denying a CLI sign-in. The API accepts each purpose only on its own routes.
+export type Purpose = "admin_read" | "admin_write" | "auth_event" | "device_approve";
 
 export async function assertion(subject: string, purpose: Purpose, claims: Record<string, unknown> = {}) {
   return new SignJWT({ purpose, ...claims })
