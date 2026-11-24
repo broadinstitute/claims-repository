@@ -1,4 +1,9 @@
 #!/bin/sh
 # The claims CLI (docs/creating-a-collection.md), run from this repository's virtualenv.
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+if [ ! -x "$HERE/.venv/bin/python" ]; then
+  echo "claims: no virtualenv at $HERE/.venv. Create it with:" >&2
+  echo "  cd $HERE && python3 -m venv .venv && .venv/bin/pip install -r requirements-cli.txt" >&2
+  exit 1
+fi
 cd "$HERE" && exec "$HERE/.venv/bin/python" -m claims_cli.main "$@"

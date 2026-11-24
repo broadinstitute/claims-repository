@@ -43,11 +43,25 @@ import tempfile
 import time
 from pathlib import Path
 
-import yaml
 
-from . import scaffold
-from . import vocab
-from . import sources as src
+def _require_cli_packages():
+    """Name the install command instead of failing mid-command with an ImportError."""
+    import importlib.util
+
+    missing = [m for m in ("yaml", "fastapi", "duckdb", "httpx") if importlib.util.find_spec(m) is None]
+    if missing:
+        repo = Path(__file__).resolve().parent.parent
+        sys.exit(f"claims: missing Python packages ({', '.join(missing)}). Install the CLI's requirements:\n"
+                 f"  {repo / '.venv/bin/pip'} install -r {repo / 'requirements-cli.txt'}")
+
+
+_require_cli_packages()
+
+import yaml  # noqa: E402
+
+from . import scaffold  # noqa: E402
+from . import vocab  # noqa: E402
+from . import sources as src  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -1073,6 +1087,10 @@ def cmd_serve(args):
 
 
 def main(argv=None):
+    # Starlette asks for httpx2 behind fastapi.testclient; httpx works and the warning is noise here.
+    import warnings
+    warnings.filterwarnings("ignore", message=".*httpx.*starlette.testclient.*")
+    warnings.filterwarnings("ignore", message=".*starlette.testclient.*httpx2.*")
     parser = argparse.ArgumentParser(prog="claims", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", help="control-plane SQLite file (or CLAIMS_DB)")
