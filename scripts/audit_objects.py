@@ -37,6 +37,7 @@ from service import db  # noqa: E402
 from service import pigean_template as tpl  # noqa: E402
 from service.app import CLAIM_SOURCES, ClaimSynthesisError, synthesize_claim  # noqa: E402
 from service.refs import dapper_refs  # noqa: E402
+from service.text_index import text_rows  # noqa: E402
 
 # Minimum slots a stored instance of each class must carry — the floor, not
 # the full profile (profile validation belongs to the dapper tooling).
@@ -75,6 +76,7 @@ def main() -> int:
 
     # 1 + 2: documents and the reference index.
     expected_refs: set[tuple[str, str]] = set()
+    expected_text: set[tuple[str, str, str, str]] = set()
     checked_refs = 0
     for row in con.execute("SELECT id, class_name, payload FROM dapper_objects"):
         oid, cls = row["id"], row["class_name"]
@@ -96,6 +98,7 @@ def main() -> int:
             problems.append(f"{oid}: payload.class_name mismatch ({payload.get('class_name')})")
         # References first: every stored object's refs belong in the index,
         # whatever its class.
+        expected_text.update(text_rows(oid, cls, payload))
         for ref in dapper_refs(payload):
             checked_refs += 1
             expected_refs.add((oid, ref))
@@ -119,6 +122,19 @@ def main() -> int:
         problems.append(
             f"object_refs differs from recomputed refs: {len(expected_refs - stored_refs)} missing, "
             f"{len(stored_refs - expected_refs)} stale"
+        )
+
+    # 2b: the text index equals the words recomputed from every document.
+    stored_text = {(r["object_id"], r["class_name"], r["field"], r["words"])
+                   for r in con.execute("SELECT object_id, class_name, field, words FROM object_text")}
+    for object_id, _, field, _ in sorted(expected_text - stored_text)[:20]:
+        problems.append(f"object_text missing {object_id} {field}")
+    for object_id, _, field, _ in sorted(stored_text - expected_text)[:20]:
+        problems.append(f"object_text stale {object_id} {field}")
+    if expected_text != stored_text:
+        problems.append(
+            f"object_text differs from recomputed words: {len(expected_text - stored_text)} missing, "
+            f"{len(stored_text - expected_text)} stale (repair: scripts/migrate.py --index-text adds missing rows)"
         )
 
     # 3: every template-backed index row's claim synthesizes to its address.

@@ -13,6 +13,11 @@ Safety rules:
     service needs (information_schema); a mismatch is an error.
   - object_refs is backfilled from stored documents when it is empty but
     objects exist (or always, with --rebuild-refs).
+  - object_text (the text-search index, 009) is backfilled the same way when
+    it is empty but objects exist, or always with --index-text. The backfill
+    only adds rows that are missing, so it is safe to run again: do so after
+    deploying the service that maintains the index, to cover objects stored
+    between the migration and the deploy.
 
 Connection comes from the same env vars the service uses:
   CLAIMS_MYSQL_HOST / CLAIMS_MYSQL_PORT / CLAIMS_MYSQL_USER /
@@ -49,6 +54,8 @@ REQUIRED_COLUMNS = {
     "claim_memberships": {"phenotype", "collection", "gene", "gene_set", "claim_id"},
     "gene_set_entities": {"collection", "name", "dapper_id", "n_genes"},
     "object_refs": {"from_id", "to_id"},
+    # 009_object_text.sql
+    "object_text": {"object_id", "field", "class_name", "words"},
     "kpn_traits": {"trait_id", "legacy_id", "pigean_id", "name", "primary_concept_id"},
     "kpn_trait_mappings": {"trait_id", "target_id", "ontology", "predicate"},
     "kpn_trait_release": {"version", "commit_sha", "file_sha256"},
@@ -80,6 +87,8 @@ REQUIRED_PRIMARY_KEYS = {
     "release_objects": ["collection_key", "version", "object_id"],
     "deposit_objects": ["deposit_id", "object_id"],
     "deposit_edges": ["deposit_id", "seq"],
+    # 009_object_text.sql
+    "object_text": ["object_id", "field"],
 }
 
 
@@ -147,6 +156,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--rebuild-refs", action="store_true",
                         help="recompute object_refs from every stored document")
+    parser.add_argument("--index-text", action="store_true",
+                        help="add the object_text rows missing for stored documents (idempotent)")
     args = parser.parse_args()
 
     database = os.environ.get("CLAIMS_MYSQL_DATABASE")
@@ -235,6 +246,20 @@ def main() -> int:
             with svc:
                 written = rebuild_object_refs(svc)
             print(f"rebuilt object_refs: {written} references from {objects} objects")
+        indexed = svc.execute("SELECT COUNT(*) AS c FROM object_text").fetchone()["c"]
+        svc.commit()
+        if objects and (args.index_text or not indexed):
+            from service.text_index import rebuild_object_text
+
+            batches = [0]
+
+            def progress(last, offered):
+                batches[0] += 1
+                if batches[0] % 100 == 0:
+                    print(f"  object_text: through {last[:40]} ({offered} rows offered)", flush=True)
+            offered = rebuild_object_text(svc, progress=progress)
+            now = svc.execute("SELECT COUNT(*) AS c FROM object_text").fetchone()["c"]
+            print(f"indexed object_text: {offered} rows offered from {objects} objects; {indexed} rows before, {now} now")
     finally:
         svc.close()
     return 0
