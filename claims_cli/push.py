@@ -131,7 +131,7 @@ class RemoteTarget:
             self.prefetch([], [activity_id])
         return activity_id in self._recorded
 
-    def refuse_other_slice(self, ds: dict) -> None:
+    def refuse_other_slice(self, col, ds: dict) -> None:
         """The API checks this when the dataset arrives."""
 
     def put_dataset(self, col, ds: dict, vocab, extract: dict | None, pending: list, step=None) -> dict:

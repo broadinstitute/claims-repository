@@ -551,7 +551,7 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
             unfinished += 1   # another shard's, or past this call's limit
             continue
         if ingest:
-            target.refuse_other_slice(ds)
+            target.refuse_other_slice(col, ds)
         fetched = _fetch_files(ds, fetch, workdir, f"dataset {n}") if ingest else []
         fetched += [v[3] for v in (ds.get("prefetched") or {}).values()]
         if target.kind == "parquet":
@@ -597,16 +597,34 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
                        stats=stats, warnings=warnings)
 
 
-def _refuse_other_slice(con, ds: dict) -> None:
+def _other_collections(con, dataset_id: str) -> set[str]:
+    """The collections a stored dataset is known to belong to: those of releases listing it, and the one it was
+    pushed for (dataset_indexes)."""
+    keys = {r["collection_key"] for r in con.execute(
+        "SELECT DISTINCT r.collection_key FROM release_datasets d JOIN collection_releases r ON r.release_id = "
+        "d.release_id WHERE d.dataset_id = ?", (dataset_id,)).fetchall()}
+    keys |= {r["collection_key"] for r in con.execute(
+        "SELECT collection_key FROM dataset_indexes WHERE dataset_id = ?", (dataset_id,)).fetchall()}
+    return keys
+
+
+def _refuse_other_slice(con, ds: dict, collection: str | None = None) -> None:
     """The same result files already ingested as another dataset of the same
-    dimensions, so under other `where` bounds: claims are shared by id, so two
-    slices of one file cannot both be served, and adding rows to an ingested
-    dataset is not supported. (A file listed under the wrong dimensions is
-    caught, with a clearer message, when its rows are read.)"""
+    collection and dimensions, so under other `where` bounds: claims are shared
+    by id, so two slices of one file cannot both be served, and adding rows to
+    an ingested dataset is not supported. (A file listed under the wrong
+    dimensions is caught, with a clearer message, when its rows are read.)
+    Another collection may hold the same files: its claim ids differ, since the
+    collection is part of every claim's minting context. A dataset known to
+    belong only to other collections is therefore no conflict."""
     mine = {n: d["value"] for n, d in ds["dims"].items()}
     for f in ds["files"].values():
         for other in con.execute("SELECT DISTINCT dataset_id FROM dataset_files WHERE file_id = ? AND dataset_id <> ?",
                                  (f["doc"]["id"], ds["doc"]["id"])).fetchall():
+            if collection is not None:
+                owners = _other_collections(con, other["dataset_id"])
+                if owners and collection not in owners:
+                    continue
             theirs = {r["dimension"]: r["value"] for r in con.execute(
                 "SELECT dimension, value FROM dataset_dimensions WHERE dataset_id = ?", (other["dataset_id"],)).fetchall()}
             if theirs == mine:
@@ -1020,8 +1038,8 @@ class SqlTarget:
     def context_recorded(self, activity_id: str) -> bool:
         return bool(self.con.execute("SELECT 1 FROM mint_contexts WHERE activity_id = ?", (activity_id,)).fetchone())
 
-    def refuse_other_slice(self, ds: dict) -> None:
-        _refuse_other_slice(self.con, ds)
+    def refuse_other_slice(self, col: Collection, ds: dict) -> None:
+        _refuse_other_slice(self.con, ds, col.key)
 
     def put_dataset(self, col: Collection, ds: dict, vocab, extract: dict | None, pending: list,
                     step: Callable[[str], None] | None = None, on_store: Callable | None = None) -> dict:

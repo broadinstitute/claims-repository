@@ -484,7 +484,7 @@ def put_dataset(con, collection: str, dataset_id: str, body: dict, publisher: di
                     "contexts": len(pending), "objects": 0}
         entry = _index(body.get("index"), dataset_id)
         try:
-            target.refuse_other_slice(ds)
+            target.refuse_other_slice(bundle.col, ds)
         except pub.PublishError as exc:
             raise Conflict(str(exc)) from exc
         cache = cstore.bucket_store().cache
