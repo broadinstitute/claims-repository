@@ -953,11 +953,57 @@ def store_dataset(con, col: Collection, ds: dict, extract: dict, objects: dict, 
     return n_rows, len(edge_rows)
 
 
+def request_memo(con) -> dict:
+    """Lookups of stored, immutable records (a dataset's dimensions and files, its gene sets' edges) made while
+    one request is served: kept on its connection, so each is read once per request."""
+    memo = getattr(con, "memo", None)
+    if memo is None:
+        memo = con.memo = {}
+    return memo
+
+
+def dataset_dimensions(con, dataset_id: str) -> dict:
+    """{dimension: canonical value} of a stored dataset."""
+    memo = request_memo(con)
+    key = ("dimensions", dataset_id)
+    if key not in memo:
+        memo[key] = {r["dimension"]: r["value"] for r in con.execute(
+            "SELECT dimension, value FROM dataset_dimensions WHERE dataset_id = ?", (dataset_id,)).fetchall()}
+    return memo[key]
+
+
+def dataset_role_files(con, dataset_id: str) -> dict:
+    """{role: file id} of a stored dataset."""
+    memo = request_memo(con)
+    key = ("files", dataset_id)
+    if key not in memo:
+        memo[key] = {r["role"]: r["file_id"] for r in con.execute(
+            "SELECT role, file_id FROM dataset_files WHERE dataset_id = ?", (dataset_id,)).fetchall()}
+    return memo[key]
+
+
+def prefetch_groups(con, dataset_id: str, edge_kind: str, group_ids) -> None:
+    """Read many edge groups (gene sets) of one dataset in two queries, for group_info."""
+    from .store import get_store
+
+    memo = request_memo(con)
+    wanted = [g for g in set(group_ids) if ("group", dataset_id, edge_kind, g) not in memo]
+    if not wanted:
+        return
+    found = get_store(con, [dataset_id]).groups(dataset_id, edge_kind, wanted)
+    for g in wanted:
+        memo[("group", dataset_id, edge_kind, g)] = found.get(g)
+
+
+def group_info(con, dataset_id: str, edge_kind: str, group_id: str) -> tuple | None:
+    """(label, member count, member ids) of the edges ending at group_id, or None."""
+    prefetch_groups(con, dataset_id, edge_kind, [group_id])
+    return request_memo(con)[("group", dataset_id, edge_kind, group_id)]
+
+
 def dataset_ns(con, dataset_id: str) -> dict:
     """The {dataset.*} placeholders: each dimension's canonical value."""
-    rows = con.execute("SELECT dimension, value FROM dataset_dimensions WHERE dataset_id = ?",
-                       (dataset_id,)).fetchall()
-    return {"id": dataset_id, **{r["dimension"]: r["value"] for r in rows}}
+    return {"id": dataset_id, **dataset_dimensions(con, dataset_id)}
 
 
 def row_inputs(col_minting: dict, kind: str, r) -> dict:
@@ -978,16 +1024,16 @@ def group_inputs(con, minting: dict, dataset_id: str, kind: str, group_id: str,
     """render_group's `group` for one edge group (all edges ending at group_id).
     `found` = (label, member count) and `library` when the caller already has
     them (the Parquet ingester, before anything is stored)."""
-    from .store import get_store
-
     spec = minting["edge_kinds"][kind]
-    label, count = found if found is not None else get_store(con, [dataset_id]).group(dataset_id, kind, group_id)
+    if found is None:
+        info = group_info(con, dataset_id, kind, group_id)
+        found = (info[0], info[1]) if info else None
+    label, count = found
     entity = minting["entities"][spec["to"]["entity"]]
     parent = ""
     if "library_dimension" in entity:
         if library is None:
-            library = con.execute("SELECT value FROM dataset_dimensions WHERE dataset_id = ? AND dimension = ?",
-                                  (dataset_id, entity["library_dimension"])).fetchone()["value"]
+            library = dataset_dimensions(con, dataset_id)[entity["library_dimension"]]
         parent = engine.gene_set_collection(library)["id"]
     return {"id": group_id, "label": label, "count": count, "parent": parent}
 
