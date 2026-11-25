@@ -20,7 +20,8 @@ from collections import OrderedDict
 from . import engine
 from . import identity as idn
 from .manifest import ManifestError, bind_params
-from .publish import dataset_ns, group_inputs, row_inputs
+from .publish import (dataset_dimensions, dataset_ns, dataset_role_files, group_info, group_inputs,
+                      prefetch_groups, request_memo, row_inputs)
 from .store import compile_where, get_store
 
 
@@ -132,7 +133,18 @@ def _render_group(con, ctx, dataset: dict, dataset_id, edge_kind, group_id) -> t
 
 
 def _release_contexts(con, release_id: str, dataset_ids) -> dict[str, list]:
-    """dataset id -> (activity id, mint context) for the release's mint contexts over those datasets."""
+    """dataset id -> (activity id, mint context) for the release's mint contexts over those datasets (each
+    dataset read once per request)."""
+    memo = request_memo(con)
+    key = ("contexts", release_id)
+    known = memo.setdefault(key, {})
+    ask = sorted(set(dataset_ids) - known.keys())
+    if ask:
+        known.update(_release_contexts_read(con, release_id, ask))
+    return {d: known[d] for d in sorted(set(dataset_ids))}
+
+
+def _release_contexts_read(con, release_id: str, dataset_ids) -> dict[str, list]:
     ids = sorted(set(dataset_ids))
     pairs = []
     for i in range(0, len(ids), 500):
@@ -210,22 +222,20 @@ def rebuild_gene_set(con, minting: dict, dataset_id: str, gene_set_id: str) -> d
     dataset's edges (members are the genes whose edges end at it). None
     unless the rebuilt document has exactly the id the claim names."""
     store = get_store(con, [dataset_id])
-    role_files = {r["role"]: r["file_id"] for r in con.execute(
-        "SELECT role, file_id FROM dataset_files WHERE dataset_id = ?", (dataset_id,)).fetchall()}
+    role_files = dataset_role_files(con, dataset_id)
     for kind, spec in (minting.get("edge_kinds") or {}).items():
         entity = minting["entities"].get(spec["to"]["entity"], {})
         if "mint" not in entity:
             continue
-        library = con.execute("SELECT value FROM dataset_dimensions WHERE dataset_id = ? AND dimension = ?",
-                              (dataset_id, entity["library_dimension"])).fetchone()
+        library = dataset_dimensions(con, dataset_id).get(entity["library_dimension"])
         if library is None:
             continue
-        lib_doc = engine.gene_set_collection(library["value"])
+        lib_doc = engine.gene_set_collection(library)
         membership_file = next((fid for role, fid in sorted(role_files.items())
                                 if _yields(minting, role) == entity.get("members_from")), None)
-        found = store.group(dataset_id, kind, gene_set_id)
+        found = group_info(con, dataset_id, kind, gene_set_id)
         if found is not None:
-            doc = engine.gene_set(found[0], lib_doc, store.members(dataset_id, kind, gene_set_id), membership_file)
+            doc = engine.gene_set(found[0], lib_doc, found[2], membership_file)
         else:  # a kept set with no member edges: its name is the row's subject value
             row = store.query(*_subject_lookup(store, dataset_id, gene_set_id))
             if not row:
@@ -454,8 +464,7 @@ def _row_view(r, manifest, dims_cache, con):
     kind = manifest["row_kinds"][r["kind"]]
     row = json.loads(r["row_json"])
     if r["dataset_id"] not in dims_cache:
-        dims_cache[r["dataset_id"]] = {d["dimension"]: d["value"] for d in con.execute(
-            "SELECT dimension, value FROM dataset_dimensions WHERE dataset_id = ?", (r["dataset_id"],))}
+        dims_cache[r["dataset_id"]] = dict(dataset_dimensions(con, r["dataset_id"]))
     return {
         "kind": r["kind"],
         "dataset": {"id": r["dataset_id"], "dimensions": dims_cache[r["dataset_id"]]},
@@ -568,25 +577,66 @@ def _walk_rows(rows, qdoc):
                 yield item["row"]
 
 
+def _minted_group_kinds(con, release_id) -> dict[str, list[str]]:
+    """{row kind: the edge kinds whose groups are its subjects}, for row kinds about a minted entity (one whose
+    documents are built from edge groups, such as a gene set from its member edges). Read from the release's
+    manifest, so it holds for any collection."""
+    manifest = _json(con.execute("SELECT manifest FROM collection_releases WHERE release_id = ?",
+                                 (release_id,)).fetchone()["manifest"])["manifest"]
+    entities, edge_kinds = manifest.get("entities") or {}, manifest.get("edge_kinds") or {}
+    out = {}
+    for kind, rk in (manifest.get("row_kinds") or {}).items():
+        entity = rk["subject"].get("entity")
+        if "mint" in entities.get(entity, {}):
+            out[kind] = [k for k, spec in edge_kinds.items() if spec["to"]["entity"] == entity]
+    return out
+
+
 def _attach_claims(con, release_id, rows, qdoc, keys, envelope, dataset_ids=None):
     """Render, serve (and assert) each row's claims and each edge group's
     claims under the release's mint contexts, limited to the requested keys."""
     all_rows = list(_walk_rows(rows, qdoc))
     unique = {r["_row_id"]: r["_raw"] for r in all_rows}
+    # The gene sets this response renders (joined edge groups, and rows about a gene set), read up front: two
+    # queries per dataset and edge kind rather than two per gene set.
+    wanted_groups: dict[tuple, set] = {}
+    for row in rows:
+        for step in qdoc["plan"][1:]:
+            for item in row.get(step["join"]["as"], []):
+                e = item["edge"]
+                wanted_groups.setdefault((e["dataset_id"], e["kind"]), set()).add(e["to"]["id"])
+    minted = _minted_group_kinds(con, release_id)
+    for r in all_rows:
+        for kind in minted.get(r["kind"], []):
+            wanted_groups.setdefault((r["dataset"]["id"], kind), set()).add(r["subject"]["id"])
+    for (dataset_id, kind), ids in sorted(wanted_groups.items()):
+        prefetch_groups(con, dataset_id, kind, ids)
     by_row: dict[int, dict] = {}
     for rc in implied_row_claims(con, release_id, [unique[i] for i in sorted(unique)], keys):
         by_row.setdefault(rc["row_id"], {})[rc["claim_key"]] = rc
-    for r in all_rows:
-        r["claims"] = {k: envelope(con, rc["claim_id"], ("collection", rc))
-                       for k, rc in sorted(by_row.get(r["_row_id"], {}).items())}
-    groups: dict[tuple, dict] = {}
+    groups: dict[tuple, list] = {}
     for row in rows:
         for step in qdoc["plan"][1:]:
             for item in row.get(step["join"]["as"], []):
                 e = item["edge"]
                 key = (e["dataset_id"], e["kind"], e["to"]["id"])
                 if key not in groups:
-                    groups[key] = {rc["claim_key"]: envelope(con, rc["claim_id"], ("collection", rc))
-                                   for rc in implied_group_claims(con, release_id, *key, keys=keys)}
-                e["claims"] = groups[key]
+                    groups[key] = implied_group_claims(con, release_id, *key, keys=keys)
+    # Every claim of the response, served in one batch when the caller can (envelope.many).
+    wanted = [rc for r in all_rows for rc in by_row.get(r["_row_id"], {}).values()]
+    wanted += [rc for found in groups.values() for rc in found]
+    many = getattr(envelope, "many", None)
+    if many is not None:
+        served = dict(zip((rc["claim_id"] for rc in wanted), many(con, [(rc["claim_id"], ("collection", rc))
+                                                                         for rc in wanted])))
+    else:
+        served = {rc["claim_id"]: envelope(con, rc["claim_id"], ("collection", rc)) for rc in wanted}
+    for r in all_rows:
+        r["claims"] = {k: served[rc["claim_id"]] for k, rc in sorted(by_row.get(r["_row_id"], {}).items())}
+    for row in rows:
+        for step in qdoc["plan"][1:]:
+            for item in row.get(step["join"]["as"], []):
+                e = item["edge"]
+                e["claims"] = {rc["claim_key"]: served[rc["claim_id"]]
+                               for rc in groups[(e["dataset_id"], e["kind"], e["to"]["id"])]}
 

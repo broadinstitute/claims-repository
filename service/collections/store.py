@@ -115,6 +115,26 @@ class _SqlShape:
                          "AND e.kind = ? AND e.to_id = ? GROUP BY e.to_value", [dataset_id, edge_kind, group_id])
         return (got[0]["label"], got[0]["n"]) if got else None
 
+    def groups(self, dataset_id, edge_kind, group_ids) -> dict:
+        """{group id: (label, member count, member ids)} for many groups of one dataset, in two queries."""
+        ids = sorted(set(group_ids))
+        if not ids:
+            return {}
+        _, _, edges = self.tables([dataset_id])
+        out, members = {}, {}
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            marks = _marks(len(part))
+            for r in self.query(f"SELECT e.to_id AS gid, e.to_value AS label, COUNT(*) AS n FROM {edges} e WHERE "
+                                f"e.dataset_id = ? AND e.kind = ? AND e.to_id IN ({marks}) GROUP BY e.to_id, e.to_value",
+                                [dataset_id, edge_kind, *part]):
+                out[r["gid"]] = (r["label"], r["n"])
+            for r in self.query(f"SELECT e.to_id AS gid, e.from_id FROM {edges} e WHERE e.dataset_id = ? AND "
+                                f"e.kind = ? AND e.to_id IN ({marks}) ORDER BY e.to_id, e.from_id",
+                                [dataset_id, edge_kind, *part]):
+                members.setdefault(r["gid"], []).append(r["from_id"])
+        return {gid: (label, n, members.get(gid, [])) for gid, (label, n) in out.items()}
+
     def members(self, dataset_id, edge_kind, group_id):
         _, _, edges = self.tables([dataset_id])
         return [r["from_id"] for r in self.query(

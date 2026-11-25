@@ -163,14 +163,24 @@ def _fetch_payloads(con, object_ids):
     (the difference between ~1 ms and ~25 ms per object against Aurora)."""
     pending = getattr(con, "pending_objects", None) or {}
     found = {i: pending[i] for i in object_ids if i and i in pending}
-    ids = [i for i in object_ids if i and i not in found]
-    if not ids:
-        return found
-    marks = ",".join("?" * len(ids))
-    rows = con.execute(
-        f"SELECT id, payload FROM dapper_objects WHERE id IN ({marks})", ids
-    ).fetchall()
-    return {**found, **{r["id"]: json.loads(r["payload"]) for r in rows}}
+    ids = list(dict.fromkeys(i for i in object_ids if i and i not in found))
+    for n in range(0, len(ids), 500):
+        part = ids[n:n + 500]
+        rows = con.execute(f"SELECT id, payload FROM dapper_objects WHERE id IN ({','.join('?' * len(part))})",
+                           part).fetchall()
+        found.update({r["id"]: json.loads(r["payload"]) for r in rows})
+    return found
+
+
+def _stored_ids(con, object_ids) -> set:
+    """Which of these ids are stored (one IN query per 500)."""
+    ids = list(dict.fromkeys(i for i in object_ids if i))
+    out = set()
+    for n in range(0, len(ids), 500):
+        part = ids[n:n + 500]
+        out |= {r["id"] for r in con.execute(
+            f"SELECT id FROM dapper_objects WHERE id IN ({','.join('?' * len(part))})", part).fetchall()}
+    return out
 
 
 def _id_list(value) -> list:
@@ -308,68 +318,114 @@ def envelope(con, claim_id, assert_claim=True, source=None):
     a first-serve mint, or a re-assertion — is recorded once per request for
     the end-of-request flush. `source` is the (family, index row) when the
     caller already has it. Counts in the envelope are as of this response."""
-    row = con.execute(f"SELECT {_ENVELOPE_COLS} FROM dapper_objects WHERE id = ?", (claim_id,)).fetchone()
+    return envelopes(con, [(claim_id, source)], assert_claim)[0]
+
+
+def envelopes(con, items, assert_claim=True) -> list:
+    """envelope() for many claims at once, in order: [(claim_id, source)] -> [envelope or None]. The stored
+    objects every envelope needs (claim rows, propositions, scores, evidence, value locators) are read in a
+    few batched queries for the whole list, not several per claim."""
+    rows = {}
+    ids = list(dict.fromkeys(cid for cid, _ in items))
+    for n in range(0, len(ids), 500):
+        part = ids[n:n + 500]
+        rows.update({r["id"]: r for r in con.execute(
+            f"SELECT id, {_ENVELOPE_COLS} FROM dapper_objects WHERE id IN ({','.join('?' * len(part))})",
+            part).fetchall()})
+    data_plane: dict = {}
+    heads = [_envelope_head(con, cid, rows.get(cid), assert_claim, source, data_plane) for cid, source in items]
+    if data_plane:
+        _stage_objects(con, data_plane)
+
+    claims = [h["claim"] for h in heads if h is not None]
+    docs = _fetch_payloads(con, [ref for c in claims for ref in (
+        ([c["proposition"]] if isinstance(c.get("proposition"), str) else [])
+        + _id_list(c.get("has_score")) + _id_list(c.get("has_evidence")))])
+    locator_docs = _fetch_payloads(con, [vid for c in claims for eid in _id_list(c.get("has_evidence"))
+                                         if isinstance(docs.get(eid), dict)
+                                         for vid in _id_list(docs[eid].get("value_locators"))])
+    pending = getattr(con, "pending_objects", None) or {}
+    refs = {}
+    for h in heads:
+        if h is None:
+            continue
+        c = h["claim"]
+        proposition = (docs.get(c["proposition"]) if isinstance(c.get("proposition"), str) else None) or {}
+        h["proposition"] = proposition
+        h["gene_set_refs"] = _dapper_refs([proposition.get("subject_entity"), proposition.get("object_entity")],
+                                          "dapper:GeneSet.")
+        h["derived_from"] = _id_list(c.get("was_derived_from"))
+        refs.update(dict.fromkeys(h["gene_set_refs"] + _dapper_refs(h["derived_from"], "dapper:")))
+    stored = _stored_ids(con, [r for r in refs if r not in pending])
+    return [None if h is None else _envelope_body(h, docs, locator_docs, stored | set(pending)) for h in heads]
+
+
+def _envelope_head(con, claim_id, row, assert_claim, source, data_plane: dict) -> dict | None:
+    """The claim behind an envelope (synthesized, checked and asserted as envelope() describes), with its
+    deposit counts; the data-plane objects its rendering needs go into `data_plane`. None when not a claim."""
     if row is not None and row["class_name"] != "Claim":
         return None
     if not assert_claim:
         if row is None:
             return None
         claim = json.loads(row["payload"])
-        times, first, last = row["times_seen"], _ts(row["created_at"]), _ts(row["last_seen_at"] or row["created_at"])
-    else:
+        return {"claim_id": claim_id, "claim": claim, "times": row["times_seen"], "first": _ts(row["created_at"]),
+                "last": _ts(row["last_seen_at"] or row["created_at"])}
+    collection = source is not None and source[0] == "collection"
+    if source is None or (not collection and _inputs_of(source[1]) is None):
+        source = _index_source(con, claim_id) or source
         collection = source is not None and source[0] == "collection"
-        if source is None or (not collection and _inputs_of(source[1]) is None):
-            source = _index_source(con, claim_id) or source
-            collection = source is not None and source[0] == "collection"
-        synthesized = None
-        if collection:
-            try:
-                synthesized, data_plane = cserve.render_claim_full(con, source[1])
-                if data_plane:
-                    _stage_objects(con, data_plane)
-            except (cserve.ClaimRenderError, cserve.engine.TemplateError, cidn.MintError) as exc:
-                raise ClaimSynthesisError(str(exc)) from exc
-        elif source is not None and _inputs_of(source[1]) is not None:
-            synthesized = synthesize_claim(*source)
-        if row is None and synthesized is None:
-            return None
-        if row is not None and synthesized is not None and json.loads(row["payload"]) != synthesized:
-            raise ClaimSynthesisError(
-                f"stored document at {claim_id} differs from the claim its index row implies; "
-                "refusing to serve it"
+    synthesized = None
+    if collection:
+        try:
+            synthesized, objects = cserve.render_claim_full(con, source[1])
+            if objects:
+                data_plane.update(objects)
+        except (cserve.ClaimRenderError, cserve.engine.TemplateError, cidn.MintError) as exc:
+            raise ClaimSynthesisError(str(exc)) from exc
+    elif source is not None and _inputs_of(source[1]) is not None:
+        synthesized = synthesize_claim(*source)
+    if row is None and synthesized is None:
+        return None
+    if row is not None and synthesized is not None and json.loads(row["payload"]) != synthesized:
+        raise ClaimSynthesisError(
+            f"stored document at {claim_id} differs from the claim its index row implies; "
+            "refusing to serve it"
+        )
+    assertions = getattr(con, "assertions", None)
+    if assertions is None:
+        assertions = con.assertions = {}
+    index = tuple(source[1][f] for f in cserve.CLAIM_FIELDS) if collection else None
+    if claim_id not in assertions:
+        if len(assertions) >= MAX_ASSERTIONS_PER_REQUEST:
+            raise ValueError(
+                f"this request would assert more than {MAX_ASSERTIONS_PER_REQUEST} claims; "
+                "narrow it (fewer rows or aliases)"
             )
-        assertions = getattr(con, "assertions", None)
-        if assertions is None:
-            assertions = con.assertions = {}
-        index = tuple(source[1][f] for f in cserve.CLAIM_FIELDS) if collection else None
-        if claim_id not in assertions:
-            if len(assertions) >= MAX_ASSERTIONS_PER_REQUEST:
-                raise ValueError(
-                    f"this request would assert more than {MAX_ASSERTIONS_PER_REQUEST} claims; "
-                    "narrow it (fewer rows or aliases)"
-                )
-            if row is None:
-                assertions[claim_id] = {
-                    "new": True, "payload": tpl.canonical(synthesized),
-                    "identity_profile": cidn.PROFILE if collection else tpl.IDENTITY_PROFILE,
-                    "method": cserve.collection_of(con, source[1]) if collection else tpl.METHOD,
-                    "proposition": synthesized["proposition"], "refs": sorted(dapper_refs(synthesized)),
-                    "index": index,
-                }
-            else:
-                assertions[claim_id] = {"new": False, "payload": row["payload"], "identity_profile": "unverified",
-                                        "index": index}
-        claim = synthesized if row is None else json.loads(row["payload"])
-        now = _now_ts()
-        times = (row["times_seen"] if row is not None else 0) + 1
-        first = _ts(row["created_at"]) if row is not None else now
-        last = now
-    proposition = (_fetch_payload(con, claim["proposition"]) if isinstance(claim.get("proposition"), str) else None) or {}
+        if row is None:
+            assertions[claim_id] = {
+                "new": True, "payload": tpl.canonical(synthesized),
+                "identity_profile": cidn.PROFILE if collection else tpl.IDENTITY_PROFILE,
+                "method": cserve.collection_of(con, source[1]) if collection else tpl.METHOD,
+                "proposition": synthesized["proposition"], "refs": sorted(dapper_refs(synthesized)),
+                "index": index,
+            }
+        else:
+            assertions[claim_id] = {"new": False, "payload": row["payload"], "identity_profile": "unverified",
+                                    "index": index}
+    now = _now_ts()
+    return {"claim_id": claim_id, "claim": synthesized if row is None else json.loads(row["payload"]),
+            "times": (row["times_seen"] if row is not None else 0) + 1,
+            "first": _ts(row["created_at"]) if row is not None else now, "last": now}
+
+
+def _envelope_body(h: dict, docs: dict, locator_docs: dict, resolvable: set) -> dict:
+    """An envelope from its claim and the objects read for the whole batch."""
+    claim, claim_id = h["claim"], h["claim_id"]
     score_ids = _id_list(claim.get("has_score"))
-    score_docs = _fetch_payloads(con, score_ids)
     scores = []
     for sid in score_ids:
-        s = score_docs.get(sid)
+        s = docs.get(sid)
         if _well_formed_score(s):
             scores.append(
                 {
@@ -380,30 +436,12 @@ def envelope(con, claim_id, assert_claim=True, source=None):
                     "interpretation": s["interpretation"],
                 }
             )
-    entity_refs = [proposition.get("subject_entity"), proposition.get("object_entity")]
-    gene_set_refs = _dapper_refs(entity_refs, "dapper:GeneSet.")
-    derived_from = _id_list(claim.get("was_derived_from"))
-    file_refs = _dapper_refs(derived_from, "dapper:")
-    refs_to_resolve = gene_set_refs + file_refs
+    refs_to_resolve = h["gene_set_refs"] + _dapper_refs(h["derived_from"], "dapper:")
     resolution = "UNRESOLVED"
     if refs_to_resolve:
-        pending = getattr(con, "pending_objects", None) or {}
-        unstored = [r for r in refs_to_resolve if r not in pending]
-        found = len(refs_to_resolve) - len(unstored)
-        if unstored:
-            placeholders = ",".join("?" * len(unstored))
-            found += con.execute(
-                f"SELECT COUNT(*) AS c FROM dapper_objects WHERE id IN ({placeholders})", unstored,
-            ).fetchone()["c"]
-        resolution = "RESOLVED" if found == len(refs_to_resolve) else "UNRESOLVED"
-    triple = _triple_of(proposition)
+        resolution = "RESOLVED" if all(r in resolvable for r in refs_to_resolve) else "UNRESOLVED"
     evidence = []
-    evidence_ids = _id_list(claim.get("has_evidence"))
-    evidence_docs = _fetch_payloads(con, evidence_ids)
-    items = [evidence_docs[eid] for eid in evidence_ids if isinstance(evidence_docs.get(eid), dict)]
-    locator_docs = _fetch_payloads(
-        con, [vid for item in items for vid in _id_list(item.get("value_locators"))]
-    )
+    items = [docs[eid] for eid in _id_list(claim.get("has_evidence")) if isinstance(docs.get(eid), dict)]
     for item in items:
         locators = [
             locator_docs[vid] for vid in _id_list(item.get("value_locators")) if vid in locator_docs
@@ -413,16 +451,16 @@ def envelope(con, claim_id, assert_claim=True, source=None):
         "id": claim.get("id", claim_id),
         "resolverUrl": _resolver_url(claim_id),
         "claim": claim,
-        "proposition": proposition,
-        "triple": triple,
+        "proposition": h["proposition"],
+        "triple": _triple_of(h["proposition"]),
         "scores": scores,
         "evidence": evidence,
-        "timesDeposited": times,
-        "firstDepositedAt": first,
-        "lastDepositedAt": last,
+        "timesDeposited": h["times"],
+        "firstDepositedAt": h["first"],
+        "lastDepositedAt": h["last"],
         "provenanceRefs": {
-            "derivedFromFiles": derived_from,
-            "geneSetRefs": gene_set_refs,
+            "derivedFromFiles": h["derived_from"],
+            "geneSetRefs": h["gene_set_refs"],
             "resolveVia": "provenance-indexer",
             "resolution": resolution,
         },
@@ -664,6 +702,10 @@ def resolve_proposition(_, info, id):
 
 def _collection_envelope(con, claim_id, source):
     return envelope(con, claim_id, source=source)
+
+
+# Query results serve many claims at once (serve._attach_claims): one batch.
+_collection_envelope.many = lambda con, items: envelopes(con, items)
 
 
 @query.field("collections")
