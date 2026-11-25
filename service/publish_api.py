@@ -1,15 +1,15 @@
 """Publishing a release into this service with a `claims login` token (docs/publishing-to-a-deployment.md).
 
-The publishing machine reads and checks the result files (publish.read_dataset) and sends what they hold,
-one dataset per request. This module computes everything else itself (every identifier, gene set, metric
-and mint context, and the collection's own File records) and stores through publish.SqlTarget, the same
-write path scripts/publish_collection.py takes, so a pushed release and a directly published one are the
-same rows. A request that would change something recorded is refused; one repeated after a lost answer
-changes nothing.
+The publishing machine reads and checks the result files (publish.read_dataset), builds each dataset's
+Parquet index, and puts it in a bucket the data's owner keeps; this service is told where, reads the index
+into its cache (service/collections/index_bucket.py), checks it against the sha256 recorded with the push,
+and computes every identifier, metric, edge and mint context again from its values before recording the
+dataset's control rows. No row is stored in the database: queries are served from the cached index. A
+request that would change something recorded is refused; one repeated after a lost answer changes nothing.
 
     POST /v1/publish/{collection}/{version}:begin                 the collection's files -> bundle digest, state
     POST /v1/publish/{collection}/{version}:check                 which datasets and mint contexts are stored
-    PUT  /v1/publish/{collection}/{version}/datasets/{dataset_id}  one dataset
+    PUT  /v1/publish/{collection}/{version}/datasets/{dataset_id}  one dataset's index, in the push's bucket
     POST /v1/publish/{collection}/{version}:finish                the release: recorded, and made current
 """
 from __future__ import annotations
@@ -33,6 +33,8 @@ from starlette.concurrency import run_in_threadpool
 
 from . import db, device_login
 from .collections import identity as idn
+from .collections import index_bucket
+from .collections import store as cstore
 from .collections import publish as pub
 from .collections.manifest import Collection, ManifestError, load_collection
 from .collections.traits import MappingError, collection_vocabulary, resolve_dimension, unmapped_policy
@@ -386,17 +388,6 @@ def _contexts(bundle: Bundle, ds: dict) -> list:
     return out
 
 
-def _extract(sent) -> dict | None:
-    if sent is None:
-        return None
-    if not (isinstance(sent, dict) and isinstance(sent.get("edges", {}), dict) and isinstance(sent.get("rows", {}), dict)
-            and all(isinstance(v, list) for v in (*sent.get("edges", {}).values(), *sent.get("rows", {}).values()))):
-        raise pub.PublishError("extract is {edges: {kind: [[from, to], ...]}, rows: {kind: [row, ...]}}")
-    return sent
-
-
-# --- the steps ---------------------------------------------------------------------
-
 def _refuse_object_collection(con, collection: str) -> None:
     if con.execute("SELECT 1 FROM object_collections WHERE collection_key = ?", (collection,)).fetchone():
         raise Conflict(f"{collection} is an object collection: its releases are built from deposits, not pushed")
@@ -412,6 +403,13 @@ def _chunked(con, sql: str, ids: list, column: str, params: tuple = ()) -> set:
 
 
 def begin(con, collection: str, version: str, body: dict, publisher: dict) -> dict:
+    index_location = body.get("index_location")
+    try:
+        index_bucket.parse(index_location)
+    except index_bucket.IndexError_ as exc:
+        raise pub.PublishError(str(exc)) from exc
+    if cstore.index_dir():
+        raise pub.PublishError("this deployment serves a local index (CLAIMS_INDEX_DIR); it takes no pushes")
     files, prefix = _bundle_files(body)
     digest = _digest(files, prefix)
     bundle = _load(digest, files, prefix)
@@ -428,7 +426,7 @@ def begin(con, collection: str, version: str, body: dict, publisher: dict) -> di
                      device_login._fmt(device_login._now())))
         device_login._audit(con, "release_publish_started", publisher["email"],
                             f"{collection} {version} with {publisher['token_id']}, bundle {digest[:12]}")
-    return {"bundle": digest, "collection": collection, "version": version,
+    return {"bundle": digest, "collection": collection, "version": version, "index_location": index_location,
             "existing_release_id": existing["release_id"] if existing else None,
             "existing_was_revision_of": existing["was_revision_of"] if existing else None,
             "current_release_id": target.current_release_id(collection)}
@@ -446,46 +444,83 @@ def check(con, body: dict) -> dict:
     return {"stored": sorted(stored), "recorded": sorted(recorded)}
 
 
+def _index(sent, dataset_id: str) -> dict:
+    """The dataset's index as the push describes it: its location (derived here from the push's index
+    location) and each file's sha256, size and S3 version."""
+    if not isinstance(sent, dict) or not isinstance(sent.get("files"), dict):
+        raise pub.PublishError("index is {location, files: {name: {sha256, size, version_id}}}")
+    try:
+        index_bucket.parse(sent.get("location"))
+    except index_bucket.IndexError_ as exc:
+        raise pub.PublishError(str(exc)) from exc
+    files = sent["files"]
+    if set(files) != set(index_bucket.FILES):
+        raise pub.PublishError(f"index files are exactly {list(index_bucket.FILES)}")
+    for name, f in files.items():
+        if not (isinstance(f, dict) and isinstance(f.get("sha256"), str) and DIGEST_RE.match(f["sha256"])
+                and type(f.get("size")) is int and 0 <= f["size"] <= MAX_INFLATED
+                and (f.get("version_id") is None or (isinstance(f["version_id"], str) and len(f["version_id"]) <= 1024))):
+            raise pub.PublishError(f"index file {name}: {{sha256, size, version_id}}")
+    return {"location": index_bucket.dataset_location(sent["location"], dataset_id),
+            "files": {n: {"sha256": f["sha256"], "size": f["size"], "version_id": f.get("version_id")}
+                      for n, f in sorted(files.items())}}
+
+
 def put_dataset(con, collection: str, dataset_id: str, body: dict, publisher: dict) -> dict:
+    """Register one dataset whose Parquet index is in the push's bucket: its files are read, checked against
+    their sha256, and every identifier, metric and edge in them is computed again from their values before
+    the dataset's control rows are recorded. No row is stored here."""
     bundle = _bundle(con, collection, body.get("bundle"))
     vocab = bundle.vocab()
     ds = _dataset(bundle, vocab, dataset_id, body.get("dataset"))
-    extract = _extract(body.get("extract"))
-    target = pub.SqlTarget(con, publisher["email"], publisher["token_id"])
-    if target.kind != "sql":
-        raise pub.PublishError("this deployment keeps result data in a Parquet index; push to one that keeps it in "
-                               "its database")
-
-    def record(c) -> None:  # in the dataset's transaction: who stored it, for which collection
-        c.execute("INSERT INTO publish_datasets (dataset_id, collection_key, bundle_sha256, published_by, "
-                  "publisher_token_id, stored_at) VALUES (?, ?, ?, ?, ?, ?)",
-                  (dataset_id, collection, bundle.digest, publisher["email"], publisher["token_id"],
-                   device_login._fmt(device_login._now())))
-
+    target = pub.SqlTarget(con)
     with _lock(con, "dataset", dataset_id, dataset_id):
         stored = target.dataset_stored(dataset_id)
-        if stored:
-            extract = None  # a repeat: the rows are in
-        elif extract is None:
-            raise pub.PublishError(f"{dataset_id} is not stored yet: send what its files hold (extract)")
-        else:
-            try:
-                target.refuse_other_slice(ds)
-            except pub.PublishError as exc:
-                raise Conflict(str(exc)) from exc
         pending = [ctx for ctx in _contexts(bundle, ds) if not target.context_recorded(ctx.activity["id"])]
-        done = target.put_dataset(bundle.col, ds, vocab, extract, pending, on_store=record)
-    return {"dataset_id": dataset_id, "already_stored": stored, **done}
+        if stored:
+            with con:
+                pub.record_index_dataset(con, ds, pending, {}, stored=False)
+            return {"dataset_id": dataset_id, "already_stored": True, "rows": 0, "edges": 0,
+                    "contexts": len(pending), "objects": 0}
+        entry = _index(body.get("index"), dataset_id)
+        try:
+            target.refuse_other_slice(ds)
+        except pub.PublishError as exc:
+            raise Conflict(str(exc)) from exc
+        cache = cstore.bucket_store().cache
+        try:
+            directory = cache.ensure(dataset_id, entry)
+        except index_bucket.IndexError_ as exc:
+            raise pub.PublishError(str(exc)) from exc
+        except Exception as exc:  # the bucket could not be read: the publisher's to fix (location, grant)
+            raise pub.PublishError(f"cannot read the index at {entry['location']}: {type(exc).__name__}: "
+                                   f"{str(exc)[:200]}") from exc
+        objects: dict = {}
+        try:
+            counts = pub.verify_parquet_dataset(bundle.col, ds, vocab, directory, objects)
+        except BaseException:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise
+        with con:
+            pub.record_index_dataset(con, ds, pending, objects, stored=True)
+            con.execute("INSERT INTO dataset_indexes (dataset_id, collection_key, location, files, counts, "
+                        "bundle_sha256, published_by, publisher_token_id, stored_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (dataset_id, collection, entry["location"], json.dumps(entry["files"]), json.dumps(counts),
+                         bundle.digest, publisher["email"], publisher["token_id"],
+                         device_login._fmt(device_login._now())))
+    return {"dataset_id": dataset_id, "already_stored": False, "rows": sum(counts["rows"].values()),
+            "edges": sum(counts["edges"].values()), "contexts": len(pending),
+            "objects": sum(1 for v in objects.values() if v[0] in pub.EAGER_CLASSES)}
 
 
 def _members(con, collection: str, release: dict) -> list[str]:
-    """The release's members, each a dataset stored for this collection: pushed for it (publish_datasets), or
+    """The release's members, each a dataset stored for this collection: pushed for it (dataset_indexes), or
     a member of one of its recorded releases."""
     members = release.get("members")
     if not (isinstance(members, list) and members and len(members) <= MAX_CHECK and len(set(members)) == len(members)
             and all(isinstance(m, str) and idn.class_of(m) == "Dataset" for m in members)):
         raise pub.PublishError("the release lists its member datasets, once each")
-    bound = _chunked(con, "SELECT dataset_id FROM publish_datasets WHERE collection_key = ? AND dataset_id IN ({marks})",
+    bound = _chunked(con, "SELECT dataset_id FROM dataset_indexes WHERE collection_key = ? AND dataset_id IN ({marks})",
                      members, "dataset_id", (collection,))
     rest = [m for m in members if m not in bound]
     if rest:

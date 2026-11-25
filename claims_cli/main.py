@@ -7,7 +7,7 @@
     claims collection validate <collection dir>
     claims release plan <collection dir> --version 2026.11.1 [--only IBD,HEIGHT]
     claims release publish <collection dir> 2026.11.1 [--first 25] [--workers 4]
-    claims release publish <collection dir> 2026.11.1 --api qa      (into a deployed service; needs claims login)
+    claims release publish <collection dir> 2026.11.1 --api qa --index-to s3://bucket/prefix   (needs claims login)
     claims release status <collection dir> 2026.11.1
     claims sources verify <collection dir> 2026.11.1
     claims query run pigean top-genes-with-sets --var trait=IBD --var topGenes=5
@@ -902,7 +902,8 @@ def _publish_once(args, collection_dir: Path, shard: str | None) -> dict:
         if args.api:
             from . import push
 
-            target = push.RemoteTarget(_publish_api(args), _publisher_token(args), col, args.version)
+            target = push.RemoteTarget(_publish_api(args), _publisher_token(args), col, args.version,
+                                       args.index_to, Path(os.environ["CLAIMS_INDEX_DIR"]) / "push-staging")
         else:
             con = _connect()
         result = publish(con, col, spec, base, allow_dirty=True, progress=progress, fetch=fetch, workdir=workdir,
@@ -936,10 +937,12 @@ def cmd_release_publish(args):
     if left and not args.allow_draft:
         sys.exit(f"{len(left)} TODO(s) left in {collection_dir} (`claims collection validate` lists them); claims "
                  "published now would carry them. Finish them, or pass --allow-draft for a test deployment.")
+    if args.api and not args.index_to:
+        sys.exit("name where the index goes: --index-to s3://bucket/prefix (a bucket the service may read)")
     if args.api and not args.shard:
         api = _publish_api(args)
         _publisher_token(args)
-        print(f"publishing to {api} (the files are read here; the sha256 cache is {index})", flush=True)
+        print(f"publishing to {api}: the files are read here, the index goes to {args.index_to}", flush=True)
     if args.shard:  # a worker started by --workers
         out = _publish_once(args, collection_dir, args.shard)
         print(json.dumps({"stats": out["result"].stats, "complete": out["result"].complete}))
@@ -951,7 +954,7 @@ def cmd_release_publish(args):
             cmd = [sys.executable, "-m", "claims_cli.main", "--db", str(db), "--index-dir", str(index),
                    "release", "publish", str(collection_dir), args.version, "--shard", f"{i}/{args.workers}",
                    "--quiet", *(["--allow-draft"] if args.allow_draft else []),
-                   *(["--api", args.api] if args.api else [])]
+                   *(["--api", args.api, "--index-to", args.index_to] if args.api else [])]
             if args.first:
                 cmd += ["--first", str(-(-args.first // args.workers))]
             procs.append(subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE, text=True))
@@ -1187,6 +1190,8 @@ def main(argv=None):
     p.add_argument("--allow-draft", action="store_true", help="publish even though TODOs are left")
     p.add_argument("--api", help="publish into this deployed service instead (`qa`, or its base URL); needs "
                    "`claims login` (docs/publishing-to-a-deployment.md)")
+    p.add_argument("--index-to", help="with --api: where the release's Parquet index goes (s3://bucket/prefix, a "
+                   "bucket the service may read); the service serves from it and stores no rows")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(func=cmd_release_publish)
     p = release.add_parser("status", help="how far a release has been published")

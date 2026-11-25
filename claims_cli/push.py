@@ -15,7 +15,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from service.collections.publish import PublishError, repository_prefix
+from pathlib import Path
+
+from service.collections import index_bucket
+from service.collections.publish import PublishError, parquet_dataset, repository_prefix
 from service.collections.traits import vocabulary_files
 
 from . import auth
@@ -42,10 +45,17 @@ class RemoteTarget:
 
     kind = "remote"
 
-    def __init__(self, api: str, token: str, col, version: str):
-        self.api, self.token = api, token
+    def __init__(self, api: str, token: str, col, version: str, index_location: str, staging: Path):
+        """`index_location` is where the datasets' Parquet indexes go (s3://bucket/prefix, a bucket the service
+        may read); `staging` is a local directory they are built in before upload."""
+        from service.collections.store import ParquetStore
+
+        index_bucket.parse(index_location, server=False)
+        self.api, self.token, self.index_location = api, token, index_location.rstrip("/")
+        self.staging = ParquetStore(staging)
         self.base = f"{api}/v1/publish/{urllib.parse.quote(col.key, safe='')}/{urllib.parse.quote(version, safe='')}"
-        begun = self._send("POST", ":begin", {"files": collection_files(col), "prefix": repository_prefix(col)})
+        begun = self._send("POST", ":begin", {"files": collection_files(col), "prefix": repository_prefix(col),
+                                              "index_location": self.index_location})
         self.bundle = begun["bundle"]
         self._existing = ({"release_id": begun["existing_release_id"], "was_revision_of": begun["existing_was_revision_of"]}
                           if begun.get("existing_release_id") else None)
@@ -129,6 +139,9 @@ class RemoteTarget:
                    "files": {role: f["doc"] for role, f in ds["files"].items()},
                    "where": ds.get("where") or {}, "was_generated_by": ds["doc"]["was_generated_by"]}
         dataset_id = ds["doc"]["id"]
+        index = None
+        if extract is not None:
+            index = self._upload(col, ds, vocab, extract)
 
         def settled():  # stored by the attempt that timed out: done, nothing to send again
             got = self._send("POST", ":check", {"datasets": [dataset_id],
@@ -137,11 +150,25 @@ class RemoteTarget:
                 return {"dataset_id": dataset_id, "rows": 0, "edges": 0, "contexts": 0, "objects": 0}
             return None
         done = self._send("PUT", f"datasets/{urllib.parse.quote(dataset_id, safe=':')}",
-                          {"bundle": self.bundle, "dataset": dataset, "extract": extract}, settled=settled)
+                          {"bundle": self.bundle, "dataset": dataset, "index": index}, settled=settled)
         if done.get("dataset_id") != ds["doc"]["id"]:
             raise PublishError(f"{self.api} stored {done.get('dataset_id')}, not {ds['doc']['id']}")
         self._stored.add(ds["doc"]["id"])
         return {k: done[k] for k in ("rows", "edges", "contexts", "objects")}
+
+    def _upload(self, col, ds: dict, vocab, extract: dict) -> dict:
+        """Build the dataset's Parquet index here and put it under the push's index location: what the
+        service is told (each file's sha256, size and S3 version)."""
+        dataset_id = ds["doc"]["id"]
+        rows, metrics, edges = parquet_dataset(col, ds, extract, {}, vocab)
+        self.staging.write_dataset(dataset_id, rows, metrics, edges)
+        local = self.staging.dataset_dir(dataset_id)
+        where = index_bucket.dataset_location(self.index_location, dataset_id)
+        files = {}
+        for name in index_bucket.FILES:
+            files[name] = {"sha256": index_bucket.sha256_file(local / name), "size": (local / name).stat().st_size,
+                           "version_id": index_bucket.upload(local / name, where, name)}
+        return {"location": self.index_location, "files": files}
 
     def record_release(self, col, release: dict, document: dict, objects: dict, dataset_ids: list[str],
                        contexts: list, provenance: list, vocab, template_files: dict, query_files: dict,

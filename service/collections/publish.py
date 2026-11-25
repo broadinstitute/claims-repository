@@ -963,7 +963,7 @@ def group_inputs(con, minting: dict, dataset_id: str, kind: str, group_id: str,
     from .store import get_store
 
     spec = minting["edge_kinds"][kind]
-    label, count = found if found is not None else get_store(con).group(dataset_id, kind, group_id)
+    label, count = found if found is not None else get_store(con, [dataset_id]).group(dataset_id, kind, group_id)
     entity = minting["entities"][spec["to"]["entity"]]
     parent = ""
     if "library_dimension" in entity:
@@ -1082,45 +1082,114 @@ class SqlTarget:
 EAGER_CLASSES = {"File", "Activity", "Dataset", "ResultCollection", "GeneSetCollection"}
 
 
+def parquet_dataset(col: Collection, ds: dict, extract: dict, objects: dict, vocab) -> tuple[list, list, list]:
+    """A dataset's Parquet index content from what its files hold (read_dataset): (rows, metrics, edges), every
+    identifier computed here. `objects` receives the entities it mints (the gene-set library, gene sets)."""
+    from .store import stable_row_id
+
+    doc = col.doc
+    dataset_id = ds["doc"]["id"]
+    rows, metrics, edge_rows = [], [], []
+    ents, edges = assemble_entities(col, ds, extract, objects)
+    for kind, pairs in edges.items():
+        spec = doc["edge_kinds"][kind]
+        for (from_value, to_value), (from_id, _, _) in sorted(pairs.items()):
+            to_id, _ = ents.ident(spec["to"]["entity"], to_value)
+            edge_rows.append((dataset_id, kind, from_id, to_id, from_value, to_value))
+    unknown = sorted(set(extract.get("rows") or {}) - set(doc["row_kinds"]))
+    if unknown:
+        raise PublishError(f"rows of unknown kind(s) {unknown}")
+    for kind, rk in doc["row_kinds"].items():
+        if col.role_for(kind) not in ds["files"]:
+            continue
+        for r in assemble_rows(col, ds, ents, kind, extract, vocab):
+            row = {**r, "dataset_id": dataset_id, "kind": kind,
+                   "row_id": stable_row_id(dataset_id, kind, r["subject_id"])}
+            rows.append(row)
+            values = json.loads(row["row_json"])
+            metrics.extend((row["row_id"], m, idn.num(values[m])) for m in rk["metrics"])
+    return rows, metrics, edge_rows
+
+
+def record_index_dataset(con, ds: dict, pending: list, objects: dict, stored: bool) -> None:
+    """A Parquet-indexed dataset's control rows, in the caller's transaction: dimensions and files (when it is
+    stored now), pending mint contexts, and the eagerly stored objects (gene sets are rebuilt when served)."""
+    dataset_id = ds["doc"]["id"]
+    if stored:
+        con.executemany("INSERT INTO dataset_dimensions (dataset_id, dimension, value, label) VALUES (?, ?, ?, ?)",
+                        [(dataset_id, n, d["value"], d["label"]) for n, d in ds["dims"].items()])
+        con.executemany("INSERT INTO dataset_files (dataset_id, role, file_id) VALUES (?, ?, ?)",
+                        [(dataset_id, role, f["doc"]["id"]) for role, f in ds["files"].items()])
+    for ctx in pending:
+        _record_context(con, ctx)
+    _store_objects(con, {oid: v for oid, v in objects.items() if v[0] in EAGER_CLASSES})
+
+
+def read_parquet_extract(col: Collection, directory: Path) -> tuple[dict, list, list, list]:
+    """What a dataset's Parquet index says its files hold (the values a push is checked by), and the index's
+    own (rows, metrics, edges) as tuples, read with DuckDB."""
+    import duckdb
+
+    db = duckdb.connect()
+    try:
+        rows = [dict(zip(("row_id", "dataset_id", "kind", "subject_id", "subject_value", "subject_label", "object_id",
+                          "object_label", "file_id", "row_json", "spans"), r)) for r in db.execute(
+            "SELECT row_id, dataset_id, kind, subject_id, subject_value, subject_label, object_id, object_label, "
+            "file_id, row_json, spans FROM read_parquet(?)", [str(directory / "rows.parquet")]).fetchall()]
+        metrics = db.execute("SELECT row_id, metric, value FROM read_parquet(?)",
+                             [str(directory / "metrics.parquet")]).fetchall()
+        edges = db.execute("SELECT dataset_id, kind, from_id, to_id, from_value, to_value FROM read_parquet(?)",
+                           [str(directory / "edges.parquet")]).fetchall()
+    finally:
+        db.close()
+    extract: dict = {"edges": {}, "rows": {}}
+    for e in edges:
+        extract["edges"].setdefault(e[1], []).append([e[4], e[5]])
+    for r in rows:
+        rk = col.doc["row_kinds"].get(r["kind"])
+        if rk is None:
+            raise PublishError(f"the index holds rows of unknown kind {r['kind']!r}")
+        values = json.loads(r["row_json"])
+        extract["rows"].setdefault(r["kind"], []).append({
+            "subject_value": r["subject_value"],
+            "object_value": str(values.get(rk["object"]["column"])) if "column" in rk["object"] else "",
+            "row_json": r["row_json"], "spans": r["spans"]})
+    return extract, rows, metrics, edges
+
+
+def verify_parquet_dataset(col: Collection, ds: dict, vocab, directory: Path, objects: dict) -> dict:
+    """Check a pushed dataset's Parquet index against what its values make: every identifier, label, metric
+    and edge is computed again here and must be exactly what the index holds. Its counts."""
+    extract, rows, metrics, edges = read_parquet_extract(col, directory)
+    want_rows, want_metrics, want_edges = parquet_dataset(col, ds, extract, objects, vocab)
+    key = lambda r: tuple(r[f] for f in ("row_id", "dataset_id", "kind", "subject_id", "subject_value",  # noqa: E731
+                                         "subject_label", "object_id", "object_label", "file_id", "row_json", "spans"))
+    if sorted(map(key, rows)) != sorted(map(key, want_rows)):
+        raise PublishError("the index's rows are not what their values make (identifiers, labels or files differ)")
+    if sorted(metrics) != sorted(want_metrics):
+        raise PublishError("the index's metrics are not the rows' values")
+    if sorted(edges) != sorted(want_edges):
+        raise PublishError("the index's edges are not what their values make")
+    counts = {"rows": {}, "edges": {}}
+    for r in want_rows:
+        counts["rows"][r["kind"]] = counts["rows"].get(r["kind"], 0) + 1
+    for e in want_edges:
+        counts["edges"][e[1]] = counts["edges"].get(e[1], 0) + 1
+    return counts
+
+
 def _ingest_parquet(con, col: Collection, ds: dict, pending: list, vocab, store, ingest: bool) -> tuple[int, int]:
     """Ingest one dataset into the Parquet index (rows, metrics and edges,
     written whole), then record its control rows (dimensions, files, pending
     mint contexts) in the service database. Gene sets are not stored here: the
     service rebuilds and stores one the first time a claim naming it is served."""
-    from .store import stable_row_id
-
-    doc = col.doc
-    dataset_id = ds["doc"]["id"]
     objects: dict[str, tuple[str, dict]] = {}
     rows, edge_rows = [], []
     if ingest:
-        extract = read_dataset(col, ds, vocab)
-        ents, edges = assemble_entities(col, ds, extract, objects)
-        for kind, pairs in edges.items():
-            spec = doc["edge_kinds"][kind]
-            for (from_value, to_value), (from_id, _, _) in sorted(pairs.items()):
-                to_id, _ = ents.ident(spec["to"]["entity"], to_value)
-                edge_rows.append((dataset_id, kind, from_id, to_id, from_value, to_value))
-        metrics = []
-        for kind, rk in doc["row_kinds"].items():
-            if col.role_for(kind) not in ds["files"]:
-                continue
-            for r in assemble_rows(col, ds, ents, kind, extract, vocab):
-                row = {**r, "dataset_id": dataset_id, "kind": kind,
-                       "row_id": stable_row_id(dataset_id, kind, r["subject_id"])}
-                rows.append(row)
-                values = json.loads(row["row_json"])
-                metrics.extend((row["row_id"], m, idn.num(values[m])) for m in rk["metrics"])
-        store.write_dataset(dataset_id, rows, metrics, edge_rows)
+        rows, metrics, edge_rows = parquet_dataset(col, ds, read_dataset(col, ds, vocab), objects, vocab)
+        store.write_dataset(ds["doc"]["id"], rows, metrics, edge_rows)
     with con:
-        if ingest:
-            con.executemany("INSERT INTO dataset_dimensions (dataset_id, dimension, value, label) VALUES (?, ?, ?, ?)",
-                            [(dataset_id, n, d["value"], d["label"]) for n, d in ds["dims"].items()])
-            con.executemany("INSERT INTO dataset_files (dataset_id, role, file_id) VALUES (?, ?, ?)",
-                            [(dataset_id, role, f["doc"]["id"]) for role, f in ds["files"].items()])
-        for ctx in pending:
-            _record_context(con, ctx)
-        _store_objects(con, {oid: v for oid, v in objects.items() if v[0] in EAGER_CLASSES})
+        record_index_dataset(con, ds, pending, objects, ingest)
     return len(rows), len(edge_rows)
 
 

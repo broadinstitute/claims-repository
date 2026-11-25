@@ -10,3 +10,8 @@ linkml-runtime>=1.9,<2
 jsonschema>=4.18,<5
 # MySQL (QA and prod, when CLAIMS_MYSQL_HOST is set) and scripts/migrate.py.
 PyMySQL>=1.1,<2
+# The Parquet result store (service/collections/store.py), queried with DuckDB: a local deployment's
+# index, and on QA/prod the bucket indexes releases are published with (service/collections/index_bucket.py).
+duckdb==1.1.3
+# Reading (service) and writing (CLI) bucket indexes in S3.
+boto3>=1.34,<2

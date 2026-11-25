@@ -329,9 +329,12 @@ CREATE TABLE IF NOT EXISTS collection_releases (
   publisher_token_id TEXT,
   UNIQUE (collection_key, version)
 );
-CREATE TABLE IF NOT EXISTS publish_datasets (
+CREATE TABLE IF NOT EXISTS dataset_indexes (
   dataset_id TEXT PRIMARY KEY,
   collection_key TEXT NOT NULL,
+  location TEXT NOT NULL,
+  files TEXT NOT NULL,
+  counts TEXT NOT NULL,
   bundle_sha256 TEXT NOT NULL,
   published_by TEXT NOT NULL,
   publisher_token_id TEXT NOT NULL,

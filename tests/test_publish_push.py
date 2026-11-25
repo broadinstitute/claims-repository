@@ -1,10 +1,12 @@
 """Publishing into a deployed service with a `claims login` token (docs/publishing-to-a-deployment.md).
 
-The acceptance test: the same release published directly into one database and pushed over HTTP into
-another holds the same rows, objects, mint contexts and release record, and serves the same claims. The
-rest are what the API refuses."""
+The acceptance test: the same release published directly into a local deployment (SQLite plus a Parquet
+index on disk) and pushed over HTTP (its Parquet index into a bucket, here a file:// one) records the same
+control rows, objects, mint contexts and release, stores no row in the service database, and serves the
+same claims. The rest are what the API refuses."""
 from __future__ import annotations
 
+import os
 import gzip
 import json
 import socket
@@ -23,7 +25,10 @@ from service import db as service_db
 from service import device_login, publish_api
 from service.app import app
 from service.collections import identity as idn
+from service.collections import index_bucket
+from service.collections import publish as pub
 from service.collections.manifest import load_collection, load_release
+from service.collections.store import ParquetStore
 from service.collections.publish import PublishError, publish
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,11 +49,24 @@ def _quick_retries(monkeypatch):
 
 @pytest.fixture(scope="module")
 def pushed_db():
-    """The deployed service's database for this module (the server thread connects through DB_PATH)."""
-    saved = service_db.DB_PATH
-    service_db.DB_PATH = str(Path(tempfile.mkdtemp()) / "pushed.db")
+    """The deployed service's database for this module (the server thread connects through DB_PATH), its
+    index cache, and file:// index locations allowed (a stand-in for the owner's bucket)."""
+    saved = service_db.DB_PATH, {k: os.environ.get(k) for k in ("CLAIMS_INDEX_ALLOW_FILE", "CLAIMS_INDEX_CACHE")}
+    root = Path(tempfile.mkdtemp())
+    service_db.DB_PATH = str(root / "pushed.db")
+    os.environ["CLAIMS_INDEX_ALLOW_FILE"], os.environ["CLAIMS_INDEX_CACHE"] = "1", str(root / "cache")
     yield service_db.DB_PATH
-    service_db.DB_PATH = saved
+    service_db.DB_PATH = saved[0]
+    for k, v in saved[1].items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+@pytest.fixture(scope="module")
+def bucket(pushed_db):
+    return "file://" + str(Path(tempfile.mkdtemp()) / "owner-bucket" / "pigean-index")
 
 
 @pytest.fixture(scope="module")
@@ -106,10 +124,14 @@ def _spec(tmp_path: Path, version: str, traits=("FIXPHENO", "FIXPHENO2")) -> dic
     return {"version": version, "datasets": datasets}
 
 
-def _push(api, token, spec, base, **kw):
+def _target(api, token, col, version, bucket, cls=None):
+    return (cls or push.RemoteTarget)(api, token["access_token"], col, version, bucket,
+                                      Path(tempfile.mkdtemp()) / "staging")
+
+
+def _push(api, token, bucket, spec, base, **kw):
     col = load_collection(COLLECTION)
-    target = push.RemoteTarget(api, token["access_token"], col, spec["version"])
-    return publish(None, col, spec, base, target=target, **kw)
+    return publish(None, col, spec, base, target=_target(api, token, col, spec["version"], bucket), **kw)
 
 
 def _rows(con, sql, params=()):
@@ -138,9 +160,11 @@ def _snapshot(con) -> dict:
     }
 
 
-def _served(db_path: str) -> list:
+def _served(db_path: str, index_dir: str | None = None) -> list:
     saved = service_db.DB_PATH
     service_db.DB_PATH = db_path
+    if index_dir:
+        os.environ["CLAIMS_INDEX_DIR"] = index_dir
     try:
         r = TestClient(app).post(f"/v1/collections/pigean/queries/{QUERY}:run",
                                  json={"variables": {"trait": "FIXPHENO2", "library": "fixture-v1", "topGenes": 5}})
@@ -150,27 +174,35 @@ def _served(db_path: str) -> list:
                   for i in row.get("sets", [])]) for row in r.json()["rows"]]
     finally:
         service_db.DB_PATH = saved
+        os.environ.pop("CLAIMS_INDEX_DIR", None)
 
 
-def test_a_pushed_release_is_the_directly_published_release(api, token, pushed_db, tmp_path):
+def test_a_pushed_release_is_the_directly_published_release(api, token, pushed_db, bucket, tmp_path, monkeypatch):
     spec = _spec(tmp_path, "0.2.0-push")
     col = load_collection(COLLECTION)
-    direct_db = str(tmp_path / "direct.db")
+    direct_db, direct_index = str(tmp_path / "direct.db"), str(tmp_path / "direct-index")
+    monkeypatch.setenv("CLAIMS_INDEX_DIR", direct_index)   # a local deployment: its index on this disk
     con = service_db.connect(direct_db)
     try:
         direct = publish(con, col, spec, tmp_path)
     finally:
         con.close()
+    monkeypatch.delenv("CLAIMS_INDEX_DIR")
 
-    pushed = _push(api, token, spec, tmp_path)
+    pushed = _push(api, token, bucket, spec, tmp_path)
     assert pushed.release_id == direct.release_id and pushed.complete
-    assert pushed.stats == direct.stats and direct.stats["rows"] > 0 and direct.stats["edges"] > 0
+    assert {k: v for k, v in pushed.stats.items() if k not in ("index_bytes", "objects")} == \
+        {k: v for k, v in direct.stats.items() if k not in ("index_bytes", "objects")}
+    assert direct.stats["rows"] > 0 and direct.stats["edges"] > 0
 
     a, b = service_db.connect(direct_db), service_db.connect(pushed_db)
     try:
         want, got = _snapshot(a), _snapshot(b)
         for table in want:
             assert got[table] == want[table], table
+        assert got["rows"] == got["metrics"] == got["edges"] == []   # no row in the service database
+        indexed = b.execute("SELECT dataset_id, location, files FROM dataset_indexes").fetchall()
+        assert len(indexed) == 2 and all(r["location"].startswith(bucket + "/datasets/") for r in indexed)
         assert tuple(b.execute("SELECT published_by, publisher_token_id FROM collection_releases").fetchone()) == \
             (PUBLISHER, token["token_id"])
         assert a.execute("SELECT published_by FROM collection_releases").fetchone()[0] is None
@@ -181,26 +213,26 @@ def test_a_pushed_release_is_the_directly_published_release(api, token, pushed_d
         a.close()
         b.close()
 
-    again = _push(api, token, spec, tmp_path)   # nothing left to do: nothing changes
+    again = _push(api, token, bucket, spec, tmp_path)   # nothing left to do: nothing changes
     assert again.release_id == direct.release_id and again.stats["datasets_ingested"] == 0
     b = service_db.connect(pushed_db)
     try:
         assert _snapshot(b) == got
     finally:
         b.close()
-    assert _served(pushed_db) == _served(direct_db) != []
+    assert _served(pushed_db) == _served(direct_db, direct_index) != []
 
 
-def test_a_push_resumes_and_is_recorded_only_when_whole(api, token, pushed_db, tmp_path):
+def test_a_push_resumes_and_is_recorded_only_when_whole(api, token, pushed_db, bucket, tmp_path):
     spec = _spec(tmp_path, "0.3.0-resume", ("FIXRESUME", "FIXRESUME2"))
-    first = _push(api, token, spec, tmp_path, max_ingest=1)
+    first = _push(api, token, bucket, spec, tmp_path, max_ingest=1)
     assert not first.complete and first.stats["datasets_ingested"] == 1
     con = service_db.connect(pushed_db)
     try:
         assert con.execute("SELECT 1 FROM collection_releases WHERE version = '0.3.0-resume'").fetchone() is None
     finally:
         con.close()
-    rest = _push(api, token, spec, tmp_path)
+    rest = _push(api, token, bucket, spec, tmp_path)
     assert rest.complete and rest.stats["datasets_ingested"] == 1
     con = service_db.connect(pushed_db)
     try:
@@ -225,16 +257,16 @@ def _send(api, token, method, path, body, gz=True):
     return httpx.request(method, f"{api}/v1/publish/pigean/{path}", content=data, headers=headers, timeout=30)
 
 
-def _begin(api, token, version="9.9.9-refused"):
+def _begin(api, token, bucket, version="9.9.9-refused"):
     col = load_collection(COLLECTION)
-    r = _send(api, token, "POST", f"{version}:begin", {"files": push.collection_files(col), "prefix": "tests/fixtures/collections/pigean"})
+    r = _send(api, token, "POST", f"{version}:begin", {"files": push.collection_files(col), "index_location": bucket,
+                                                       "prefix": "tests/fixtures/collections/pigean"})
     assert r.status_code == 200, r.text
     return r.json()["bundle"]
 
 
 def _one_dataset(tmp_path, phenotype="FIXREF"):
-    """A dataset's request body as RemoteTarget sends it, from a direct publish's plan."""
-    from service.collections import publish as pub
+    """(dataset id, the dataset as RemoteTarget describes it, the plan's dataset, vocab, extract)."""
     col = load_collection(COLLECTION)
     folder = _files(tmp_path, phenotype)
     spec = {"version": "x", "datasets": [{"dimensions": {"trait": phenotype, "library": "fixture-v1"},
@@ -251,7 +283,22 @@ def _one_dataset(tmp_path, phenotype="FIXREF"):
     dataset = {"raw_dimensions": {n: d["raw"] for n, d in ds["dims"].items()},
                "files": {r: f["doc"] for r, f in ds["files"].items()}, "where": {},
                "was_generated_by": ds["doc"]["was_generated_by"]}
-    return ds["doc"]["id"], dataset, extract
+    return ds["doc"]["id"], dataset, ds, plan["vocab"], extract
+
+
+def _index(tmp_path, bucket, ds, vocab, extract, tamper=None):
+    """Build a dataset's index as the CLI does, optionally tampered with, and put it in the bucket."""
+    col = load_collection(COLLECTION)
+    rows, metrics, edges = pub.parquet_dataset(col, ds, extract, {}, vocab)
+    if tamper:
+        tamper(rows, metrics, edges)
+    staging = ParquetStore(tmp_path / f"staging-{len(list(tmp_path.iterdir()))}")
+    staging.write_dataset(ds["doc"]["id"], rows, metrics, edges)
+    local = staging.dataset_dir(ds["doc"]["id"])
+    where = index_bucket.dataset_location(bucket, ds["doc"]["id"])
+    files = {n: {"sha256": index_bucket.sha256_file(local / n), "size": (local / n).stat().st_size,
+                 "version_id": index_bucket.upload(local / n, where, n)} for n in index_bucket.FILES}
+    return {"location": bucket, "files": files}
 
 
 def test_no_token_no_push(api):
@@ -260,51 +307,67 @@ def test_no_token_no_push(api):
     assert _send(api, bad, "POST", "1.0:begin", {"files": {}}).status_code == 401
 
 
-def test_the_collection_files_are_checked(api, token):
+def test_the_collection_files_are_checked(api, token, bucket):
     col = load_collection(COLLECTION)
     files = push.collection_files(col)
     for body, match in (({"files": {**files, "../evil.yaml": "x"}}, "relative path"),
                         ({"files": {k: v for k, v in files.items() if k != "collection.yaml"}}, "no collection.yaml"),
                         ({"files": {**files, "extra.yaml": "a: 1"}}, "does not use"),
                         ({"files": files, "prefix": "../up"}, "prefix")):
-        r = _send(api, token, "POST", "1.0:begin", body)
+        r = _send(api, token, "POST", "1.0:begin", {**body, "index_location": bucket})
         assert r.status_code == 400 and match in r.json()["detail"], r.text
-    r = httpx.post(f"{api}/v1/publish/other/1.0:begin", json={"files": files},
+    for location in (None, "s3://not-allowed-bucket/x", "s3://Bad_Bucket/x", "file:///../etc", "https://x.example/y"):
+        r = _send(api, token, "POST", "1.0:begin", {"files": files, "index_location": location})
+        assert r.status_code == 400 and ("index location" in r.json()["detail"] or "does not read" in r.json()["detail"]
+                                         or "absolute" in r.json()["detail"]), (location, r.text)
+    r = httpx.post(f"{api}/v1/publish/other/1.0:begin", json={"files": files, "index_location": bucket},
                    headers={"Authorization": "Bearer " + token["access_token"]})
     assert r.status_code == 400 and "not 'other'" in r.json()["detail"]
 
 
-def test_a_dataset_is_what_its_values_make(api, token, tmp_path):
-    bundle = _begin(api, token)
-    dataset_id, dataset, extract = _one_dataset(tmp_path)
+def test_a_dataset_index_is_checked_against_its_values(api, token, bucket, tmp_path):
+    bundle = _begin(api, token, bucket)
+    dataset_id, dataset, ds, vocab, extract = _one_dataset(tmp_path)
 
-    def put(ds=dataset, ex=extract, did=dataset_id, b=bundle):
-        return _send(api, token, "PUT", f"9.9.9-refused/datasets/{did}", {"bundle": b, "dataset": ds, "extract": ex})
+    def put(index, d=dataset, did=dataset_id, b=bundle):
+        return _send(api, token, "PUT", f"9.9.9-refused/datasets/{did}", {"bundle": b, "dataset": d, "index": index})
 
+    good = _index(tmp_path, bucket, ds, vocab, extract)
     other_trait = {**dataset, "raw_dimensions": {**dataset["raw_dimensions"], "trait": "OTHER"}}
-    r = put(ds=other_trait)
+    r = put(good, d=other_trait)
     assert r.status_code == 400 and "not the dataset these values make" in r.json()["detail"]
     tampered_file = json.loads(json.dumps(dataset))
     tampered_file["files"]["gene_stats"]["size_in_bytes"] += 1
-    assert "content address" in put(ds=tampered_file).json()["detail"]
-    below = json.loads(json.dumps(extract))
-    below["rows"]["gene_phenotype"][0]["row_json"] = json.dumps({"x": 1})
-    assert "do not match its row" in put(ex=below).json()["detail"]
-    other_phenotype = json.loads(json.dumps(extract))
-    row = json.loads(other_phenotype["rows"]["gene_phenotype"][0]["row_json"])
-    row["phenotype"] = "ELSEWHERE"
-    other_phenotype["rows"]["gene_phenotype"][0]["row_json"] = idn.canonical(row)
-    assert "does not match the dataset's trait" in put(ex=other_phenotype).json()["detail"]
-    assert "not stored yet" in put(ex=None).json()["detail"]
-    assert "start the push with :begin" in put(b="0" * 64).json()["detail"]
+    assert "content address" in put(good, d=tampered_file).json()["detail"]
+    assert "start the push with :begin" in put(good, b="0" * 64).json()["detail"]
+    assert "index is {location" in put(None).json()["detail"]
+    elsewhere = {**good, "location": "s3://someone-elses-bucket/x"}
+    assert "does not read the bucket" in put(elsewhere).json()["detail"]
+    wrong_sha = json.loads(json.dumps(good))
+    wrong_sha["files"]["rows.parquet"]["sha256"] = "0" * 64
+    assert "not the file recorded at publish" in put(wrong_sha).json()["detail"]
 
-    ok = put()
-    assert ok.status_code == 200 and ok.json()["rows"] > 0 and not ok.json()["already_stored"]
-    again = put()
+    def other_subject(rows, metrics, edges):
+        rows[0]["subject_id"] = "HGNC.SYMBOL:NOT-THIS-ONE"
+    r = put(_index(tmp_path, bucket, ds, vocab, extract, other_subject))
+    assert r.status_code == 400 and "rows are not what their values make" in r.json()["detail"]
+
+    def higher_score(rows, metrics, edges):
+        metrics[0] = (metrics[0][0], metrics[0][1], metrics[0][2] + 1)
+    assert "metrics are not the rows' values" in put(_index(tmp_path, bucket, ds, vocab, extract, higher_score)).json()["detail"]
+
+    def extra_edge(rows, metrics, edges):
+        edges.append((dataset_id, "member_of", "HGNC.SYMBOL:FIXG9", edges[0][3], "FIXG9", edges[0][5]))
+    assert "not what their values make" in put(_index(tmp_path, bucket, ds, vocab, extract, extra_edge)).json()["detail"]
+
+    ok = put(_index(tmp_path, bucket, ds, vocab, extract))
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["rows"] > 0 and not ok.json()["already_stored"]
+    again = put(None)
     assert again.status_code == 200 and again.json()["already_stored"] and again.json()["rows"] == 0
 
 
-def test_a_release_is_recorded_only_as_this_push_makes_it(api, token, tmp_path):
+def test_a_release_is_recorded_only_as_this_push_makes_it(api, token, bucket, tmp_path):
     spec = _spec(tmp_path, "0.4.0-finish", ("FIXFINISH", "FIXFINISH2"))
     col = load_collection(COLLECTION)
     sent = {}
@@ -315,7 +378,7 @@ def test_a_release_is_recorded_only_as_this_push_makes_it(api, token, tmp_path):
             raise PublishError("stopped before finishing")
 
     with pytest.raises(PublishError, match="stopped"):
-        publish(None, col, spec, tmp_path, target=Recording(api, token["access_token"], col, spec["version"]))
+        publish(None, col, spec, tmp_path, target=_target(api, token, col, spec["version"], bucket, Recording))
     _, release, document, objects, *_rest = sent["args"]
     provenance, code_version = sent["args"][6], sent["args"][10]
 
@@ -359,7 +422,7 @@ def test_the_contract_lists_the_publish_routes():
         assert path in contract
 
 
-def test_the_cli_publishes_with_api_and_workers(api, token, pushed_db, tmp_path):
+def test_the_cli_publishes_with_api_and_workers(api, token, pushed_db, bucket, tmp_path):
     """`claims release publish ... --api URL --workers 2`, as a server runs it."""
     import os
     import shutil
@@ -377,7 +440,8 @@ def test_the_cli_publishes_with_api_and_workers(api, token, pushed_db, tmp_path)
            "CLAIMS_TOKEN": token["access_token"], "XDG_CONFIG_HOME": str(tmp_path / "config")}
     base = [sys.executable, "-m", "claims_cli.main", "--db", str(tmp_path / "local.db"), "--index-dir",
             str(tmp_path / "index"), "release", "publish", str(col_dir), "0.5.0-cli"]
-    out = subprocess.run(base + ["--api", api, "--workers", "2"], cwd=ROOT, env=env, capture_output=True, text=True)
+    out = subprocess.run(base + ["--api", api, "--index-to", bucket, "--workers", "2"], cwd=ROOT, env=env,
+                         capture_output=True, text=True)
     assert out.returncode == 0, out.stderr + out.stdout
     assert f"publishing to {api}" in out.stdout and f"at {api}" in out.stdout and "recorded     2 datasets" in out.stdout
     con = service_db.connect(pushed_db)
@@ -387,17 +451,20 @@ def test_the_cli_publishes_with_api_and_workers(api, token, pushed_db, tmp_path)
     finally:
         con.close()
     assert not (tmp_path / "index" / "datasets").exists()  # nothing went into the local deployment
+    out = subprocess.run(base + ["--api", api], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert out.returncode != 0 and "--index-to" in out.stderr
 
     env.pop("CLAIMS_TOKEN")
-    out = subprocess.run(base + ["--api", api], cwd=ROOT, env=env, capture_output=True, text=True)
+    out = subprocess.run(base + ["--api", api, "--index-to", bucket], cwd=ROOT, env=env, capture_output=True, text=True)
     assert out.returncode != 0 and "not signed in" in out.stderr
-    out = subprocess.run(base + ["--api", "http://api.example.org"], cwd=ROOT, env=env, capture_output=True, text=True)
+    out = subprocess.run(base + ["--api", "http://api.example.org", "--index-to", bucket], cwd=ROOT, env=env,
+                         capture_output=True, text=True)
     assert out.returncode != 0 and "not an https URL" in out.stderr
 
 
 # --- review findings (2026-11-24) ---------------------------------------------------------
 
-def test_a_bundle_never_reads_outside_itself(api, token):
+def test_a_bundle_never_reads_outside_itself(api, token, bucket):
     import yaml
 
     col = load_collection(COLLECTION)
@@ -406,15 +473,15 @@ def test_a_bundle_never_reads_outside_itself(api, token):
     manifest["templates"] = ["../../../../../../../../etc/hosts"]
     sent = {k: v for k, v in files.items() if not k.startswith("templates/")}
     sent["collection.yaml"] = yaml.safe_dump(manifest)
-    r = _send(api, token, "POST", "1.0:begin", {"files": sent})
+    r = _send(api, token, "POST", "1.0:begin", {"files": sent, "index_location": bucket})
     assert r.status_code == 400 and "not sent" in r.json()["detail"] and "localhost" not in r.text
     before = set(publish_api._BUNDLE_DIR.iterdir())
     broken = {**files, "templates/gene.yaml": "not: [a template"}
-    assert _send(api, token, "POST", "1.0:begin", {"files": broken}).status_code == 400
+    assert _send(api, token, "POST", "1.0:begin", {"files": broken, "index_location": bucket}).status_code == 400
     assert set(publish_api._BUNDLE_DIR.iterdir()) == before  # nothing left behind
 
 
-def test_finish_stores_only_what_the_release_carries(api, token, tmp_path):
+def test_finish_stores_only_what_the_release_carries(api, token, bucket, tmp_path):
     spec = _spec(tmp_path, "0.6.0-objects", ("FIXOBJ", "FIXOBJ2"))
     col = load_collection(COLLECTION)
     sent = {}
@@ -425,7 +492,7 @@ def test_finish_stores_only_what_the_release_carries(api, token, tmp_path):
             raise PublishError("stopped before finishing")
 
     with pytest.raises(PublishError, match="stopped"):
-        publish(None, col, spec, tmp_path, target=Recording(api, token["access_token"], col, spec["version"]))
+        publish(None, col, spec, tmp_path, target=_target(api, token, col, spec["version"], bucket, Recording))
     _, release, document, _objects, *_ = sent["args"]
     provenance, code_version = sent["args"][6], sent["args"][10]
 
@@ -456,27 +523,27 @@ def test_finish_stores_only_what_the_release_carries(api, token, tmp_path):
     assert finish().status_code == 200
 
 
-def test_spans_must_quote_the_value(api, token, tmp_path):
-    bundle = _begin(api, token, "9.9.8-spans")
-    dataset_id, dataset, extract = _one_dataset(tmp_path, "FIXSPAN")
-    forged = json.loads(json.dumps(extract))
-    first = forged["rows"]["gene_phenotype"][0]
-    spans = json.loads(first["spans"])
-    metric = next(iter(spans))
-    spans[metric] = [spans[metric][0], 6, "1e-300"]
-    first["spans"] = idn.canonical(spans)
+def test_spans_must_quote_the_value(api, token, bucket, tmp_path):
+    bundle = _begin(api, token, bucket, "9.9.8-spans")
+    dataset_id, dataset, ds, vocab, extract = _one_dataset(tmp_path, "FIXSPAN")
+
+    def forged_span(rows, metrics, edges):
+        spans = json.loads(rows[0]["spans"])
+        metric = next(iter(spans))
+        spans[metric] = [spans[metric][0], 6, "1e-300"]
+        rows[0]["spans"] = idn.canonical(spans)
     r = _send(api, token, "PUT", f"9.9.8-spans/datasets/{dataset_id}",
-              {"bundle": bundle, "dataset": dataset, "extract": forged})
+              {"bundle": bundle, "dataset": dataset, "index": _index(tmp_path, bucket, ds, vocab, extract, forged_span)})
     assert r.status_code == 400 and "byte span" in r.json()["detail"]
 
 
-def test_object_collections_and_nan_are_refused(api, token, pushed_db):
+def test_object_collections_and_nan_are_refused(api, token, pushed_db, bucket):
     col = load_collection(COLLECTION)
     con = service_db.connect(pushed_db)
     try:
         with con:
             con.execute("INSERT INTO object_collections (collection_key, definition) VALUES ('pigean', '{}')")
-        r = _send(api, token, "POST", "1.0:begin", {"files": push.collection_files(col)})
+        r = _send(api, token, "POST", "1.0:begin", {"files": push.collection_files(col), "index_location": bucket})
         assert r.status_code == 409 and "object collection" in r.json()["detail"]
     finally:
         with con:
@@ -496,7 +563,7 @@ def test_a_dataset_being_stored_answers_busy_before_its_body(api, token):
     assert r.status_code == 503 and r.headers["retry-after"] == "30"
 
 
-def test_two_finishes_of_one_version_record_one_release(api, token, pushed_db, tmp_path):
+def test_two_finishes_of_one_version_record_one_release(api, token, pushed_db, bucket, tmp_path):
     spec = _spec(tmp_path, "0.7.0-race", ("FIXRACE", "FIXRACE2"))
     col = load_collection(COLLECTION)
     captured = []
@@ -507,11 +574,9 @@ def test_two_finishes_of_one_version_record_one_release(api, token, pushed_db, t
             raise PublishError("stopped")
 
     with pytest.raises(PublishError):
-        publish(None, col, spec, tmp_path, target=Recording(api, token["access_token"], col, spec["version"]))
+        publish(None, col, spec, tmp_path, target=_target(api, token, col, spec["version"], bucket, Recording))
     (args, bundle), = captured
     _, release, document, _o, *_ = args
-    from service.collections import publish as pub
-
     loaded = publish_api._bundle(service_db.connect(pushed_db), "pigean", bundle)
     bodies = []
     for code_version in ("aaaa", "bbbb"):
@@ -535,3 +600,30 @@ def test_two_finishes_of_one_version_record_one_release(api, token, pushed_db, t
         assert con.execute("SELECT 1 FROM collection_releases WHERE release_id = ?", (current,)).fetchone()
     finally:
         con.close()
+
+
+def test_an_index_changed_in_the_bucket_is_not_served(api, token, pushed_db, bucket, tmp_path):
+    """The service serves only the bytes recorded at publish: a file the owner rewrote afterwards is refused."""
+    import shutil
+
+    from service.collections import store as cstore
+
+    spec = _spec(tmp_path, "0.8.0-changed", ("FIXCHANGED", "FIXCHANGED2"))
+    _push(api, token, bucket, spec, tmp_path)
+    con = service_db.connect(pushed_db)
+    try:
+        locations = [r[0] for r in con.execute(
+            "SELECT location FROM dataset_indexes WHERE dataset_id IN (SELECT dataset_id FROM release_datasets d JOIN "
+            "collection_releases r ON r.release_id = d.release_id WHERE r.version = '0.8.0-changed')").fetchall()]
+    finally:
+        con.close()
+    cache = cstore.bucket_store().cache
+    shutil.rmtree(cache.root / "datasets", ignore_errors=True)
+    (cache.root / "datasets").mkdir()
+    assert len(locations) == 2
+    for location in locations:
+        rows = Path(location[len("file://"):]) / "rows.parquet"
+        rows.write_bytes(rows.read_bytes() + b"tampered")
+    r = TestClient(app).post(f"/v1/collections/pigean/queries/{QUERY}:run",
+                             json={"variables": {"trait": "FIXCHANGED", "library": "fixture-v1", "topGenes": 5}})
+    assert r.status_code >= 400 or "not the file recorded at publish" in r.text

@@ -89,7 +89,7 @@ def render_claim_full(con, rc) -> tuple[dict, dict]:
     result_claims (rendered again and checked against its id)."""
     if "_rendered" in rc:
         return rc["_rendered"][0][rc["claim_key"]], rc["_rendered"][1]
-    store = get_store(con)
+    store = get_store(con, [rc["dataset_id"]])
     ctx = mint_context(con, rc["activity_id"])
     if rc["row_id"] is not None:
         r = store.row(rc["dataset_id"], rc["row_id"])
@@ -111,7 +111,7 @@ def _objects(con, ctx, dataset_id, out, gene_sets) -> dict:
     """The data-plane objects a render references (stored when one of its claims is first served). A lazy
     store (Parquet) stores no gene sets at ingest, so the ones named here are rebuilt from the edges."""
     objects = {oid: doc for oid, (_, doc) in out.objects.items()}
-    if get_store(con).lazy_objects:
+    if get_store(con, [dataset_id]).lazy_objects:
         for gid in gene_sets:
             doc = rebuild_gene_set(con, ctx.minting, dataset_id, gid)
             if doc is not None:
@@ -209,7 +209,7 @@ def rebuild_gene_set(con, minting: dict, dataset_id: str, gene_set_id: str) -> d
     """A GeneSet document as the publisher minted it, rebuilt from the
     dataset's edges (members are the genes whose edges end at it). None
     unless the rebuilt document has exactly the id the claim names."""
-    store = get_store(con)
+    store = get_store(con, [dataset_id])
     role_files = {r["role"]: r["file_id"] for r in con.execute(
         "SELECT role, file_id FROM dataset_files WHERE dataset_id = ?", (dataset_id,)).fetchall()}
     for kind, spec in (minting.get("edge_kinds") or {}).items():
@@ -297,7 +297,6 @@ def describe(con, collection: str, release: str | None = None, *, first: int = 5
         from . import objects
 
         return objects.describe(con, collection, rel, record)
-    store = get_store(con)
     m = record["manifest"]
     releases = [{"id": r["release_id"], "version": r["version"], "published_at": str(r["published_at"]),
                  "git_commit": r["git_commit"]}
@@ -307,8 +306,11 @@ def describe(con, collection: str, release: str | None = None, *, first: int = 5
     datasets = []
     total = con.execute("SELECT COUNT(*) AS n FROM release_datasets WHERE release_id = ?",
                         (rel["release_id"],)).fetchone()["n"]
-    for d in con.execute("SELECT dataset_id FROM release_datasets WHERE release_id = ? ORDER BY dataset_id "
-                         "LIMIT ? OFFSET ?", (rel["release_id"], first, offset)).fetchall():
+    page = [d["dataset_id"] for d in con.execute("SELECT dataset_id FROM release_datasets WHERE release_id = ? "
+                                                  "ORDER BY dataset_id LIMIT ? OFFSET ?",
+                                                  (rel["release_id"], first, offset)).fetchall()]
+    store = get_store(con, page)
+    for d in ({"dataset_id": x} for x in page):
         dims = {r["dimension"]: {"value": r["value"], "label": r["label"]} for r in con.execute(
             "SELECT dimension, value, label FROM dataset_dimensions WHERE dataset_id = ?", (d["dataset_id"],))}
         files = {r["role"]: r["file_id"] for r in con.execute(
@@ -497,7 +499,6 @@ def run_plan(con, collection: str, qdoc: dict, bound: dict, *, release: str | No
     dims_cache: dict = {}
 
     # Anchor: filter, order and limit before any join.
-    store = get_store(con)
     a = qdoc["plan"][0]["anchor"]
     dims = {}
     for dim, raw in sorted((a.get("dimensions") or {}).items()):
@@ -505,6 +506,7 @@ def run_plan(con, collection: str, qdoc: dict, bound: dict, *, release: str | No
         if value is not None:
             dims[dim] = _resolve_value(con, manifest, dim, value, record.get("mappings"))
     dataset_ids = _datasets_matching(con, rel["release_id"], dims)
+    store = get_store(con, dataset_ids)
     direction = "ASC" if a["order"].get("dir") == "asc" else "DESC"
     subject = _bind(a.get("subject"), bound)
     subjects = None if subject is None else ([subject] if isinstance(subject, str) else list(subject))
