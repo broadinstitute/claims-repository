@@ -687,12 +687,12 @@ def resolve_proposition(_, info, id):
             sources[r["claim_id"]] = (family, r)
     for r in cserve.served_claims_for_proposition(con, id):
         sources[r["claim_id"]] = ("collection", r)
-    envelopes = [e for e in (envelope(con, cid, source=src) for cid, src in sorted(sources.items())) if e]
+    served = [e for e in envelopes(con, sorted(sources.items())) if e]
     return {
         "id": id,
         "proposition": payload,
         "triple": _triple_of(payload),
-        "claims": envelopes,
+        "claims": served,
     }
 
 
@@ -776,8 +776,7 @@ def resolve_row_metrics(row, info):
 
 @row_type.field("claim")
 def resolve_row_claim(row, info, key):
-    rc = crows.row_claims(_con(info), row).get(key)
-    return _collection_envelope(_con(info), rc["claim_id"], ("collection", rc)) if rc else None
+    return crows.row_envelope(_con(info), row, key, envelopes)
 
 
 @row_type.field("claimKeys")
@@ -792,8 +791,7 @@ def resolve_row_joined(row, info, via, kind, orderBy, first=10, where=None):
 
 @edge_type.field("claim")
 def resolve_edge_claim(edge, info, key):
-    rc = crows.edge_claims(_con(info), edge).get(key)
-    return _collection_envelope(_con(info), rc["claim_id"], ("collection", rc)) if rc else None
+    return crows.edge_envelope(_con(info), edge, key, envelopes)
 
 
 @edge_type.field("claimKeys")
