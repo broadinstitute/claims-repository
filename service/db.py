@@ -325,7 +325,16 @@ CREATE TABLE IF NOT EXISTS collection_releases (
   document TEXT NOT NULL,
   git_commit TEXT,
   published_at TEXT DEFAULT (datetime('now')),
+  published_by TEXT,
+  publisher_token_id TEXT,
   UNIQUE (collection_key, version)
+);
+CREATE TABLE IF NOT EXISTS publish_bundles (
+  bundle_sha256 TEXT PRIMARY KEY,
+  collection_key TEXT NOT NULL,
+  files TEXT NOT NULL,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS release_datasets (
   release_id TEXT NOT NULL,
@@ -602,6 +611,11 @@ def _connect_sqlite(path: str | None) -> Connection:
     if "collection_key" not in cols:
         raw.execute("ALTER TABLE deposits ADD COLUMN collection_key TEXT")
         raw.execute("ALTER TABLE deposits ADD COLUMN release_version TEXT")
+    # ... and for DBs created before a release recorded who pushed it (011).
+    cols = {r[1] for r in raw.execute("PRAGMA table_info(collection_releases)")}
+    if "published_by" not in cols:
+        raw.execute("ALTER TABLE collection_releases ADD COLUMN published_by TEXT")
+        raw.execute("ALTER TABLE collection_releases ADD COLUMN publisher_token_id TEXT")
     return Connection(raw, "sqlite")
 
 

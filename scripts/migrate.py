@@ -43,7 +43,9 @@ ALREADY_APPLIED = {1050, 1060, 1061}
 REQUIRED_COLUMNS = {
     # 006_collections.sql
     "collections": {"collection_key", "title", "current_release_id"},
-    "collection_releases": {"release_id", "collection_key", "version", "manifest", "document"},
+    "collection_releases": {"release_id", "collection_key", "version", "manifest", "document",
+                            "published_by", "publisher_token_id"},  # 011
+    "publish_bundles": {"bundle_sha256", "collection_key", "files", "created_by", "created_at"},  # 011
     "result_rows": {"row_id", "dataset_id", "kind", "subject_id", "subject_value", "row_json", "spans"},
     "mint_contexts": {"activity_id", "context"},
     "dapper_objects": {"id", "class_name", "payload", "times_seen", "last_seen_at"},
@@ -97,6 +99,8 @@ REQUIRED_PRIMARY_KEYS = {
     "deposit_edges": ["deposit_id", "seq"],
     # 009_object_text.sql
     "object_text": ["object_id", "field"],
+    # 011_publish_push.sql
+    "publish_bundles": ["bundle_sha256"],
 }
 
 

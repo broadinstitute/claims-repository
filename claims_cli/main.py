@@ -7,6 +7,7 @@
     claims collection validate <collection dir>
     claims release plan <collection dir> --version 2026.11.1 [--only IBD,HEIGHT]
     claims release publish <collection dir> 2026.11.1 [--first 25] [--workers 4]
+    claims release publish <collection dir> 2026.11.1 --api qa      (into a deployed service; needs claims login)
     claims release status <collection dir> 2026.11.1
     claims sources verify <collection dir> 2026.11.1
     claims query run pigean top-genes-with-sets --var trait=IBD --var topGenes=5
@@ -16,7 +17,9 @@
 Every command that touches a deployment needs --db (the control-plane SQLite
 file) and --index-dir (the Parquet index), or CLAIMS_DB and CLAIMS_INDEX_DIR.
 It refuses to run when CLAIMS_MYSQL_HOST is set: this CLI is for local stacks.
-`claims login` signs in to a deployed API instead (device code; docs/cli-login.md).
+`claims login` signs in to a deployed API instead (device code; docs/cli-login.md),
+and `release publish --api` publishes into one with that sign-in, reading the files
+here (docs/publishing-to-a-deployment.md).
 
 A collection directory holds the manifest (collection.yaml), templates,
 queries, and source.yaml, which says where the result files live:
@@ -894,16 +897,36 @@ def _publish_once(args, collection_dir: Path, shard: str | None) -> dict:
             print(f"[{time.time() - started:7.0f}s]{f' shard {shard}' if shard else ''} {phase}", flush=True)
 
     workdir = Path(args.workdir or tempfile.mkdtemp(prefix="claims-publish-"))
-    con = _connect()
+    target = con = None
     try:
+        if args.api:
+            from . import push
+
+            target = push.RemoteTarget(_publish_api(args), _publisher_token(args), col, args.version)
+        else:
+            con = _connect()
         result = publish(con, col, spec, base, allow_dirty=True, progress=progress, fetch=fetch, workdir=workdir,
                          max_ingest=args.first, on_hash=on_hash,
-                         shard=tuple(int(x) for x in shard.split("/")) if shard else None)
+                         shard=tuple(int(x) for x in shard.split("/")) if shard else None, target=target)
     except PublishError as exc:
         sys.exit(f"error: {exc}")
     finally:
-        con.close()
+        if con is not None:
+            con.close()
     return {"result": result, "seconds": time.time() - started}
+
+
+def _publish_api(args) -> str:
+    """The deployed service `--api` names (`qa` for QA): publishing to one is never a default."""
+    return auth.api_base(auth.QA if args.api == "qa" else args.api)
+
+
+def _publisher_token(args) -> str:
+    api = _publish_api(args)
+    token = auth.token_for(api)
+    if not token:
+        sys.exit(f"claims: not signed in to {api}. Run `claims login --api {api}` first.")
+    return token
 
 
 def cmd_release_publish(args):
@@ -913,6 +936,10 @@ def cmd_release_publish(args):
     if left and not args.allow_draft:
         sys.exit(f"{len(left)} TODO(s) left in {collection_dir} (`claims collection validate` lists them); claims "
                  "published now would carry them. Finish them, or pass --allow-draft for a test deployment.")
+    if args.api and not args.shard:
+        api = _publish_api(args)
+        _publisher_token(args)
+        print(f"publishing to {api} (the files are read here; the sha256 cache is {index})", flush=True)
     if args.shard:  # a worker started by --workers
         out = _publish_once(args, collection_dir, args.shard)
         print(json.dumps({"stats": out["result"].stats, "complete": out["result"].complete}))
@@ -923,7 +950,8 @@ def cmd_release_publish(args):
         for i in range(args.workers):
             cmd = [sys.executable, "-m", "claims_cli.main", "--db", str(db), "--index-dir", str(index),
                    "release", "publish", str(collection_dir), args.version, "--shard", f"{i}/{args.workers}",
-                   "--quiet", *(["--allow-draft"] if args.allow_draft else [])]
+                   "--quiet", *(["--allow-draft"] if args.allow_draft else []),
+                   *(["--api", args.api] if args.api else [])]
             if args.first:
                 cmd += ["--first", str(-(-args.first // args.workers))]
             procs.append(subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE, text=True))
@@ -944,12 +972,13 @@ def cmd_release_publish(args):
         print(f"not served yet: {s['datasets_ingested']} dataset(s) ingested in this run "
               f"({out['seconds']:.0f}s); {r.warnings[-1]}")
         return
-    print(f"recorded     {s['datasets']} datasets as {r.release_id} ({out['seconds']:.0f}s)")
+    print(f"recorded     {s['datasets']} datasets as {r.release_id} ({out['seconds']:.0f}s)"
+          + (f" at {_publish_api(args)}" if args.api else ""))
     for k in ("rows", "edges", "mint_contexts_recorded", "index_bytes"):
         if k in s:
             print(f"  {k}: {_fmt_bytes(s[k]) if k == 'index_bytes' else f'{s[k]:,}'}")
     for w in r.warnings:
-        if "uncommitted" not in w:
+        if args.api or "uncommitted" not in w:
             print(f"warning      {w}")
 
 
@@ -1156,6 +1185,8 @@ def main(argv=None):
     p.add_argument("--shard", help=argparse.SUPPRESS)
     p.add_argument("--workdir", help="where files are downloaded while their dataset is read (default: a temp dir)")
     p.add_argument("--allow-draft", action="store_true", help="publish even though TODOs are left")
+    p.add_argument("--api", help="publish into this deployed service instead (`qa`, or its base URL); needs "
+                   "`claims login` (docs/publishing-to-a-deployment.md)")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(func=cmd_release_publish)
     p = release.add_parser("status", help="how far a release has been published")

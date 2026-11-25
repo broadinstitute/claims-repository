@@ -2059,3 +2059,7 @@ from . import device_login as _device_login  # noqa: E402
 app.include_router(_admin.router)
 # CLI sign-in (device code) and publisher tokens: docs/cli-login.md.
 app.include_router(_device_login.router)
+# Publishing a release with a claims login token: docs/publishing-to-a-deployment.md.
+from . import publish_api as _publish_api  # noqa: E402
+
+app.include_router(_publish_api.router)

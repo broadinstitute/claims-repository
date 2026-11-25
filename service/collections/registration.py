@@ -8,7 +8,7 @@ files) must resolve, symlinks and `..` followed, inside one of the roots.
 
 `check` reads files and writes nothing: publish() runs as a dry run for the
 release id and version state, and sample claims are rendered with the
-ingester's own building blocks (dataset_entities, dataset_rows, row_inputs,
+ingester's own building blocks (read_dataset, assemble_entities, assemble_rows, row_inputs,
 mint_context_for), so a sample's id is the id a real publish records.
 `start_job` runs the real publish on a background thread with its own
 connection, one job at a time. Jobs are kept in this process's memory only
@@ -409,12 +409,13 @@ def _inspect_datasets(con, col: Collection, spec: dict, base: Path, allowed) -> 
 def _read_dataset(col: Collection, ds: dict, vocab, sample: int) -> dict:
     """Read every file of a dataset as the ingester would (so a bad row is
     reported now, not at publish), keeping the first `sample` rows per kind."""
-    ents, edges = pub.dataset_entities(col, ds, {}, vocab)
+    extract = pub.read_dataset(col, ds, vocab)
+    ents, edges = pub.assemble_entities(col, ds, extract, {})
     rows = {}
     for kind in col.doc["row_kinds"]:
         if col.role_for(kind) not in ds["files"]:
             continue
-        it = pub.dataset_rows(col, ds, ents, kind, vocab)
+        it = pub.assemble_rows(col, ds, ents, kind, extract, vocab)
         rows[kind] = list(islice(it, sample))
         for _ in it:  # validate the rest
             pass

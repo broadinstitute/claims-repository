@@ -49,6 +49,13 @@ tags:
       Sign-in for the claims CLI by device code (RFC 8628; docs/cli-login.md). The CLI starts a sign-in, an admin
       approves its user code in the admin console, and the CLI exchanges the device code, once, for a publisher token
       (clp_ followed by 43 characters, 30 days) that it sends as a Bearer token. Only SHA-256 hashes are stored.
+  - name: Publish
+    description: >-
+      Publishing a file-based collection's release into this service with a publisher token
+      (docs/publishing-to-a-deployment.md). The publishing machine reads and checks the result files and sends what
+      they hold, one dataset per request; the service computes every identifier, gene set, metric and mint context
+      itself and stores them as scripts/publish_collection.py does. Bodies are JSON, gzip-encoded or not (at most
+      16 MB as sent). Every request is idempotent; one that contradicts a recorded release is refused (409).
 security: []
 paths:
   /v1/health:
@@ -175,6 +182,77 @@ paths:
       responses:
         '200': { description: The token is revoked. }
         '401': { description: No valid publisher token. }
+  /v1/publish/{collection}/{version}:begin:
+    post:
+      operationId: beginPublish
+      tags: [Publish]
+      summary: Start or resume a push with the collection's files
+      description: >-
+        Body {files: {relative path: text}, prefix}: the manifest, templates, queries and vocabulary files, and the
+        collection directory's path in its git repository (it is part of the files' File records). Answers the
+        bundle digest the later requests name, the version's recorded release (if any) and the collection's current
+        release.
+      security: [{ PublisherToken: [] }]
+      parameters:
+        - { name: collection, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: The bundle digest and the version's state. }
+        '400': { description: The files are not a valid file-based collection named collection. }
+        '401': { description: No valid publisher token. }
+  /v1/publish/{collection}/{version}:check:
+    post:
+      operationId: checkPublish
+      tags: [Publish]
+      summary: Which datasets are stored and which mint contexts are recorded
+      description: Body {datasets, contexts}, at most 50,000 ids each. Answers {stored, recorded}.
+      security: [{ PublisherToken: [] }]
+      parameters:
+        - { name: collection, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: The ids that are stored or recorded. }
+        '401': { description: No valid publisher token. }
+  /v1/publish/{collection}/{version}/datasets/{dataset_id}:
+    put:
+      operationId: putPublishDataset
+      tags: [Publish]
+      summary: Store one dataset from what its result files hold
+      description: >-
+        Body {bundle, dataset: {raw_dimensions, files: {role: File record}, where, was_generated_by}, extract:
+        {edges: {kind: [[from value, to value]]}, rows: {kind: [{subject_value, object_value, row_json, spans}]}}}.
+        The Dataset record these values make must have the id dataset_id. Stored in one transaction with the
+        dataset's mint contexts; a dataset already stored has only its missing mint contexts recorded, and extract
+        may then be null.
+      security: [{ PublisherToken: [] }]
+      parameters:
+        - { name: collection, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+        - { name: dataset_id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 'The dataset''s counts: rows, edges, contexts, objects, already_stored.' }
+        '400': { description: The values do not make this dataset, or a row breaks the collection's rules. }
+        '401': { description: No valid publisher token. }
+        '409': { description: A result file is already stored as another dataset with the same dimensions. }
+        '413': { description: The body is too large. }
+  /v1/publish/{collection}/{version}:finish:
+    post:
+      operationId: finishPublish
+      tags: [Publish]
+      summary: Record the release and make it the collection's current release
+      description: >-
+        Body {bundle, release, document, objects, provenance, code_version}. Every member dataset must be stored
+        and its mint contexts recorded; the release's manifest, template and query files must be the bundle's and
+        its predecessor the collection's current release. The release records who published it.
+      security: [{ PublisherToken: [] }]
+      parameters:
+        - { name: collection, in: path, required: true, schema: { type: string } }
+        - { name: version, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: The release id, and already_recorded when this version was recorded before. }
+        '400': { description: The release is not what this push makes. }
+        '401': { description: No valid publisher token. }
+        '409': { description: The version is recorded with other content. }
   /v1/vocabulary:
     get:
       operationId: getVocabulary
