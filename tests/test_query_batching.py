@@ -100,3 +100,60 @@ def test_batched_serving_is_claim_by_claim_serving_for_any_collection(store, mon
     assert all(r["rows"] for r in batched), [len(r["rows"]) for r in batched]
     # One dataset, one edge kind: each query reads its gene sets at most once, whatever they are called.
     assert 1 <= reads <= len(QUERIES)
+
+
+GRAPHQL = """{
+  rows(collection: "variant", kind: "protein_score", first: 5, orderBy: {metric: "combined"},
+       dimensions: [{name: "trait", value: "FIXPHENO"}, {name: "library", value: "fixture-v1"}]) {
+    rows {
+      subject { id } claimKeys
+      claim(key: "measurement") { id timesDeposited evidence { item valueLocators } }
+      joined(via: "belongs_to", kind: "module_score", orderBy: {metric: "beta_uncorrected"}, first: 2) {
+        edge { to { id } claim(key: "roster") { id provenanceRefs { resolution } } }
+        row { subject { id } claim(key: "measurement") { id } }
+      }
+    }
+  }
+}"""
+
+
+@pytest.mark.parametrize("store", ["sql", "parquet"])
+def test_graphql_lists_are_served_in_batches_for_any_collection(store, monkeypatch, tmp_path):
+    """Row.claim, Row.joined and RowEdge.claim answer a whole list at once: the same response as claim by claim,
+    in a handful of database calls."""
+    col = load_collection(_variant(tmp_path))
+    spec, base = load_release(FIX / "pigean-fixture-release.yaml")
+    if store == "parquet":
+        monkeypatch.setenv("CLAIMS_INDEX_DIR", str(tmp_path / "index"))
+    first = str(tmp_path / "a.db")
+    con = service_db.connect(first)
+    try:
+        publish(con, col, spec, base)
+    finally:
+        con.close()
+    second = str(tmp_path / "b.db")
+    shutil.copyfile(first, second)
+    batched_envelopes = service_app.envelopes
+    calls = {"n": 0}
+    execute = service_db.Connection.execute
+
+    def counted(self, *args, **kwargs):
+        calls["n"] += 1
+        return execute(self, *args, **kwargs)
+    monkeypatch.setattr(service_db.Connection, "execute", counted)
+
+    def run(db_path, one_by_one):
+        monkeypatch.setattr(service_db, "DB_PATH", db_path)
+        monkeypatch.setattr(service_app, "envelopes", (lambda con, items: [batched_envelopes(con, [i])[0] for i in items])
+                            if one_by_one else batched_envelopes)
+        calls["n"] = 0
+        r = TestClient(app).post("/v1/graphql", json={"query": GRAPHQL})
+        assert r.status_code == 200 and "errors" not in r.json(), r.text
+        return _scrub(r.json()), calls["n"]
+
+    expected, slow = run(first, True)
+    got, fast = run(second, False)
+    assert got == expected
+    rows = got["data"]["rows"]["rows"]
+    assert rows and all(r["claim"] for r in rows) and any(j["edge"]["claim"] for r in rows for j in r["joined"])
+    assert fast < slow and fast <= 30, (fast, slow)

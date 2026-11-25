@@ -28,6 +28,7 @@ files. So the cost of a query is mostly how many calls it makes, not how much it
 
 | Date | Decision | Status |
 | --- | --- | --- |
+| 2026-11-25 | **GraphQL answers each list at once.** GraphQL applies a field's selection to every item of a list, so the first item of a list to ask for `joined(...)` or `claim(key)` answers it for the whole list. A join runs one store query per dataset for every row of the list, and all the joined rows share one batch. A claim key is served for every row or edge of the list in one `envelopes()` call. The `proposition` field serves its claims in one batch too. | Built (#15) |
 | 2026-11-25 | **Claims are served in one batch per response.** `serve._attach_claims` gathers every row and edge-group claim the response serves and calls `envelopes(con, items)` once. Claim rows, the stored-object check, propositions, scores, evidence, value locators and reference checks take about five queries for the whole response. `envelope()` is the one-claim case of the same code. | Built (#14) |
 | 2026-11-25 | **Edge groups are read up front.** Every edge group the response renders is read in two queries per dataset and edge kind (`store.groups`). That covers joined groups and rows whose subject is a minted entity such as a gene set, and is found from the release's manifest, not from names. The per-group path reads the same prefetch. | Built (#14) |
 | 2026-11-25 | **Stored records are read once per request.** A dataset's dimensions, files and mint contexts, and edge groups, are kept on the request's connection (`publish.request_memo`). They are immutable once stored, and nothing is kept between requests. | Built (#14) |
@@ -38,6 +39,10 @@ Effect on `top-genes-with-sets` (IBD, 10 genes, 3 sets each): 1,114 database cal
 became 13 and 5, with identical responses and stored claims. `gene-across-traits` went from 258 and 35 to
 14 and 9.
 
+GraphQL, `rows` for the top 10 IBD genes, each with its measurement claim and 3 joined gene sets with roster
+and measurement claims (70 claims): 325 database calls and 57 index queries became 19 and 5, with
+identical responses, assertion counters and stored claims.
+
 ### Rules that keep serving fast for any collection
 
 - No serving code issues a query per row, per claim or per edge group. Gather the ids, then read them with
@@ -46,6 +51,8 @@ became 13 and 5, with identical responses and stored claims. `gene-across-traits
 - Lookups of stored, immutable records go through `publish.request_memo` (`dataset_dimensions`,
   `dataset_role_files`, `group_info`, `serve._release_contexts`).
 - Which kinds and entities need what is read from the release's manifest, never from names or id prefixes.
+- GraphQL list fields answer the whole list the first time an item asks, keeping the answer on the list's
+  shared batch (`rows.row_envelope`, `rows.edge_envelope`, `rows.joined`); never per item.
 - A batching change must leave responses byte-identical. Compare the query responses of `main` and the
   branch over copies of one database, and extend `tests/test_query_batching.py` when a new path is batched.
 
@@ -73,5 +80,3 @@ The `claims` option already exists: a request may name the claim keys it wants (
   cache; the first query after that pays for the downloads (7.9 s against 4 s warm).
 - **One index file set per release.** For cross-dataset queries over many datasets: rows, metrics and edges
   of the whole release in a few files sorted by dataset and subject, instead of four files per dataset.
-- **GraphQL.** Its collection fields resolve one claim at a time (`app.py` resolvers calling
-  `_collection_envelope`); a per-request loader would give them the same batching as the REST query runner.
