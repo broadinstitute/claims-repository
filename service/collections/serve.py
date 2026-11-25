@@ -464,8 +464,7 @@ def _row_view(r, manifest, dims_cache, con):
     kind = manifest["row_kinds"][r["kind"]]
     row = json.loads(r["row_json"])
     if r["dataset_id"] not in dims_cache:
-        dims_cache[r["dataset_id"]] = {d["dimension"]: d["value"] for d in con.execute(
-            "SELECT dimension, value FROM dataset_dimensions WHERE dataset_id = ?", (r["dataset_id"],))}
+        dims_cache[r["dataset_id"]] = dict(dataset_dimensions(con, r["dataset_id"]))
     return {
         "kind": r["kind"],
         "dataset": {"id": r["dataset_id"], "dimensions": dims_cache[r["dataset_id"]]},
@@ -578,12 +577,19 @@ def _walk_rows(rows, qdoc):
                 yield item["row"]
 
 
-def _minted_edge_kinds(con, release_id) -> list[str]:
-    """The release's edge kinds whose `to` end is a minted entity (a gene set)."""
+def _minted_group_kinds(con, release_id) -> dict[str, list[str]]:
+    """{row kind: the edge kinds whose groups are its subjects}, for row kinds about a minted entity (one whose
+    documents are built from edge groups, such as a gene set from its member edges). Read from the release's
+    manifest, so it holds for any collection."""
     manifest = _json(con.execute("SELECT manifest FROM collection_releases WHERE release_id = ?",
                                  (release_id,)).fetchone()["manifest"])["manifest"]
-    return [k for k, spec in (manifest.get("edge_kinds") or {}).items()
-            if "mint" in (manifest.get("entities") or {}).get(spec["to"]["entity"], {})]
+    entities, edge_kinds = manifest.get("entities") or {}, manifest.get("edge_kinds") or {}
+    out = {}
+    for kind, rk in (manifest.get("row_kinds") or {}).items():
+        entity = rk["subject"].get("entity")
+        if "mint" in entities.get(entity, {}):
+            out[kind] = [k for k, spec in edge_kinds.items() if spec["to"]["entity"] == entity]
+    return out
 
 
 def _attach_claims(con, release_id, rows, qdoc, keys, envelope, dataset_ids=None):
@@ -599,12 +605,10 @@ def _attach_claims(con, release_id, rows, qdoc, keys, envelope, dataset_ids=None
             for item in row.get(step["join"]["as"], []):
                 e = item["edge"]
                 wanted_groups.setdefault((e["dataset_id"], e["kind"]), set()).add(e["to"]["id"])
-    minted_kinds = _minted_edge_kinds(con, release_id)
+    minted = _minted_group_kinds(con, release_id)
     for r in all_rows:
-        subject = (r.get("subject") or {}).get("id") or ""
-        if subject.startswith("dapper:GeneSet."):
-            for kind in minted_kinds:
-                wanted_groups.setdefault((r["dataset"]["id"], kind), set()).add(subject)
+        for kind in minted.get(r["kind"], []):
+            wanted_groups.setdefault((r["dataset"]["id"], kind), set()).add(r["subject"]["id"])
     for (dataset_id, kind), ids in sorted(wanted_groups.items()):
         prefetch_groups(con, dataset_id, kind, ids)
     by_row: dict[int, dict] = {}
