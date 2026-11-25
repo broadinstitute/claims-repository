@@ -88,16 +88,85 @@ def _git_info(path: Path) -> tuple[str | None, bool, str | None]:
         return None, False, None
 
 
-def _source_file_doc(src: SourceFile, description: str, mime_type: str = "application/yaml") -> dict:
-    _, _, rel = _git_info(src.path)
+def _source_file_doc(src: SourceFile, description: str, mime_type: str = "application/yaml",
+                     location: str | None = None) -> dict:
+    """A collection file's File record. Its location is the file's path in its git repository (`location`
+    gives it when there is no repository to ask, as on the API for a push), else its collection path."""
+    if location is None:
+        _, _, location = _git_info(src.path)
     return idn.mint("File", {
         "filename": src.path.name,
         "description": description,
         "mime_type": mime_type,
         "sha256": src.sha256,
         "size_in_bytes": len(src.data),
-        "location": rel or src.rel,
+        "location": location or src.rel,
     })
+
+
+def vocabulary_file_docs(col: Collection, prefix: str | None = None) -> list[dict]:
+    """The File records of the collection's mapping and cross-reference files (prefix: as collection_file_docs)."""
+    out = []
+    for block, dim, rel in vocabulary_files(col.doc):
+        path = (col.root / rel).resolve()
+        what = "mapping" if block == "mappings" else "cross-references"
+        location = None if prefix is None else (f"{prefix}/{rel}" if prefix else rel)
+        out.append(_source_file_doc(SourceFile(path=path, rel=rel, data=path.read_bytes(), doc={}),
+                                    f"{col.key} {what} for {dim}.", "text/tab-separated-values", location=location))
+    return out
+
+
+def publication_doc(col: Collection, version: str, code_version: str) -> dict:
+    """The Activity that publishes a release."""
+    return idn.mint("Activity", {
+        "name": f"Publish {col.key} {version}",
+        "description": (f"Built release {version} of the {col.key} collection from its manifest, "
+                        "checked each result file's sha256, and recorded the release."),
+        "activity_type": "ResultCollectionPublication",
+        "software_name": engine.SOFTWARE,
+        "software_version": engine.ENGINE_VERSION,
+        "code_version": code_version,
+    })
+
+
+def release_doc(col: Collection, version: str, members: list[str], publication_id: str, previous_id: str | None,
+                manifest_file: dict, template_files: dict, query_files: dict) -> dict:
+    """A release's ResultCollection record."""
+    doc = col.doc
+    return idn.mint("ResultCollection", {
+        "name": f"{doc['title']} {version}",
+        "collection_key": col.key,
+        "version": version,
+        "description": doc.get("description"),
+        "methods": doc["methods"],
+        "dataset_dimensions": [d["name"] for d in doc["dataset_dimensions"]],
+        "members": members,
+        "n_members": len(members),
+        "has_claim_template": [template_files[t.doc["template"]]["id"] for t in col.templates],
+        "has_query_template": [query_files[n]["id"] for n in col.queries] or None,
+        "has_manifest_file": manifest_file["id"],
+        "was_generated_by": publication_id,
+        "was_revision_of": previous_id,
+    })
+
+
+def repository_prefix(col: Collection) -> str:
+    """The collection directory's path in its git repository ("" when it is not in one): what a push sends so
+    the API computes the same File records for the collection's files (collection_file_docs)."""
+    _, _, rel = _git_info(col.manifest.path)
+    return rel.rsplit("/", 1)[0] if rel and "/" in rel else ""
+
+
+def collection_file_docs(col: Collection, prefix: str | None = None) -> tuple[dict, dict, dict]:
+    """The File records of a collection's manifest, its templates (by template name) and its queries (by
+    name). `prefix` is the collection directory's path in its repository (repository_prefix); None asks git."""
+    def doc(src: SourceFile, description: str) -> dict:
+        location = None if prefix is None else (f"{prefix}/{src.rel}" if prefix else src.rel)
+        return _source_file_doc(src, description, location=location)
+    return (doc(col.manifest, f"{col.key} collection manifest."),
+            {t.doc["template"]: doc(t, f"{col.key} claim template {t.doc['template']} v{t.doc['version']}.")
+             for t in col.templates},
+            {name: doc(q, f"{col.key} query template {name}.") for name, q in col.queries.items()})
 
 
 _PY_NONE = re.compile(rb'(?<=": )None(?=[,}])')
@@ -160,6 +229,37 @@ class _Entities:
         return self.libraries[lib]
 
 
+def result_file_doc(col: Collection, role: str, name: str, sha256: str, size: int, location: str) -> dict:
+    """The File record of one result file."""
+    role_spec = col.doc["file_roles"][role]
+    return idn.mint("File", {"filename": name, "description": role_spec.get("description"),
+                             "mime_type": role_spec.get("media_type"), "sha256": sha256, "size_in_bytes": size,
+                             "location": location})
+
+
+def _trait(dims: dict) -> str | None:
+    # DAPPER's trait slot takes a CURIE (e.g. a KPN.TRAIT id from the collection's
+    # mapping); an unmapped bare key stays only a dimension value.
+    return dims["trait"]["value"] if "trait" in dims and ":" in dims["trait"]["value"] else None
+
+
+def dataset_doc(col: Collection, dims: dict, files: dict, bounds: dict, run_id: str) -> dict:
+    """The Dataset record of one dataset: `dims` = {name: {value, label}}, `files` = {role: File record} in
+    role order, `bounds` as where_for gives them, `run_id` the Activity that wrote the files."""
+    doc = col.doc
+    names = [d["name"] for d in doc["dataset_dimensions"]]
+    label = ", ".join(f"{n}={dims[n]['label']}" for n in names)
+    return idn.mint("Dataset", {
+        "name": f"{doc['title']}: {label}",
+        "description": f"{doc['title']} for {label}." + (f" Holds only {where_text(bounds)}." if bounds else ""),
+        "trait": _trait(dims),
+        "has_file": [f["id"] for f in files.values()],
+        "dimension_values": [{"dimension": n, "dimension_value": dims[n]["value"]} for n in names],
+        "file_roles": [{"role": r, "file": f["id"]} for r, f in files.items()],
+        "was_generated_by": run_id,
+    })
+
+
 def where_for(col: Collection, spec: dict, ds: dict) -> dict:
     """{row kind: {metric: bound}} for one dataset: its own `where`, else the
     release's. Checked against the manifest's row kinds and metrics."""
@@ -209,7 +309,7 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
             fetch: Callable[[str, Path], None] | None = None, workdir: Path | None = None,
             max_ingest: int | None = None, shard: tuple[int, int] | None = None,
             on_hash: Callable[[str, str, int], None] | None = None,
-            provenance_fetch: Callable[[str], bytes] | None = None) -> Publication:
+            provenance_fetch: Callable[[str], bytes] | None = None, target=None) -> Publication:
     """Publish a release. `dry_run` computes the release id, its DAPPER
     document (less the mint-context Activities) and warnings, and returns
     before anything is written; a version already published with other
@@ -225,8 +325,13 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
     records the release. A file given by location WITHOUT a sha256 is
     hashed when its dataset is fetched (its dataset's id depends on it), and
     `on_hash(location, sha256, size)` is told, so a caller can remember it
-    for the next call; the release is recorded only once every file is known."""
+    for the next call; the release is recorded only once every file is known.
+
+    `target` is where the release goes: by default the service database `con`
+    opens (SqlTarget); a push to a deployed service passes its own (the CLI's
+    RemoteTarget), and `con` is then None."""
     step = progress or (lambda phase: None)
+    target = target or SqlTarget(con)
     doc = col.doc
     dims_spec = doc["dataset_dimensions"]
     dim_names = [d["name"] for d in dims_spec]
@@ -252,11 +357,9 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
         warnings.append(msg)
     code_version = f"{commit}{'-dirty' if dirty else ''}" if commit else "uncommitted"
 
-    manifest_file = keep("File", _source_file_doc(col.manifest, f"{col.key} collection manifest."))
-    template_files = {t.doc["template"]: keep("File", _source_file_doc(
-        t, f"{col.key} claim template {t.doc['template']} v{t.doc['version']}.")) for t in col.templates}
-    query_files = {name: keep("File", _source_file_doc(q, f"{col.key} query template {name}."))
-                   for name, q in col.queries.items()}
+    manifest_file, template_files, query_files = collection_file_docs(col)
+    for f in (manifest_file, *template_files.values(), *query_files.values()):
+        keep("File", f)
 
     # --- provenance --------------------------------------------------------
     from . import provenance as prov_mod
@@ -283,20 +386,11 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
         for role, f in sorted(ds["files"].items()):
             path, sha, size = facts[role]
             name = path.name if path is not None else f["location"].rstrip("/").rsplit("/", 1)[-1]
-            role_spec = doc["file_roles"][role]
-            files[role] = {"path": path, "name": name, "location": f.get("location"), "doc": keep("File", idn.mint("File", {
-                "filename": name,
-                "description": role_spec.get("description"),
-                "mime_type": role_spec.get("media_type"),
-                "sha256": sha,
-                "size_in_bytes": size,
-                "location": f.get("location") or name,
-            }))}
+            files[role] = {"path": path, "name": name, "location": f.get("location"), "doc": keep("File", result_file_doc(
+                col, role, name, sha, size, f.get("location") or name))}
         bounds = where_for(col, spec, ds)
         label = ", ".join(f"{n}={dims[n]['label']}" for n in dim_names)
-        # DAPPER's trait slot takes a CURIE (e.g. a KPN.TRAIT id from the collection's
-        # mapping); an unmapped bare key stays only a dimension value.
-        trait = dims["trait"]["value"] if "trait" in dims and ":" in dims["trait"]["value"] else None
+        trait = _trait(dims)
         # The run as the release describes it. It is part of the Dataset's identity, so it never depends on
         # provenance documents: adding or correcting provenance later re-addresses no dataset and re-reads no file.
         run = keep("Activity", idn.mint("Activity", {
@@ -314,15 +408,7 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
         for f in files.values():
             generated_edges.append({"subject": f["doc"]["id"], "predicate": "prov:wasGeneratedBy",
                                     "object": documented or run["id"]})
-        dataset = keep("Dataset", idn.mint("Dataset", {
-            "name": f"{doc['title']}: {label}",
-            "description": f"{doc['title']} for {label}." + (f" Holds only {where_text(bounds)}." if bounds else ""),
-            "trait": trait,
-            "has_file": [f["doc"]["id"] for f in files.values()],
-            "dimension_values": [{"dimension": n, "dimension_value": dims[n]["value"]} for n in dim_names],
-            "file_roles": [{"role": r, "file": f["doc"]["id"]} for r, f in files.items()],
-            "was_generated_by": run["id"],
-        }))
+        dataset = keep("Dataset", dataset_doc(col, dims, {r: f["doc"] for r, f in files.items()}, bounds, run["id"]))
         if documented:
             generated_edges.append({"subject": dataset["id"], "predicate": "prov:wasGeneratedBy", "object": documented})
         entry.update({"doc": dataset, "files": files, "where": bounds, "deferred": False, "run": documented})
@@ -366,54 +452,23 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
     if skipped:
         warnings.append(f"{len(skipped)} dataset(s) left out: their dimension values resolve through no mapping "
                         f"(`unmapped: skip`): {', '.join(sorted(skipped)[:5])}{', ...' if len(skipped) > 5 else ''}")
-    for block, dim, rel in vocabulary_files(doc):
-        path = (col.root / rel).resolve()
-        what = "mapping" if block == "mappings" else "cross-references"
-        vocab_file = keep("File", _source_file_doc(
-            SourceFile(path=path, rel=rel, data=path.read_bytes(), doc={}), f"{col.key} {what} for {dim}.",
-            "text/tab-separated-values"))
+    for vocab_file in vocabulary_file_docs(col):
+        keep("File", vocab_file)
         used_edges.append({"subject": "__publication__", "predicate": "prov:used", "object": vocab_file["id"]})
 
     # --- the release -----------------------------------------------------
     def build_release():
         """The release record and its DAPPER document, from every dataset."""
         # Re-publishing a version keeps the predecessor it was first published with.
-        existing = con.execute("SELECT release_id, document FROM collection_releases WHERE collection_key = ? "
-                               "AND version = ?", (col.key, spec["version"])).fetchone()
-        if existing:
-            previous_id = json.loads(existing["document"])["result_collections"][0].get("was_revision_of")
-        else:
-            current = con.execute("SELECT current_release_id FROM collections WHERE collection_key = ?",
-                                  (col.key,)).fetchone()
-            previous_id = current["current_release_id"] if current else None
-        publication = keep("Activity", idn.mint("Activity", {
-            "name": f"Publish {col.key} {spec['version']}",
-            "description": (f"Built release {spec['version']} of the {col.key} collection from its manifest, "
-                            "checked each result file's sha256, and recorded the release."),
-            "activity_type": "ResultCollectionPublication",
-            "software_name": engine.SOFTWARE,
-            "software_version": engine.ENGINE_VERSION,
-            "code_version": code_version,
-        }))
+        existing = target.existing_release(col.key, spec["version"])
+        previous_id = existing["was_revision_of"] if existing else target.current_release_id(col.key)
+        publication = keep("Activity", publication_doc(col, spec["version"], code_version))
         used_edges.append({"subject": publication["id"], "predicate": "prov:used", "object": manifest_file["id"]})
         for e in used_edges:
             if e["subject"] == "__publication__":
                 e["subject"] = publication["id"]
-        release = idn.mint("ResultCollection", {
-            "name": f"{doc['title']} {spec['version']}",
-            "collection_key": col.key,
-            "version": spec["version"],
-            "description": doc.get("description"),
-            "methods": doc["methods"],
-            "dataset_dimensions": dim_names,
-            "members": [d["doc"]["id"] for d in datasets],
-            "n_members": len(datasets),
-            "has_claim_template": [template_files[t.doc["template"]]["id"] for t in col.templates],
-            "has_query_template": [query_files[n]["id"] for n in col.queries] or None,
-            "has_manifest_file": manifest_file["id"],
-            "was_generated_by": publication["id"],
-            "was_revision_of": previous_id,
-        })
+        release = release_doc(col, spec["version"], [d["doc"]["id"] for d in datasets], publication["id"],
+                              previous_id, manifest_file, template_files, query_files)
         keep("ResultCollection", release)
         if existing and existing["release_id"] != release["id"] and not dry_run:
             raise PublishError(f"{col.key} {spec['version']} is already published as {existing['release_id']} "
@@ -457,8 +512,19 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
                                "previous_release_id": previous_id, "commit": commit, "dirty": dirty,
                                "code_version": code_version})
     minting, digest = col.minting_section(), col.minting_digest()
-    from .store import get_store
-    store = get_store(con)
+
+    def contexts_of(ds: dict) -> list:
+        out = []
+        for t in col.templates:
+            ctx = mint_context_for(col, t, template_files[t.doc["template"]]["id"], ds, minting, digest)
+            if ctx is not None:
+                out.append(ctx)
+                keep("Activity", ctx.activity)
+        return out
+    known = [d for d in datasets if not d["deferred"]]
+    for d in known:
+        d["contexts"] = contexts_of(d)
+    target.prefetch([d["doc"]["id"] for d in known], [c.activity["id"] for d in known for c in d["contexts"]])
     stats["objects"] = 0
     # One transaction per dataset: its rows, its claims' data plane and its
     # mint contexts land together or not at all, and memory holds one dataset.
@@ -474,15 +540,10 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
             for role, (path, _, _, _) in ds["prefetched"].items():
                 ds["files"][role]["path"] = path
         dataset_id = ds["doc"]["id"]
-        ds["contexts"] = []
-        for t in col.templates:
-            ctx = mint_context_for(col, t, template_files[t.doc["template"]]["id"], ds, minting, digest)
-            if ctx is not None:
-                ds["contexts"].append(ctx)
-                keep("Activity", ctx.activity)
-        ingest = not con.execute("SELECT 1 FROM dataset_files WHERE dataset_id = ? LIMIT 1", (dataset_id,)).fetchone()
-        pending = [ctx for ctx in ds["contexts"] if not con.execute(
-            "SELECT 1 FROM mint_contexts WHERE activity_id = ?", (ctx.activity["id"],)).fetchone()]
+        if "contexts" not in ds:
+            ds["contexts"] = contexts_of(ds)
+        ingest = not target.dataset_stored(dataset_id)
+        pending = [ctx for ctx in ds["contexts"] if not target.context_recorded(ctx.activity["id"])]
         if not ingest and not pending:
             continue
         if not ds.get("prefetched") and (not in_scope or
@@ -490,13 +551,13 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
             unfinished += 1   # another shard's, or past this call's limit
             continue
         if ingest:
-            _refuse_other_slice(con, ds)
+            target.refuse_other_slice(ds)
         fetched = _fetch_files(ds, fetch, workdir, f"dataset {n}") if ingest else []
         fetched += [v[3] for v in (ds.get("prefetched") or {}).values()]
-        if store.kind == "parquet":
+        if target.kind == "parquet":
             try:
                 step(f"Ingesting dataset {n} of {len(datasets)} into the Parquet index")
-                n_rows, n_edges = _ingest_parquet(con, col, ds, pending, vocab, store, ingest)
+                n_rows, n_edges = _ingest_parquet(target.con, col, ds, pending, vocab, target.store, ingest)
             finally:
                 _remove(fetched)
             stats["datasets_ingested"] += int(ingest)
@@ -505,31 +566,17 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
             stats["mint_contexts_recorded"] += len(pending)
             continue
         try:
-            for attempt in range(1, 4):
-                ds_objects: dict[str, tuple[str, dict]] = {}
-                n_rows = n_edges = 0
-                try:
-                    with con:
-                        if ingest:
-                            step(f"Ingesting dataset {n} of {len(datasets)}")
-                            n_rows, n_edges = _ingest_dataset(con, col, ds, ds_objects, vocab)
-                        for ctx in pending:
-                            _record_context(con, ctx)
-                        _store_objects(con, ds_objects)
-                    break
-                except Exception as exc:
-                    # Shards share a few rows (scores, the library record): a lock clash rolls this
-                    # dataset back whole, so it is simply tried again.
-                    if attempt == 3 or not any(code in str(exc) for code in ("1213", "1205", "Deadlock")):
-                        raise
-                    step(f"Lock clash on dataset {n}; retrying")
+            if ingest:
+                step(f"Ingesting dataset {n} of {len(datasets)}")
+            extract = read_dataset(col, ds, vocab) if ingest else None
         finally:
             _remove(fetched)
+        done = target.put_dataset(col, ds, vocab, extract, pending, step=lambda m: step(f"{m} on dataset {n}"))
         stats["datasets_ingested"] += int(ingest)
-        stats["rows"] += n_rows
-        stats["edges"] += n_edges
-        stats["mint_contexts_recorded"] += len(pending)
-        stats["objects"] += len(ds_objects)
+        stats["rows"] += done["rows"]
+        stats["edges"] += done["edges"]
+        stats["mint_contexts_recorded"] += done["contexts"]
+        stats["objects"] += done["objects"]
     if unfinished:
         warnings.append(f"{unfinished} of {len(datasets)} dataset(s) are not stored yet (outside this call's shard "
                         "or limit); the release is not recorded. Run again to continue.")
@@ -537,29 +584,12 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
                            document=document, stats=stats, warnings=warnings, complete=False)
     if release is None:
         release, document, existing, previous_id = build_release()
-    if store.kind == "parquet":
-        stats["index_bytes"] = store.size_bytes()
-    with con:
-        step("Storing objects")
-        _store_objects(con, objects)
-        step("Recording the release")
-        con.execute(
-            f"{con.dialect.insert_or_ignore} collection_releases "
-            "(release_id, collection_key, version, manifest, document, git_commit) VALUES (?, ?, ?, ?, ?, ?)",
-            (release["id"], col.key, spec["version"],
-             json.dumps({**_manifest_record(col, template_files, query_files), "provenance": prov.record(),
-                         "mappings": {dim: {k: list(v) for k, v in m.items()} for dim, m in vocab.mappings.items()},
-                         "vocabulary": vocab.entries}),
-             json.dumps(document), code_version),
-        )
-        con.executemany(f"{con.dialect.insert_or_ignore} release_datasets (release_id, dataset_id) VALUES (?, ?)",
-                        [(release["id"], d["doc"]["id"]) for d in datasets])
-        con.executemany(
-            f"{con.dialect.insert_or_ignore} release_mint_contexts (release_id, activity_id, dataset_id) VALUES (?, ?, ?)",
-            [(release["id"], ctx.activity["id"], d["doc"]["id"]) for d in datasets for ctx in d["contexts"]])
-        con.execute(
-            f"{con.dialect.insert_or_replace} collections (collection_key, title, description, current_release_id) "
-            "VALUES (?, ?, ?, ?)", (col.key, doc["title"], doc.get("description"), release["id"]))
+    if target.kind == "parquet":
+        stats["index_bytes"] = target.store.size_bytes()
+    step("Recording the release")
+    target.record_release(col, release, document, objects, [d["doc"]["id"] for d in datasets],
+                          [(ctx.activity["id"], d["doc"]["id"]) for d in datasets for ctx in d["contexts"]],
+                          prov.record(), vocab, template_files, query_files, code_version)
     if vocab.unresolved:
         warnings.append(_unresolved_warning(vocab))
     stats["objects"] += len(objects)
@@ -682,11 +712,66 @@ def _check_dimension_columns(col, role, row, ds, vocab, where):
                                f"{ds['dims'][dim]['raw']!r}; is this file in the right dataset?")
 
 
-def dataset_entities(col: Collection, ds: dict, objects: dict, vocab) -> tuple[_Entities, dict]:
-    """Read a dataset's edge files and mint its entities: (entities, edges by
-    kind as {(from value, to value): (from id, from value, to value)}).
-    Minted entities (gene sets) take their members from the whole edge file,
-    so their ids are known only after every edge has been read."""
+def read_dataset(col: Collection, ds: dict, vocab) -> dict:
+    """What a dataset's result files hold, checked line by line: the values a
+    dataset is built from, and all that a push to a deployed service sends.
+
+        {"edges": {kind: [[from value, to value], ...]},
+         "rows":  {kind: [{"subject_value", "object_value", "row_json", "spans"}, ...]}}
+
+    Rows below the release's bounds are left out. Edges are kept whole: which
+    of them survive the bounds is decided when entities are minted
+    (assemble_entities), from the rows."""
+    doc = col.doc
+    edges: dict[str, list] = {}
+    for kind, spec in (doc.get("edge_kinds") or {}).items():
+        role = col.role_for(kind)
+        if role not in ds["files"]:
+            continue
+        f = ds["files"][role]
+        pairs: dict[tuple, None] = {}
+        for n, (row, _, _) in enumerate(_ndjson(f["path"], python_none=True), 1):
+            _check_dimension_columns(col, role, row, ds, vocab, f"{f['path'].name} line {n}")
+            pairs[(str(row[spec["from"]["column"]]), str(row[spec["to"]["column"]]))] = None
+        edges[kind] = [list(p) for p in pairs]
+    rows = {}
+    for kind, rk in doc["row_kinds"].items():
+        role = col.role_for(kind)
+        if role not in ds["files"]:
+            continue
+        f = ds["files"][role]
+        bounds = (ds.get("where") or {}).get(kind)
+        out, seen = [], set()
+        for n, (row, line, offset) in enumerate(_ndjson(f["path"]), 1):
+            where = f"{f['path'].name} line {n}"
+            _check_dimension_columns(col, role, row, ds, vocab, where)
+            if not _kept(row, bounds):
+                continue
+            subject_value = str(row[rk["subject"]["column"]])
+            if subject_value in seen:
+                raise PublishError(f"{where}: {subject_value!r} appears twice in {f['path'].name}")
+            seen.add(subject_value)
+            spans = {}
+            for m in rk["metrics"]:
+                located = engine.locate(line, m)
+                if located is None or m not in row:
+                    raise PublishError(f"{where}: metric {m!r} is missing")
+                start, length, text = located
+                spans[m] = [offset + start, length, text]
+                idn.num(row[m])  # refuse non-finite values at ingest, not at serve
+            out.append({"subject_value": subject_value,
+                        "object_value": str(row[rk["object"]["column"]]) if "column" in rk["object"] else "",
+                        "row_json": idn.canonical(row), "spans": idn.canonical(spans)})
+        rows[kind] = out
+    return {"edges": edges, "rows": rows}
+
+
+def assemble_entities(col: Collection, ds: dict, extract: dict, objects: dict) -> tuple[_Entities, dict]:
+    """Mint a dataset's entities from what its files hold (read_dataset):
+    (entities, edges by kind as {(from value, to value): (from id, from value,
+    to value)}). Minted entities (gene sets) take their members from the whole
+    edge file, so their ids are known only after every edge has been seen.
+    Every id is computed here, never taken from the extract."""
     doc = col.doc
     ents = _Entities(col, ds["dims"])
     edge_kinds = doc.get("edge_kinds") or {}
@@ -694,22 +779,22 @@ def dataset_entities(col: Collection, ds: dict, objects: dict, vocab) -> tuple[_
     # Edges first: minted entities (gene sets) take their members from them.
     edges: dict[str, dict[tuple, tuple]] = {}
     members: dict[str, dict[str, set]] = {}     # minted entity type -> value -> member ids
-    for kind, spec in edge_kinds.items():
-        role = col.role_for(kind)
-        if role not in ds["files"]:
-            continue
-        f = ds["files"][role]
+    for kind, pairs in (extract.get("edges") or {}).items():
+        spec = edge_kinds.get(kind)
+        if spec is None or col.role_for(kind) not in ds["files"]:
+            raise PublishError(f"edges of kind {kind!r}: not an edge kind this dataset's files yield")
+        if "mint" in ents.spec(spec["from"]["entity"]):
+            raise PublishError(f"edge kind {kind}: a minted entity can only be an edge's `to` end")
+        to_entity = spec["to"]["entity"]
+        collects = "mint" in ents.spec(to_entity) and ents.spec(to_entity)["members_from"] == kind
         rows = edges.setdefault(kind, {})
-        for n, (row, _, _) in enumerate(_ndjson(f["path"], python_none=True), 1):
-            where = f"{f['path'].name} line {n}"
-            _check_dimension_columns(col, role, row, ds, vocab, where)
-            from_value, to_value = str(row[spec["from"]["column"]]), str(row[spec["to"]["column"]])
-            if "mint" in ents.spec(spec["from"]["entity"]):
-                raise PublishError(f"edge kind {kind}: a minted entity can only be an edge's `to` end")
+        for pair in pairs:
+            if not (isinstance(pair, (list, tuple)) and len(pair) == 2 and all(isinstance(v, str) for v in pair)):
+                raise PublishError(f"edges of kind {kind!r}: each edge is [from value, to value]")
+            from_value, to_value = pair
             from_id, _ = ents.ident(spec["from"]["entity"], from_value)
             rows[(from_value, to_value)] = (from_id, from_value, to_value)
-            to_entity = spec["to"]["entity"]
-            if "mint" in ents.spec(to_entity) and ents.spec(to_entity)["members_from"] == kind:
+            if collects:
                 members.setdefault(to_entity, {}).setdefault(to_value, set()).add(from_id)
 
     # Minted entities: every value seen as an edge end or a row subject.
@@ -718,12 +803,9 @@ def dataset_entities(col: Collection, ds: dict, objects: dict, vocab) -> tuple[_
             continue
         row_values, bounded = set(), False
         for kind, rk in doc["row_kinds"].items():
-            role = col.role_for(kind)
-            if rk["subject"]["entity"] == entity and role in ds["files"]:
-                bounds = (ds.get("where") or {}).get(kind)
-                bounded = bounded or bool(bounds)
-                row_values.update(str(r[rk["subject"]["column"]]) for r, _, _ in _ndjson(ds["files"][role]["path"])
-                                  if _kept(r, bounds))
+            if rk["subject"]["entity"] == entity and col.role_for(kind) in ds["files"]:
+                bounded = bounded or bool((ds.get("where") or {}).get(kind))
+                row_values.update(r["subject_value"] for r in (extract.get("rows") or {}).get(kind) or [])
         if bounded:
             # Under bounds an entity exists only for a kept row: not for one seen only as an
             # edge end, and no edge ends at a dropped one. A kept entity keeps its whole roster.
@@ -746,48 +828,73 @@ def dataset_entities(col: Collection, ds: dict, objects: dict, vocab) -> tuple[_
     return ents, edges
 
 
-def dataset_rows(col: Collection, ds: dict, ents: _Entities, kind: str, vocab):
-    """(subject value, result_rows column values) per row of one row kind,
-    in file order, checked as the ingester checks them."""
+def assemble_rows(col: Collection, ds: dict, ents: _Entities, kind: str, extract: dict, vocab):
+    """The result_rows column values of one row kind, from what its file holds
+    (read_dataset): identifiers and labels computed here, and each row's values
+    checked again (its dimension columns, the release's bounds, every metric a
+    finite number with a byte span), so rows that did not come from read_dataset
+    on this machine are held to the same rules."""
     rk = col.doc["row_kinds"][kind]
     role = col.role_for(kind)
+    if role not in ds["files"]:
+        raise PublishError(f"rows of kind {kind!r}: this dataset has no {role} file")
     f = ds["files"][role]
     bounds = (ds.get("where") or {}).get(kind)
     seen = set()
-    for n, (row, line, offset) in enumerate(_ndjson(f["path"]), 1):
-        where = f"{f['path'].name} line {n}"
+    for n, r in enumerate((extract.get("rows") or {}).get(kind) or [], 1):
+        where = f"{f['name']} row {n}"
+        try:
+            row, spans = json.loads(r["row_json"]), json.loads(r["spans"])
+            subject_value, object_value = r["subject_value"], r["object_value"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PublishError(f"{where}: not a row as read_dataset writes it ({exc})") from exc
+        if not (isinstance(row, dict) and isinstance(spans, dict) and idn.canonical(row) == r["row_json"]
+                and isinstance(subject_value, str) and isinstance(object_value, str)
+                and subject_value == str(row.get(rk["subject"]["column"]))
+                and object_value == (str(row.get(rk["object"]["column"])) if "column" in rk["object"] else "")):
+            raise PublishError(f"{where}: its values do not match its row")
         _check_dimension_columns(col, role, row, ds, vocab, where)
         if not _kept(row, bounds):
-            continue
-        subject_value = str(row[rk["subject"]["column"]])
+            raise PublishError(f"{where}: below the release's bounds")
+        for m in rk["metrics"]:
+            span = spans.get(m)
+            if m not in row or not (isinstance(span, list) and len(span) == 3):
+                raise PublishError(f"{where}: metric {m!r} is missing")
+            try:
+                value = idn.num(row[m])
+            except (TypeError, ValueError) as exc:
+                raise PublishError(f"{where}: metric {m!r} is not a finite number") from exc
+            start, length, text = span
+            # The span is what a claim quotes as the file's own bytes: it must be this value's text.
+            try:
+                quoted = idn.num(json.loads(text)) if isinstance(text, str) else None
+            except (TypeError, ValueError):
+                quoted = None
+            if not (type(start) is int and type(length) is int and start >= 0 and isinstance(text, str)
+                    and length == len(text.encode()) and quoted == value):
+                raise PublishError(f"{where}: the byte span of {m!r} is not the text of its value")
         subject_id, subject_label = ents.ident(rk["subject"]["entity"], subject_value)
         if subject_id in seen:
-            raise PublishError(f"{where}: {subject_value!r} appears twice in {f['path'].name}")
+            raise PublishError(f"{where}: {subject_value!r} appears twice in {f['name']}")
         seen.add(subject_id)
-        object_value = str(row[rk["object"]["column"]]) if "column" in rk["object"] else ""
         object_id, object_label = ents.ident(rk["object"]["entity"], object_value)
-        spans = {}
-        for m in rk["metrics"]:
-            located = engine.locate(line, m)
-            if located is None or m not in row:
-                raise PublishError(f"{where}: metric {m!r} is missing")
-            start, length, text = located
-            spans[m] = [offset + start, length, text]
-            idn.num(row[m])  # refuse non-finite values at ingest, not at serve
         yield {"subject_id": subject_id, "subject_value": subject_value, "subject_label": subject_label,
                "object_id": object_id, "object_label": object_label, "file_id": f["doc"]["id"],
-               "row_json": idn.canonical(row), "spans": idn.canonical(spans)}
+               "row_json": r["row_json"], "spans": r["spans"]}
 
 
 ROW_COLUMNS = ("subject_id", "subject_value", "subject_label", "object_id", "object_label", "file_id",
                "row_json", "spans")
 
 
-def _ingest_dataset(con, col: Collection, ds: dict, objects: dict, vocab) -> tuple[int, int]:
+def store_dataset(con, col: Collection, ds: dict, extract: dict, objects: dict, vocab) -> tuple[int, int]:
+    """Store one dataset in the service database (SQL store) from what its
+    files hold: rows, metrics, edges, dimensions and files, in the caller's
+    transaction. Its gene sets go into `objects` for the caller to store."""
     doc = col.doc
     dataset_id = ds["doc"]["id"]
     edge_kinds = doc.get("edge_kinds") or {}
-    ents, edges = dataset_entities(col, ds, objects, vocab)
+    ents, edges = assemble_entities(col, ds, extract, objects)
 
     edge_rows = []
     for kind, pairs in edges.items():
@@ -796,13 +903,16 @@ def _ingest_dataset(con, col: Collection, ds: dict, objects: dict, vocab) -> tup
             to_id, _ = ents.ident(spec["to"]["entity"], to_value)
             edge_rows.append((dataset_id, kind, from_id, to_id, from_value, to_value))
 
+    unknown = sorted(set(extract.get("rows") or {}) - set(doc["row_kinds"]))
+    if unknown:
+        raise PublishError(f"rows of unknown kind(s) {unknown}")
     n_rows = 0
     for kind, rk in doc["row_kinds"].items():
         role = col.role_for(kind)
         if role not in ds["files"]:
             continue
         batch_rows = [(dataset_id, kind, *(r[c] for c in ROW_COLUMNS))
-                      for r in dataset_rows(col, ds, ents, kind, vocab)]
+                      for r in assemble_rows(col, ds, ents, kind, extract, vocab)]
         batch_metrics = []
         con.executemany(
             "INSERT INTO result_rows (dataset_id, kind, subject_id, subject_value, subject_label, object_id, "
@@ -853,7 +963,7 @@ def group_inputs(con, minting: dict, dataset_id: str, kind: str, group_id: str,
     from .store import get_store
 
     spec = minting["edge_kinds"][kind]
-    label, count = found if found is not None else get_store(con).group(dataset_id, kind, group_id)
+    label, count = found if found is not None else get_store(con, [dataset_id]).group(dataset_id, kind, group_id)
     entity = minting["entities"][spec["to"]["entity"]]
     parent = ""
     if "library_dimension" in entity:
@@ -870,6 +980,101 @@ def _record_context(con, ctx: engine.MintContext) -> None:
                 (ctx.activity["id"], ctx.template_file_id, ctx.result_file_id, json.dumps(ctx.as_record())))
 
 
+# Where a release goes ------------------------------------------------------
+
+class SqlTarget:
+    """The service database `con` opened, SQLite or MySQL: where
+    scripts/publish_collection.py and the CLI's local deployment publish, and
+    what the API stores a pushed release through (service/publish_api.py), so
+    a pushed release and a directly published one are the same rows.
+    `published_by` and `token_id` name the publisher of a push."""
+
+    def __init__(self, con, published_by: str | None = None, token_id: str | None = None):
+        from .store import get_store
+
+        self.con, self.published_by, self.token_id = con, published_by, token_id
+        self.store = get_store(con)
+        self.kind = self.store.kind  # "sql", or "parquet" for a local deployment
+
+    def existing_release(self, key: str, version: str) -> dict | None:
+        """The version's recorded release: {release_id, was_revision_of}, or None."""
+        row = self.con.execute("SELECT release_id, document FROM collection_releases WHERE collection_key = ? "
+                               "AND version = ?", (key, version)).fetchone()
+        if row is None:
+            return None
+        return {"release_id": row["release_id"],
+                "was_revision_of": json.loads(row["document"])["result_collections"][0].get("was_revision_of")}
+
+    def current_release_id(self, key: str) -> str | None:
+        row = self.con.execute("SELECT current_release_id FROM collections WHERE collection_key = ?",
+                               (key,)).fetchone()
+        return row["current_release_id"] if row else None
+
+    def prefetch(self, dataset_ids: list[str], activity_ids: list[str]) -> None:
+        """A remote target asks about these in one request; the database is asked one at a time."""
+
+    def dataset_stored(self, dataset_id: str) -> bool:
+        return bool(self.con.execute("SELECT 1 FROM dataset_files WHERE dataset_id = ? LIMIT 1",
+                                     (dataset_id,)).fetchone())
+
+    def context_recorded(self, activity_id: str) -> bool:
+        return bool(self.con.execute("SELECT 1 FROM mint_contexts WHERE activity_id = ?", (activity_id,)).fetchone())
+
+    def refuse_other_slice(self, ds: dict) -> None:
+        _refuse_other_slice(self.con, ds)
+
+    def put_dataset(self, col: Collection, ds: dict, vocab, extract: dict | None, pending: list,
+                    step: Callable[[str], None] | None = None, on_store: Callable | None = None) -> dict:
+        """Store a dataset from what its files hold (None when it is stored already) and record its pending
+        mint contexts, in one transaction; `on_store(con)` runs in it when the dataset is stored."""
+        con = self.con
+        for attempt in range(1, 4):
+            objects: dict[str, tuple[str, dict]] = {}
+            n_rows = n_edges = 0
+            try:
+                with con:
+                    if extract is not None:
+                        n_rows, n_edges = store_dataset(con, col, ds, extract, objects, vocab)
+                        if on_store:
+                            on_store(con)
+                    for ctx in pending:
+                        _record_context(con, ctx)
+                    _store_objects(con, objects)
+                break
+            except Exception as exc:
+                # Shards share a few rows (scores, the library record): a lock clash rolls this
+                # dataset back whole, so it is simply tried again.
+                if attempt == 3 or not any(code in str(exc) for code in ("1213", "1205", "Deadlock")):
+                    raise
+                if step:
+                    step("Lock clash; retrying")
+        return {"rows": n_rows, "edges": n_edges, "contexts": len(pending), "objects": len(objects)}
+
+    def record_release(self, col: Collection, release: dict, document: dict, objects: dict, dataset_ids: list[str],
+                       contexts: list[tuple[str, str]], provenance: list, vocab, template_files: dict,
+                       query_files: dict, code_version: str) -> None:
+        """Store the release's objects and record it as the collection's current release, in one transaction.
+        `contexts` = [(mint context activity id, dataset id)]."""
+        con = self.con
+        manifest = {**_manifest_record(col, template_files, query_files), "provenance": provenance,
+                    "mappings": {dim: {k: list(v) for k, v in m.items()} for dim, m in vocab.mappings.items()},
+                    "vocabulary": vocab.entries}
+        with con:
+            _store_objects(con, objects)
+            con.execute(
+                f"{con.dialect.insert_or_ignore} collection_releases (release_id, collection_key, version, manifest, "
+                "document, git_commit, published_by, publisher_token_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (release["id"], col.key, release["version"], json.dumps(manifest), json.dumps(document),
+                 code_version, self.published_by, self.token_id))
+            con.executemany(f"{con.dialect.insert_or_ignore} release_datasets (release_id, dataset_id) VALUES (?, ?)",
+                            [(release["id"], d) for d in dataset_ids])
+            con.executemany(f"{con.dialect.insert_or_ignore} release_mint_contexts (release_id, activity_id, "
+                            "dataset_id) VALUES (?, ?, ?)", [(release["id"], a, d) for a, d in contexts])
+            con.execute(
+                f"{con.dialect.insert_or_replace} collections (collection_key, title, description, current_release_id) "
+                "VALUES (?, ?, ?, ?)", (col.key, col.doc["title"], col.doc.get("description"), release["id"]))
+
+
 # Parquet ingest ------------------------------------------------------------
 
 # Stored when the dataset is ingested even with a lazy store: small, and what
@@ -877,44 +1082,114 @@ def _record_context(con, ctx: engine.MintContext) -> None:
 EAGER_CLASSES = {"File", "Activity", "Dataset", "ResultCollection", "GeneSetCollection"}
 
 
+def parquet_dataset(col: Collection, ds: dict, extract: dict, objects: dict, vocab) -> tuple[list, list, list]:
+    """A dataset's Parquet index content from what its files hold (read_dataset): (rows, metrics, edges), every
+    identifier computed here. `objects` receives the entities it mints (the gene-set library, gene sets)."""
+    from .store import stable_row_id
+
+    doc = col.doc
+    dataset_id = ds["doc"]["id"]
+    rows, metrics, edge_rows = [], [], []
+    ents, edges = assemble_entities(col, ds, extract, objects)
+    for kind, pairs in edges.items():
+        spec = doc["edge_kinds"][kind]
+        for (from_value, to_value), (from_id, _, _) in sorted(pairs.items()):
+            to_id, _ = ents.ident(spec["to"]["entity"], to_value)
+            edge_rows.append((dataset_id, kind, from_id, to_id, from_value, to_value))
+    unknown = sorted(set(extract.get("rows") or {}) - set(doc["row_kinds"]))
+    if unknown:
+        raise PublishError(f"rows of unknown kind(s) {unknown}")
+    for kind, rk in doc["row_kinds"].items():
+        if col.role_for(kind) not in ds["files"]:
+            continue
+        for r in assemble_rows(col, ds, ents, kind, extract, vocab):
+            row = {**r, "dataset_id": dataset_id, "kind": kind,
+                   "row_id": stable_row_id(dataset_id, kind, r["subject_id"])}
+            rows.append(row)
+            values = json.loads(row["row_json"])
+            metrics.extend((row["row_id"], m, idn.num(values[m])) for m in rk["metrics"])
+    return rows, metrics, edge_rows
+
+
+def record_index_dataset(con, ds: dict, pending: list, objects: dict, stored: bool) -> None:
+    """A Parquet-indexed dataset's control rows, in the caller's transaction: dimensions and files (when it is
+    stored now), pending mint contexts, and the eagerly stored objects (gene sets are rebuilt when served)."""
+    dataset_id = ds["doc"]["id"]
+    if stored:
+        con.executemany("INSERT INTO dataset_dimensions (dataset_id, dimension, value, label) VALUES (?, ?, ?, ?)",
+                        [(dataset_id, n, d["value"], d["label"]) for n, d in ds["dims"].items()])
+        con.executemany("INSERT INTO dataset_files (dataset_id, role, file_id) VALUES (?, ?, ?)",
+                        [(dataset_id, role, f["doc"]["id"]) for role, f in ds["files"].items()])
+    for ctx in pending:
+        _record_context(con, ctx)
+    _store_objects(con, {oid: v for oid, v in objects.items() if v[0] in EAGER_CLASSES})
+
+
+def read_parquet_extract(col: Collection, directory: Path) -> tuple[dict, list, list, list]:
+    """What a dataset's Parquet index says its files hold (the values a push is checked by), and the index's
+    own (rows, metrics, edges) as tuples, read with DuckDB."""
+    import duckdb
+
+    db = duckdb.connect()
+    try:
+        rows = [dict(zip(("row_id", "dataset_id", "kind", "subject_id", "subject_value", "subject_label", "object_id",
+                          "object_label", "file_id", "row_json", "spans"), r)) for r in db.execute(
+            "SELECT row_id, dataset_id, kind, subject_id, subject_value, subject_label, object_id, object_label, "
+            "file_id, row_json, spans FROM read_parquet(?)", [str(directory / "rows.parquet")]).fetchall()]
+        metrics = db.execute("SELECT row_id, metric, value FROM read_parquet(?)",
+                             [str(directory / "metrics.parquet")]).fetchall()
+        edges = db.execute("SELECT dataset_id, kind, from_id, to_id, from_value, to_value FROM read_parquet(?)",
+                           [str(directory / "edges.parquet")]).fetchall()
+    finally:
+        db.close()
+    extract: dict = {"edges": {}, "rows": {}}
+    for e in edges:
+        extract["edges"].setdefault(e[1], []).append([e[4], e[5]])
+    for r in rows:
+        rk = col.doc["row_kinds"].get(r["kind"])
+        if rk is None:
+            raise PublishError(f"the index holds rows of unknown kind {r['kind']!r}")
+        values = json.loads(r["row_json"])
+        extract["rows"].setdefault(r["kind"], []).append({
+            "subject_value": r["subject_value"],
+            "object_value": str(values.get(rk["object"]["column"])) if "column" in rk["object"] else "",
+            "row_json": r["row_json"], "spans": r["spans"]})
+    return extract, rows, metrics, edges
+
+
+def verify_parquet_dataset(col: Collection, ds: dict, vocab, directory: Path, objects: dict) -> dict:
+    """Check a pushed dataset's Parquet index against what its values make: every identifier, label, metric
+    and edge is computed again here and must be exactly what the index holds. Its counts."""
+    extract, rows, metrics, edges = read_parquet_extract(col, directory)
+    want_rows, want_metrics, want_edges = parquet_dataset(col, ds, extract, objects, vocab)
+    key = lambda r: tuple(r[f] for f in ("row_id", "dataset_id", "kind", "subject_id", "subject_value",  # noqa: E731
+                                         "subject_label", "object_id", "object_label", "file_id", "row_json", "spans"))
+    if sorted(map(key, rows)) != sorted(map(key, want_rows)):
+        raise PublishError("the index's rows are not what their values make (identifiers, labels or files differ)")
+    if sorted(metrics) != sorted(want_metrics):
+        raise PublishError("the index's metrics are not the rows' values")
+    if sorted(edges) != sorted(want_edges):
+        raise PublishError("the index's edges are not what their values make")
+    counts = {"rows": {}, "edges": {}}
+    for r in want_rows:
+        counts["rows"][r["kind"]] = counts["rows"].get(r["kind"], 0) + 1
+    for e in want_edges:
+        counts["edges"][e[1]] = counts["edges"].get(e[1], 0) + 1
+    return counts
+
+
 def _ingest_parquet(con, col: Collection, ds: dict, pending: list, vocab, store, ingest: bool) -> tuple[int, int]:
     """Ingest one dataset into the Parquet index (rows, metrics and edges,
     written whole), then record its control rows (dimensions, files, pending
     mint contexts) in the service database. Gene sets are not stored here: the
     service rebuilds and stores one the first time a claim naming it is served."""
-    from .store import stable_row_id
-
-    doc = col.doc
-    dataset_id = ds["doc"]["id"]
     objects: dict[str, tuple[str, dict]] = {}
     rows, edge_rows = [], []
     if ingest:
-        ents, edges = dataset_entities(col, ds, objects, vocab)
-        for kind, pairs in edges.items():
-            spec = doc["edge_kinds"][kind]
-            for (from_value, to_value), (from_id, _, _) in sorted(pairs.items()):
-                to_id, _ = ents.ident(spec["to"]["entity"], to_value)
-                edge_rows.append((dataset_id, kind, from_id, to_id, from_value, to_value))
-        metrics = []
-        for kind, rk in doc["row_kinds"].items():
-            if col.role_for(kind) not in ds["files"]:
-                continue
-            for r in dataset_rows(col, ds, ents, kind, vocab):
-                row = {**r, "dataset_id": dataset_id, "kind": kind,
-                       "row_id": stable_row_id(dataset_id, kind, r["subject_id"])}
-                rows.append(row)
-                values = json.loads(row["row_json"])
-                metrics.extend((row["row_id"], m, idn.num(values[m])) for m in rk["metrics"])
-        store.write_dataset(dataset_id, rows, metrics, edge_rows)
+        rows, metrics, edge_rows = parquet_dataset(col, ds, read_dataset(col, ds, vocab), objects, vocab)
+        store.write_dataset(ds["doc"]["id"], rows, metrics, edge_rows)
     with con:
-        if ingest:
-            con.executemany("INSERT INTO dataset_dimensions (dataset_id, dimension, value, label) VALUES (?, ?, ?, ?)",
-                            [(dataset_id, n, d["value"], d["label"]) for n, d in ds["dims"].items()])
-            con.executemany("INSERT INTO dataset_files (dataset_id, role, file_id) VALUES (?, ?, ?)",
-                            [(dataset_id, role, f["doc"]["id"]) for role, f in ds["files"].items()])
-        for ctx in pending:
-            _record_context(con, ctx)
-        _store_objects(con, {oid: v for oid, v in objects.items() if v[0] in EAGER_CLASSES})
+        record_index_dataset(con, ds, pending, objects, ingest)
     return len(rows), len(edge_rows)
 
 

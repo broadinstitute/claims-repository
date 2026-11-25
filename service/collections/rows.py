@@ -76,7 +76,7 @@ def rows(con, collection: str, kind: str, *, order: dict, first: int = 20, relea
     if subjects and len(subjects) > MAX_SUBJECTS:
         raise ValueError(f"subject takes at most {MAX_SUBJECTS} values")
     dataset_ids = _datasets_matching(con, rel["release_id"], dims)
-    found = get_store(con).anchor(dataset_ids, kind, conds, metric, direction, first, subjects)
+    found = get_store(con, dataset_ids).anchor(dataset_ids, kind, conds, metric, direction, first, subjects)
     root = {"release_id": rel["release_id"], "manifest": manifest, "groups": {}}
     out = _batch(con, found, root)
     warnings = [] if out else [
@@ -112,8 +112,8 @@ def joined(con, row: dict, via: str, kind: str, *, order: dict, first: int = 10,
         raise ValueError(f"{via} goes from {edge['from']['entity']} to {edge['to']['entity']}; it cannot join "
                          f"{row['kind']} rows (about {starts}) to {kind} rows (about {ends})")
     conds, metric, direction = _conditions(collection, manifest, kind, where, order)
-    store = get_store(con)
     dataset_id = row["dataset"]["id"]
+    store = get_store(con, [dataset_id])
     if not store.has_edges(dataset_id, via):
         return []
     found = store.join(dataset_id, via, [row["subject"]["id"]], kind, conds, metric, direction, first)

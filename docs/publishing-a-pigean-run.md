@@ -14,11 +14,11 @@ full reference.
 
 **What works today.** The CLI publishes into a *local deployment*: a SQLite control database plus a
 Parquet index on the server's disk, which `claims serve` serves over HTTP. Publishing into the shared QA
-service needs a `claims login` (device-code sign-in, so it works on a remote machine; built, see
-[cli-login.md](cli-login.md)) and a publish path into the deployed store that requires it (not built
-yet). Everything you prepare here (the S3 layout and the
-collection directory) carries over unchanged, because both paths read the same `collection.yaml` and
-`source.yaml`.
+service is the same command with `--api qa --index-to s3://...`, after a `claims login` (device-code sign-in, so it works on
+a remote machine; see [cli-login.md](cli-login.md) and
+[publishing-to-a-deployment.md](publishing-to-a-deployment.md)). Everything you prepare here (the S3
+layout and the collection directory) carries over unchanged, because both paths read the same
+`collection.yaml` and `source.yaml`.
 
 ---
 
@@ -210,6 +210,20 @@ at a time:
 For scale: the existing run of 1,444 datasets took about 3 hours and gives an index of about 0.9 GB.
 Publishing is resumable. If it stops, run the same command again. A dataset is stored whole or not at
 all, and the release is served only once every dataset is in.
+
+To publish into QA instead, once the release looks right locally, sign in once and add `--api qa` and
+`--index-to`, a bucket prefix the service may read. The files are read again on this machine, each
+dataset's Parquet index goes to that bucket, and QA records only where it is; the release records who
+published it ([publishing-to-a-deployment.md](publishing-to-a-deployment.md)):
+
+```bash
+./bin/claims login                                          # approve the code in the admin console
+I=s3://cyaka-claims-index-test/pigean-<library>             # QA's test bucket
+./bin/claims release publish $C 2026.12.1 --api qa --index-to $I --first 1
+./bin/claims release publish $C 2026.12.1 --api qa --index-to $I --workers 4 --workdir $HOME/claims-local/work
+```
+
+QA and prod share one database, so a release published into QA is listed by prod as well.
 
 Serve the deployment and use the API:
 

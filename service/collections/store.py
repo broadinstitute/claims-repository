@@ -283,20 +283,95 @@ class ParquetStore(_SqlShape):
         finally:
             os.unlink(tmp)
 
+class BucketStore(ParquetStore):
+    """Datasets whose Parquet index lives in a bucket (service/collections/index_bucket.py): served from a local
+    cache that each dataset enters once its files match what was recorded at publish. Counts come from that
+    record, so describing a release reads no file."""
+
+    def __init__(self, root: str | os.PathLike):
+        from .index_bucket import Cache
+
+        super().__init__(root)
+        self.cache = Cache(root)
+        self.known: dict[str, dict] = {}   # dataset id -> {location, files, counts}; immutable once recorded
+
+    def dataset_dir(self, dataset_id: str) -> Path:
+        return self.cache.dir(dataset_id)
+
+    def _files(self, dataset_ids, name):
+        out = []
+        for d in dataset_ids:
+            entry = self.known.get(d)
+            if entry is not None:
+                out.append(str(self.cache.ensure(d, entry) / name))
+        return out
+
+    def counts(self, dataset_id):
+        entry = self.known.get(dataset_id)
+        return {**entry["counts"].get("rows", {}), **entry["counts"].get("edges", {})} if entry else {}
+
+    def has_dataset(self, dataset_id):
+        return dataset_id in self.known
+
+
 _PARQUET: dict[str, ParquetStore] = {}
+_BUCKET: dict[str, BucketStore] = {}
+_NOT_INDEXED: dict[str, float] = {}   # dataset id -> when it was last found to have no bucket index
+_NOT_INDEXED_FOR = 60.0
 
 
 def index_dir() -> str | None:
     return os.environ.get("CLAIMS_INDEX_DIR") or None
 
 
-def get_store(con):
-    """The store for this deployment: Parquet under CLAIMS_INDEX_DIR when it
-    is set, else the service database's tables."""
-    root = index_dir()
-    if not root:
-        return SqlStore(con)
-    store = _PARQUET.get(root)
+def cache_dir() -> str:
+    return os.environ.get("CLAIMS_INDEX_CACHE") or os.path.join(os.path.realpath("/tmp"), "claims-index-cache")
+
+
+def bucket_store() -> BucketStore:
+    root = cache_dir()
+    store = _BUCKET.get(root)
     if store is None:
-        store = _PARQUET[root] = ParquetStore(root)
+        store = _BUCKET[root] = BucketStore(root)
     return store
+
+
+def _bucket_indexed(con, dataset_ids) -> set[str]:
+    """Which of these datasets have a bucket index (dataset_indexes), recorded in the bucket store."""
+    import time
+
+    store = bucket_store()
+    now = time.time()
+    ask = [d for d in dict.fromkeys(dataset_ids)
+           if d not in store.known and now - _NOT_INDEXED.get(d, -1e9) > _NOT_INDEXED_FOR]
+    for i in range(0, len(ask), 500):
+        part = ask[i:i + 500]
+        found = con.execute(f"SELECT dataset_id, location, files, counts FROM dataset_indexes WHERE dataset_id IN "
+                            f"({_marks(len(part))})", part).fetchall()
+        for r in found:
+            store.known[r["dataset_id"]] = {"location": r["location"], "files": json.loads(r["files"]),
+                                            "counts": json.loads(r["counts"])}
+        hit = {r["dataset_id"] for r in found}
+        for d in part:
+            if d not in hit:
+                _NOT_INDEXED[d] = now
+    return {d for d in dataset_ids if d in store.known}
+
+
+def get_store(con, dataset_ids=None):
+    """The store holding these datasets: a local deployment's Parquet under CLAIMS_INDEX_DIR when it is set;
+    else the bucket store when the datasets were published with a bucket index; else the service database's
+    tables. The datasets of one release are all in one store."""
+    root = index_dir()
+    if root:
+        store = _PARQUET.get(root)
+        if store is None:
+            store = _PARQUET[root] = ParquetStore(root)
+        return store
+    if dataset_ids:
+        indexed = _bucket_indexed(con, list(dataset_ids))
+        if indexed:
+            if len(indexed) != len(set(dataset_ids)):
+                raise ValueError("these datasets are partly in a bucket index and partly in the database")
+            return bucket_store()
+    return SqlStore(con)

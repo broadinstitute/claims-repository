@@ -2,8 +2,5 @@
 # result store. Install this on any machine that creates or publishes a collection:
 #   python3 -m venv .venv && .venv/bin/pip install -r requirements-cli.txt
 -r requirements.txt
-# The Parquet result store (service/collections/store.py), queried with DuckDB. The deployed service
-# uses the SQL store and does not need it.
-duckdb==1.1.3
 # `claims query run` without --api drives the service in-process through fastapi.testclient.
 httpx>=0.27
