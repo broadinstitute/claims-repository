@@ -627,3 +627,27 @@ def test_an_index_changed_in_the_bucket_is_not_served(api, token, pushed_db, buc
     r = TestClient(app).post(f"/v1/collections/pigean/queries/{QUERY}:run",
                              json={"variables": {"trait": "FIXCHANGED", "library": "fixture-v1", "topGenes": 5}})
     assert r.status_code >= 400 or "not the file recorded at publish" in r.text
+
+
+def test_another_collection_may_hold_the_same_files(api, token, pushed_db, bucket, tmp_path):
+    """One result file is one dataset within a collection; another collection over the same files (its claim
+    ids differ) is no conflict."""
+    import re
+    import shutil
+
+    spec = _spec(tmp_path, "0.9.0-shared", ("FIXSHARED", "FIXSHARED2"))
+    _push(api, token, bucket, spec, tmp_path)
+    looser = {**spec, "version": "0.9.1-shared",
+              "datasets": [{**d, "where": {"gene_phenotype": {"combined": {"gt": 0}}}} for d in spec["datasets"]]}
+    with pytest.raises(PublishError, match="other `where` bounds"):
+        _push(api, token, bucket, looser, tmp_path)
+
+    other = tmp_path / "other-collection"
+    shutil.copytree(COLLECTION, other)
+    manifest = (other / "collection.yaml").read_text()
+    manifest = re.sub(r"(?m)^collection: .*$", "collection: pigean-other", manifest, count=1)
+    (other / "collection.yaml").write_text(re.sub(r"(?m)^title: .*$", "title: PIGEAN (other)", manifest, count=1))
+    col = load_collection(other)
+    target = _target(api, token, col, "0.1.0", bucket)
+    out = publish(None, col, {**looser, "version": "0.1.0"}, tmp_path, target=target)
+    assert out.complete and out.stats["datasets_ingested"] == 2
