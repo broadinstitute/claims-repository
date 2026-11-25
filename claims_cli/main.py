@@ -831,7 +831,7 @@ def cmd_provenance_draft(args):
     files, edges, with_sha = [], [], 0
     for ds in spec["datasets"]:
         for f in ds["files"].values():
-            item = listing.get(f["location"]) or {}
+            item = listing.get(f.get("location")) or {}
             sha = f.get("sha256") or (pins.sha256(f["location"], item.get("etag", "")) if pins else None)
             with_sha += bool(sha)
             node = idn.mint("File", {k: v for k, v in {
@@ -877,7 +877,7 @@ def _publish_once(args, collection_dir: Path, shard: str | None) -> dict:
     pins = src.Pins(Path(os.environ["CLAIMS_INDEX_DIR"]))
     for ds in spec["datasets"]:
         for f in ds["files"].values():
-            item = listing.get(f["location"])
+            item = listing.get(f.get("location"))
             if "sha256" not in f and item:
                 sha = pins.sha256(f["location"], item["etag"])
                 if sha:

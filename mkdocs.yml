@@ -16,6 +16,7 @@ nav:
   - Creating a collection: creating-a-collection.md
   - Publishing a PIGEAN run: publishing-a-pigean-run.md
   - CLI login: cli-login.md
+  - Publishing to a deployed service: publishing-to-a-deployment.md
   - Method modules: method-modules.md
   - Graph-query contract design: query-graph-design.md
   - Admin console: admin-console.md

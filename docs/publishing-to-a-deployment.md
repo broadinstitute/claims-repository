@@ -1,9 +1,10 @@
 # Publishing to a deployed service
 
-> **Status (2026-11-24): in development.** `claims release publish --api URL` publishes a release into
-> the deployed service with the token `claims login` saved ([CLI login](cli-login.md)), and the release
-> records who published it. Until it ships, publishing into QA is `scripts/publish_collection.py` with
-> the shared database password.
+> **Status (2026-11-24): built.** `claims release publish ... --api qa` publishes a release into the
+> deployed service with the token `claims login` saved ([CLI login](cli-login.md)), and the release
+> records who published it. It works on QA once the service build with migration 011 is deployed there.
+> `scripts/publish_collection.py` with the shared database password still works, and records no
+> publisher.
 
 The CLI already publishes a release into a *local* deployment: it reads the result files, checks them,
 and derives the rows, edges and DAPPER objects that claims are rendered from. Publishing into the
@@ -29,12 +30,13 @@ to the API, which checks what it can recompute and stores it. Nothing needs the 
 ```text
 server$ claims login                                         # once per 30 days
 server$ claims release plan    $C 2026.12.0                  # as for a local deployment
-server$ claims release publish $C 2026.12.0 --api https://api-qa.hugeampkpnbi.org/api/claims --first 1
-server$ claims release publish $C 2026.12.0 --api https://api-qa.hugeampkpnbi.org/api/claims --workers 4
+server$ claims release publish $C 2026.12.0 --api qa --first 1     # one dataset; not served yet
+server$ claims release publish $C 2026.12.0 --api qa --workers 4   # the rest; then the release is recorded
 ```
 
-`--first`, `--workers` and resuming work as they do locally. The release is recorded, and served, only
-when every dataset is in.
+`--api` takes `qa` or a service's base URL; it is never a default. `--first`, `--workers` and resuming
+work as they do locally, and the local deployment (`--db`, `--index-dir`) still keeps the sha256 cache
+of the files read, but no rows. The release is recorded, and served, only when every dataset is in.
 
 ```mermaid
 sequenceDiagram
@@ -65,7 +67,13 @@ Every route needs `Authorization: Bearer clp_...` (`require_publisher`).
 | `POST /v1/publish/{collection}/{version}:finish` | `bundle`; the release, its DAPPER document, its objects and the provenance record | `release_id` |
 
 Errors are 400 (the push is wrong: the message says what), 401 (no valid token), 409 (the version is
-recorded with other content, or a file is already another dataset's), 413 (too large).
+recorded with other content, or a file is already another dataset's), 413 (too large), 503 (another
+request is storing the same dataset). The CLI tries a 5xx or a dropped connection again, up to six
+times over about three minutes; anything else stops the push with the API's message.
+
+Only one request stores a given dataset at a time (a MySQL named lock). A request that outlives the load
+balancer's timeout keeps running and commits; the CLI's retry waits for it, then finds the dataset
+stored.
 
 ## Checks the API makes
 
@@ -87,7 +95,23 @@ What the API cannot check is that the rows are what the files hold: it has no ac
 publisher's identity is recorded with the release, and every claim's evidence still names its file by
 sha256 and byte range, so the rows can be audited against the files later.
 
-## Measured
+## Measured (2026-11-24)
 
-To fill in from the first push: one PIGEAN dataset's request size and store time, and the estimate
-for 1,444 datasets.
+Three of the largest PIGEAN datasets of release 2026.11.2 (IBD, T2D, HEIGHT; 576,342 edges, 8,475 rows),
+pushed from a laptop to the service running locally against a scratch database on the QA Aurora cluster:
+
+| Request | Raw | Sent (gzip) | Time |
+| --- | --- | --- | --- |
+| Largest dataset (about 190,000 edges) | 23.8 MB | 4.5 MB | 50 s |
+| Smallest of the three | 11.1 MB | 1.7 MB | 18 s |
+| `:begin` (the collection's files) | 0.55 MB | 0.07 MB | 1 s |
+| `:finish` | 0.02 MB | 0.01 MB | 2 s |
+
+The service process peaked at about 300 MB. QA's largest dataset has 341,026 edges, and 62 datasets have
+more than 100,000, so the QA task needs more than its 512 MB: the deploy that brings this sets
+2 GB. The release's 22.8 million edges at the measured rate (about 6,000 edges a second over the internet;
+faster inside AWS) come to roughly an hour, less with `--workers 4`.
+
+The same release published directly and pushed (four workers in parallel, into MySQL) gave identical
+rows, metrics, edges, objects, references, text index, mint contexts and release record
+(`tests/test_publish_push.py` checks the same on SQLite, and that the served claims are identical).

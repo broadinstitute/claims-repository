@@ -1,9 +1,9 @@
 # CLI login (device code)
 
 > **Status (2026-11-24): built.** `claims login`, `claims whoami` and `claims logout` work against QA, and
-> the admin console approves sign-ins at `/admin/device` and lists them under Keys, CLI sessions. This is
-> the first half of publishing from the CLI to a deployed service. Nothing consumes the token yet: the
-> second half, a publish path into the deployed store that requires it (`require_publisher`), is next.
+> the admin console approves sign-ins at `/admin/device` and lists them under Keys, CLI sessions.
+> `claims release publish ... --api qa` uses the token to publish a release into the deployed service
+> ([Publishing to a deployed service](publishing-to-a-deployment.md)).
 
 Publishing a collection to a shared deployment must say who did it, and not everyone may do it. The
 `claims` CLI often runs on a remote server, sometimes driven by an agent, where no browser is

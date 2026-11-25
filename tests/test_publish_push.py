@@ -351,3 +351,39 @@ def test_the_contract_lists_the_publish_routes():
     for path in ("/v1/publish/{collection}/{version}:begin", "/v1/publish/{collection}/{version}:check",
                  "/v1/publish/{collection}/{version}/datasets/{dataset_id}", "/v1/publish/{collection}/{version}:finish"):
         assert path in contract
+
+
+def test_the_cli_publishes_with_api_and_workers(api, token, pushed_db, tmp_path):
+    """`claims release publish ... --api URL --workers 2`, as a server runs it."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+
+    import yaml
+
+    col_dir = tmp_path / "pigean"
+    shutil.copytree(COLLECTION, col_dir)
+    spec = _spec(tmp_path, "0.5.0-cli", ("FIXCLI", "FIXCLI2"))
+    (col_dir / "releases").mkdir()
+    (col_dir / "releases" / "0.5.0-cli.yaml").write_text(yaml.safe_dump(spec))
+    env = {**{k: v for k, v in os.environ.items() if k not in ("CLAIMS_MYSQL_HOST", "CLAIMS_DB", "CLAIMS_INDEX_DIR")},
+           "CLAIMS_TOKEN": token["access_token"], "XDG_CONFIG_HOME": str(tmp_path / "config")}
+    base = [sys.executable, "-m", "claims_cli.main", "--db", str(tmp_path / "local.db"), "--index-dir",
+            str(tmp_path / "index"), "release", "publish", str(col_dir), "0.5.0-cli"]
+    out = subprocess.run(base + ["--api", api, "--workers", "2"], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr + out.stdout
+    assert f"publishing to {api}" in out.stdout and f"at {api}" in out.stdout and "recorded     2 datasets" in out.stdout
+    con = service_db.connect(pushed_db)
+    try:
+        assert con.execute("SELECT published_by FROM collection_releases WHERE version = '0.5.0-cli'").fetchone()[0] \
+            == PUBLISHER
+    finally:
+        con.close()
+    assert not (tmp_path / "index" / "datasets").exists()  # nothing went into the local deployment
+
+    env.pop("CLAIMS_TOKEN")
+    out = subprocess.run(base + ["--api", api], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert out.returncode != 0 and "not signed in" in out.stderr
+    out = subprocess.run(base + ["--api", "http://api.example.org"], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert out.returncode != 0 and "not an https URL" in out.stderr

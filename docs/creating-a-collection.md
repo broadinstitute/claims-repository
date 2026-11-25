@@ -69,8 +69,9 @@ Trait suggestions in `collection init` and `vocab check` read a KPN trait releas
 (or `--traits`) at `versions/trait/v0.0.2/kpn_trait_collection.yaml` in that clone. Without it the commands
 still run and only the suggestions are missing.
 
-`claims login` signs in to a deployed API with a device code ([cli-login.md](cli-login.md)). Publishing to a
-deployed API with that token is planned; today the CLI publishes into the local deployment.
+`claims login` signs in to a deployed API with a device code ([cli-login.md](cli-login.md)), and
+`claims release publish ... --api qa` then publishes a release into it
+([publishing-to-a-deployment.md](publishing-to-a-deployment.md)).
 
 ### Starting from an existing collection
 

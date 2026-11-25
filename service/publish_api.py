@@ -22,6 +22,7 @@ import tempfile
 import threading
 import zlib
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +51,38 @@ DOCUMENT_GROUPS = {"files": "File", "activities": "Activity", "datasets": "Datas
 
 class Conflict(pub.PublishError):
     """The push contradicts something already recorded (409)."""
+
+
+class Busy(pub.PublishError):
+    """Another request is storing the same dataset (503; the CLI tries again)."""
+
+
+LOCK_WAIT = 600   # seconds a repeated request waits for the first one to finish storing its dataset
+_LOCAL_LOCKS = [threading.Lock() for _ in range(64)]
+
+
+@contextmanager
+def _dataset_lock(con, dataset_id: str):
+    """One request at a time stores a given dataset. A request the load balancer timed out keeps running, and
+    the CLI's retry of it waits here, then finds the dataset stored, instead of racing it into the unique keys."""
+    digest = hashlib.sha256(dataset_id.encode()).hexdigest()
+    if con.dialect.sqlite:
+        lock = _LOCAL_LOCKS[int(digest[:8], 16) % len(_LOCAL_LOCKS)]
+        if not lock.acquire(timeout=LOCK_WAIT):
+            raise Busy(f"{dataset_id} is being stored by another request; try again")
+        try:
+            yield
+        finally:
+            lock.release()
+        return
+    name = "claims_publish_" + digest[:40]
+    if con.execute("SELECT GET_LOCK(?, ?) AS got", (name, LOCK_WAIT)).fetchone()["got"] != 1:
+        raise Busy(f"{dataset_id} is being stored by another request; try again")
+    try:
+        con.commit()  # end any snapshot taken before the wait, so what the other request stored is seen
+        yield
+    finally:
+        con.execute("SELECT RELEASE_LOCK(?)", (name,))
 
 
 # --- the request -------------------------------------------------------------------
@@ -100,6 +133,8 @@ def _call(fn, *args):
         return fn(con, *args)
     except Conflict as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except Busy as exc:
+        raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "30"})
     except (pub.PublishError, ManifestError, MappingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     finally:
@@ -348,18 +383,19 @@ def put_dataset(con, collection: str, dataset_id: str, body: dict, publisher: di
     if target.kind != "sql":
         raise pub.PublishError("this deployment keeps result data in a Parquet index; push to one that keeps it in "
                                "its database")
-    stored = target.dataset_stored(dataset_id)
-    if stored:
-        extract = None  # a repeat: the rows are in
-    elif extract is None:
-        raise pub.PublishError(f"{dataset_id} is not stored yet: send what its files hold (extract)")
-    else:
-        try:
-            target.refuse_other_slice(ds)
-        except pub.PublishError as exc:
-            raise Conflict(str(exc)) from exc
-    pending = [ctx for ctx in _contexts(bundle, ds) if not target.context_recorded(ctx.activity["id"])]
-    done = target.put_dataset(bundle.col, ds, vocab, extract, pending)
+    with _dataset_lock(con, dataset_id):
+        stored = target.dataset_stored(dataset_id)
+        if stored:
+            extract = None  # a repeat: the rows are in
+        elif extract is None:
+            raise pub.PublishError(f"{dataset_id} is not stored yet: send what its files hold (extract)")
+        else:
+            try:
+                target.refuse_other_slice(ds)
+            except pub.PublishError as exc:
+                raise Conflict(str(exc)) from exc
+        pending = [ctx for ctx in _contexts(bundle, ds) if not target.context_recorded(ctx.activity["id"])]
+        done = target.put_dataset(bundle.col, ds, vocab, extract, pending)
     return {"dataset_id": dataset_id, "already_stored": stored, **done}
 
 
