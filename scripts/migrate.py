@@ -46,6 +46,8 @@ REQUIRED_COLUMNS = {
     "collection_releases": {"release_id", "collection_key", "version", "manifest", "document",
                             "published_by", "publisher_token_id"},  # 011
     "publish_bundles": {"bundle_sha256", "collection_key", "files", "created_by", "created_at"},  # 011
+    "publish_datasets": {"dataset_id", "collection_key", "bundle_sha256", "published_by", "publisher_token_id",
+                         "stored_at"},  # 011
     "result_rows": {"row_id", "dataset_id", "kind", "subject_id", "subject_value", "row_json", "spans"},
     "mint_contexts": {"activity_id", "context"},
     "dapper_objects": {"id", "class_name", "payload", "times_seen", "last_seen_at"},
@@ -101,6 +103,7 @@ REQUIRED_PRIMARY_KEYS = {
     "object_text": ["object_id", "field"],
     # 011_publish_push.sql
     "publish_bundles": ["bundle_sha256"],
+    "publish_datasets": ["dataset_id"],
 }
 
 

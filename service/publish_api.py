@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import re
+import shutil
 import tempfile
 import threading
 import zlib
@@ -26,6 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 
@@ -33,7 +35,7 @@ from . import db, device_login
 from .collections import identity as idn
 from .collections import publish as pub
 from .collections.manifest import Collection, ManifestError, load_collection
-from .collections.traits import MappingError, collection_vocabulary, resolve_dimension, unmapped_policy, vocabulary_files
+from .collections.traits import MappingError, collection_vocabulary, resolve_dimension, unmapped_policy
 
 router = APIRouter(prefix="/v1/publish", tags=["Publish"])
 
@@ -57,32 +59,56 @@ class Busy(pub.PublishError):
     """Another request is storing the same dataset (503; the CLI tries again)."""
 
 
-LOCK_WAIT = 600   # seconds a repeated request waits for the first one to finish storing its dataset
+LOCK_WAIT = 60    # seconds a request waits for another storing the same dataset or recording the same collection
 _LOCAL_LOCKS = [threading.Lock() for _ in range(64)]
+# Classes the service mints itself: a push never sends them (gene sets are minted here from the edges).
+SERVICE_MINTED = {"Claim", "Proposition", "Evidence", "ValueLocator", "GeneSet", "GeneSetCollection",
+                  "ResultCollection", "Dataset"}
+
+
+def _lock_name(kind: str, key: str) -> tuple[str, str]:
+    digest = hashlib.sha256(f"{kind}:{key}".encode()).hexdigest()
+    return f"claims_{kind}_" + digest[:40], digest
 
 
 @contextmanager
-def _dataset_lock(con, dataset_id: str):
-    """One request at a time stores a given dataset. A request the load balancer timed out keeps running, and
-    the CLI's retry of it waits here, then finds the dataset stored, instead of racing it into the unique keys."""
-    digest = hashlib.sha256(dataset_id.encode()).hexdigest()
+def _lock(con, kind: str, key: str, what: str):
+    """A named lock: one request at a time stores a given dataset ("dataset") or records a release of a given
+    collection ("release"). A request the load balancer timed out keeps running; a retry of it waits here (or
+    is told to come back, 503), then finds its work done, instead of racing it into the unique keys."""
+    name, digest = _lock_name(kind, key)
     if con.dialect.sqlite:
         lock = _LOCAL_LOCKS[int(digest[:8], 16) % len(_LOCAL_LOCKS)]
         if not lock.acquire(timeout=LOCK_WAIT):
-            raise Busy(f"{dataset_id} is being stored by another request; try again")
+            raise Busy(f"{what} is busy with another request; try again")
         try:
             yield
         finally:
             lock.release()
         return
-    name = "claims_publish_" + digest[:40]
     if con.execute("SELECT GET_LOCK(?, ?) AS got", (name, LOCK_WAIT)).fetchone()["got"] != 1:
-        raise Busy(f"{dataset_id} is being stored by another request; try again")
+        raise Busy(f"{what} is busy with another request; try again")
     try:
         con.commit()  # end any snapshot taken before the wait, so what the other request stored is seen
         yield
     finally:
         con.execute("SELECT RELEASE_LOCK(?)", (name,))
+
+
+def _busy(kind: str, key: str) -> bool:
+    """Whether another request holds the lock now (checked before a large body is read)."""
+    name, digest = _lock_name(kind, key)
+    con = db.connect()
+    try:
+        if con.dialect.sqlite:
+            return _LOCAL_LOCKS[int(digest[:8], 16) % len(_LOCAL_LOCKS)].locked()
+        return con.execute("SELECT IS_FREE_LOCK(?) AS free", (name,)).fetchone()["free"] == 0
+    finally:
+        con.close()
+
+
+def _reject_constant(name):
+    raise ValueError(f"{name} is not a number JSON allows")
 
 
 # --- the request -------------------------------------------------------------------
@@ -111,9 +137,10 @@ async def _body(request: Request) -> dict:
     elif encoding not in ("", "identity"):
         raise HTTPException(status_code=415, detail="Send the body as JSON, gzip-encoded or not.")
     try:
-        body = json.loads(raw)
+        body = json.loads(raw, parse_constant=_reject_constant)
     except (ValueError, UnicodeDecodeError):
-        raise HTTPException(status_code=400, detail="The body is not JSON.")
+        raise HTTPException(status_code=400, detail="The body is not JSON (NaN and Infinity are refused).")
+    del raw
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="The body is a JSON object.")
     return body
@@ -137,6 +164,9 @@ def _call(fn, *args):
         raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "30"})
     except (pub.PublishError, ManifestError, MappingError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError, UnicodeError, idn.MintError) as exc:
+        # Malformed input that got past the shape checks: the caller's to fix, so not retried as a 5xx.
+        raise HTTPException(status_code=400, detail=f"malformed request ({type(exc).__name__}: {str(exc)[:200]})")
     finally:
         con.close()
 
@@ -171,7 +201,10 @@ def _bundle_files(body: dict) -> tuple[dict, str]:
         if not (isinstance(rel, str) and isinstance(text, str) and len(rel) <= 255
                 and all(PATH_PART_RE.match(part) and part not in (".", "..") for part in rel.split("/"))):
             raise pub.PublishError(f"{rel!r}: a collection file is a relative path (letters, digits, . _ -) and its text")
-        total += len(text.encode())
+        try:
+            total += len(text.encode())
+        except UnicodeEncodeError:
+            raise pub.PublishError(f"{rel}: not valid text")
     if total > MAX_BUNDLE_BYTES:
         raise pub.PublishError(f"the collection's files are {total:,} bytes; at most {MAX_BUNDLE_BYTES:,}")
     if "collection.yaml" not in files:
@@ -187,26 +220,56 @@ def _digest(files: dict, prefix: str) -> str:
                                      ensure_ascii=False).encode()).hexdigest()
 
 
+def _named_files(files: dict) -> set[str]:
+    """Every file the manifest names, each of which must be among the files sent: nothing outside the bundle is
+    ever read."""
+    try:
+        doc = yaml.safe_load(files["collection.yaml"])
+    except yaml.YAMLError as exc:
+        raise pub.PublishError(f"collection.yaml is not valid YAML: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise pub.PublishError("collection.yaml is not a manifest")
+    if doc.get("kind") == "objects":
+        raise pub.PublishError(f"{doc.get('collection')} is an object collection: its releases are built from deposits")
+    named = {"collection.yaml"}
+    for block in ("templates", "queries"):
+        value = doc.get(block) or []
+        if not isinstance(value, list):
+            raise pub.PublishError(f"collection.yaml: {block} is a list of paths")
+        named.update(value)
+    for block in ("mappings", "xrefs"):
+        value = doc.get(block) or {}
+        if not isinstance(value, dict):
+            raise pub.PublishError(f"collection.yaml: {block} maps dimensions to paths")
+        named.update(value.values())
+    missing = sorted(str(n) for n in named if n not in files)
+    if missing:
+        raise pub.PublishError(f"collection.yaml names files that were not sent: {missing[:5]}")
+    extra = sorted(set(files) - named)
+    if extra:
+        raise pub.PublishError(f"files the collection does not use: {extra[:5]}")
+    return named
+
+
 def _load(digest: str, files: dict, prefix: str) -> Bundle:
-    """Load a bundle's collection from its files (written under a directory of its own)."""
+    """Load a bundle's collection from its files, written under a directory of its own; a bundle that does not
+    load leaves nothing behind."""
+    _named_files(files)
     root = _BUNDLE_DIR / digest
     if not root.exists():
         tmp = Path(tempfile.mkdtemp(dir=_BUNDLE_DIR))
-        for rel, text in files.items():
-            (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
-            (tmp / rel).write_text(text)
         try:
+            for rel, text in files.items():
+                (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
+                (tmp / rel).write_text(text)
+            load_collection(tmp)
             tmp.rename(root)
         except OSError:  # another request wrote it first
-            pass
+            shutil.rmtree(tmp, ignore_errors=True)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
     col = load_collection(root)
-    if col.is_objects:
-        raise pub.PublishError(f"{col.key} is an object collection: its releases are built from deposits")
-    names = {"collection.yaml", *(t.rel for t in col.templates), *(q.rel for q in col.queries.values()),
-             *(rel for _, _, rel in vocabulary_files(col.doc))}
-    extra = sorted(set(files) - names)
-    if extra:
-        raise pub.PublishError(f"files the collection does not use: {extra[:5]}")
     collection_vocabulary(col.doc, col.root)  # the mappings load
     manifest_file, template_files, query_files = pub.collection_file_docs(col, prefix)
     return Bundle(digest, col, prefix, manifest_file, template_files, query_files)
@@ -216,8 +279,9 @@ def _remember(bundle: Bundle) -> Bundle:
     with _BUNDLES_LOCK:
         _BUNDLES[bundle.digest] = bundle
         _BUNDLES.move_to_end(bundle.digest)
-        while len(_BUNDLES) > 8:
-            _BUNDLES.popitem(last=False)
+        while len(_BUNDLES) > 16:
+            _, old = _BUNDLES.popitem(last=False)
+            shutil.rmtree(old.col.root, ignore_errors=True)  # written again from publish_bundles when named
     return bundle
 
 
@@ -333,12 +397,27 @@ def _extract(sent) -> dict | None:
 
 # --- the steps ---------------------------------------------------------------------
 
+def _refuse_object_collection(con, collection: str) -> None:
+    if con.execute("SELECT 1 FROM object_collections WHERE collection_key = ?", (collection,)).fetchone():
+        raise Conflict(f"{collection} is an object collection: its releases are built from deposits, not pushed")
+
+
+def _chunked(con, sql: str, ids: list, column: str, params: tuple = ()) -> set:
+    found = set()
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        found.update(r[column] for r in con.execute(sql.format(marks=",".join("?" * len(part))),
+                                                     (*params, *part)).fetchall())
+    return found
+
+
 def begin(con, collection: str, version: str, body: dict, publisher: dict) -> dict:
     files, prefix = _bundle_files(body)
     digest = _digest(files, prefix)
     bundle = _load(digest, files, prefix)
     if bundle.col.key != collection:
         raise pub.PublishError(f"collection.yaml is the collection {bundle.col.key!r}, not {collection!r}")
+    _refuse_object_collection(con, collection)
     _remember(bundle)
     target = pub.SqlTarget(con)
     existing = target.existing_release(collection, version)
@@ -360,17 +439,10 @@ def check(con, body: dict) -> dict:
     if not (isinstance(datasets, list) and isinstance(contexts, list) and len(datasets) <= MAX_CHECK
             and len(contexts) <= MAX_CHECK and all(isinstance(x, str) and len(x) <= 128 for x in datasets + contexts)):
         raise pub.PublishError(f"send {{datasets: [ids], contexts: [activity ids]}}, at most {MAX_CHECK:,} each")
-    stored, recorded = set(), set()
-    for i in range(0, len(datasets), 500):
-        part = datasets[i:i + 500]
-        stored.update(r["dataset_id"] for r in con.execute(
-            f"SELECT DISTINCT dataset_id FROM dataset_files WHERE dataset_id IN ({','.join('?' * len(part))})",
-            part).fetchall())
-    for i in range(0, len(contexts), 500):
-        part = contexts[i:i + 500]
-        recorded.update(r["activity_id"] for r in con.execute(
-            f"SELECT activity_id FROM mint_contexts WHERE activity_id IN ({','.join('?' * len(part))})",
-            part).fetchall())
+    stored = _chunked(con, "SELECT DISTINCT dataset_id FROM dataset_files WHERE dataset_id IN ({marks})",
+                      datasets, "dataset_id")
+    recorded = _chunked(con, "SELECT activity_id FROM mint_contexts WHERE activity_id IN ({marks})",
+                        contexts, "activity_id")
     return {"stored": sorted(stored), "recorded": sorted(recorded)}
 
 
@@ -383,7 +455,14 @@ def put_dataset(con, collection: str, dataset_id: str, body: dict, publisher: di
     if target.kind != "sql":
         raise pub.PublishError("this deployment keeps result data in a Parquet index; push to one that keeps it in "
                                "its database")
-    with _dataset_lock(con, dataset_id):
+
+    def record(c) -> None:  # in the dataset's transaction: who stored it, for which collection
+        c.execute("INSERT INTO publish_datasets (dataset_id, collection_key, bundle_sha256, published_by, "
+                  "publisher_token_id, stored_at) VALUES (?, ?, ?, ?, ?, ?)",
+                  (dataset_id, collection, bundle.digest, publisher["email"], publisher["token_id"],
+                   device_login._fmt(device_login._now())))
+
+    with _lock(con, "dataset", dataset_id, dataset_id):
         stored = target.dataset_stored(dataset_id)
         if stored:
             extract = None  # a repeat: the rows are in
@@ -395,101 +474,169 @@ def put_dataset(con, collection: str, dataset_id: str, body: dict, publisher: di
             except pub.PublishError as exc:
                 raise Conflict(str(exc)) from exc
         pending = [ctx for ctx in _contexts(bundle, ds) if not target.context_recorded(ctx.activity["id"])]
-        done = target.put_dataset(bundle.col, ds, vocab, extract, pending)
+        done = target.put_dataset(bundle.col, ds, vocab, extract, pending, on_store=record)
     return {"dataset_id": dataset_id, "already_stored": stored, **done}
 
 
+def _members(con, collection: str, release: dict) -> list[str]:
+    """The release's members, each a dataset stored for this collection: pushed for it (publish_datasets), or
+    a member of one of its recorded releases."""
+    members = release.get("members")
+    if not (isinstance(members, list) and members and len(members) <= MAX_CHECK and len(set(members)) == len(members)
+            and all(isinstance(m, str) and idn.class_of(m) == "Dataset" for m in members)):
+        raise pub.PublishError("the release lists its member datasets, once each")
+    bound = _chunked(con, "SELECT dataset_id FROM publish_datasets WHERE collection_key = ? AND dataset_id IN ({marks})",
+                     members, "dataset_id", (collection,))
+    rest = [m for m in members if m not in bound]
+    if rest:
+        bound |= _chunked(con, "SELECT d.dataset_id FROM release_datasets d JOIN collection_releases r ON "
+                               "r.release_id = d.release_id WHERE r.collection_key = ? AND d.dataset_id IN ({marks})",
+                          rest, "dataset_id", (collection,))
+    unbound = [m for m in members if m not in bound]
+    if unbound:
+        raise pub.PublishError(f"{len(unbound)} member dataset(s) are not stored for {collection}, e.g. {unbound[0]}: "
+                               "push them first")
+    return members
+
+
+def _unchanged(con, objects: dict) -> None:
+    """Refuse a record only the publisher supplies (a run Activity, a provenance node) that is stored under its id
+    with other content: its unhashed slots differ. Storing never overwrites a stored object, so the release's
+    document would otherwise disagree with what is served."""
+    ids = sorted(objects)
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        for r in con.execute(f"SELECT id, payload FROM dapper_objects WHERE id IN ({','.join('?' * len(part))})",
+                             part).fetchall():
+            if json.loads(r["payload"]) != objects[r["id"]][1]:
+                raise Conflict(f"{r['id']} is stored with other content; an object is never changed")
+
+
 def finish(con, collection: str, version: str, body: dict, publisher: dict) -> dict:
+    """Record a release from what this push stored. Every object stored here is one the release carries: its
+    publication Activity, manifest, template, query and vocabulary Files (all computed here), its members' Dataset
+    and result File records (recomputed), their run Activities, the mint contexts' Activities (computed here),
+    and only the provenance nodes its provenance record names."""
     bundle = _bundle(con, collection, body.get("bundle"))
     col = bundle.col
+    _refuse_object_collection(con, collection)
+    code_version, provenance = body.get("code_version"), body.get("provenance")
+    if not (isinstance(code_version, str) and 0 < len(code_version) <= 128):
+        raise pub.PublishError("send the code_version the release was built from")
+    if not (isinstance(provenance, list) and all(isinstance(p, dict) and isinstance(p.get("ids", []), list)
+                                                 for p in provenance)):
+        raise pub.PublishError("send the release's provenance record (a list)")
+    provenance_ids = {i for p in provenance for i in p.get("ids", []) if isinstance(i, str)}
     release = _verified(body.get("release"), "ResultCollection")
-    if release.get("collection_key") != collection or release.get("version") != version:
-        raise pub.PublishError(f"the release is {release.get('collection_key')} {release.get('version')}, "
-                               f"not {collection} {version}")
     document = body.get("document")
     if not isinstance(document, dict) or document.get("result_collections") != [release]:
         raise pub.PublishError("document is the release's DAPPER document, holding this release")
-    objects = {release["id"]: ("ResultCollection", release)}
-    for group, cls in DOCUMENT_GROUPS.items():
-        if not isinstance(document.get(group, []), list):
-            raise pub.PublishError(f"document.{group} is a list")
-        for d in document.get(group, []):
-            objects[_verified(d, cls)["id"]] = (cls, d)
-    extra = body.get("objects") or []
-    if not isinstance(extra, list):
-        raise pub.PublishError("objects is a list of DAPPER documents")
-    for d in extra:
-        _verified(d)
-        objects[d["id"]] = (idn.class_of(d["id"]), d)
-    for f in (bundle.manifest_file, *bundle.template_files.values(), *bundle.query_files.values()):
-        objects[f["id"]] = ("File", f)
+    unknown = sorted(set(document) - {"prefixes", "files", "activities", "datasets", "result_collections",
+                                      *pub_edge_groups()})
+    if unknown or document.get("prefixes", {}) != (col.doc.get("prefixes") or {}):
+        raise pub.PublishError(f"document holds what a release document holds, with the collection's prefixes"
+                               f"{f' (not {unknown[:3]})' if unknown else ''}")
 
-    target = pub.SqlTarget(con, publisher["email"], publisher["token_id"])
-    existing = target.existing_release(collection, version)
-    if existing and existing["release_id"] != release["id"]:
-        raise Conflict(f"{collection} {version} is already published as {existing['release_id']} with different "
-                       "content; publish a new version")
-    if existing:
-        return {"release_id": release["id"], "collection": collection, "version": version, "already_recorded": True}
-    previous = target.current_release_id(collection)
-    expected = {
-        "has_manifest_file": bundle.manifest_file["id"],
-        "has_claim_template": [bundle.template_files[t.doc["template"]]["id"] for t in col.templates],
-        "has_query_template": [bundle.query_files[n]["id"] for n in col.queries] or None,
-        "was_revision_of": previous,
-        "collection_key": collection,
-        "methods": col.doc["methods"],
-    }
-    for slot, value in expected.items():
-        if release.get(slot) != value:
-            raise pub.PublishError(f"the release's {slot} is {release.get(slot)!r}; this push makes it {value!r}"
-                                   + (" (another release became current meanwhile: run the push again)"
-                                      if slot == "was_revision_of" else ""))
-    publication = objects.get(release.get("was_generated_by"), (None, {}))[1]
-    if publication.get("activity_type") != "ResultCollectionPublication":
-        raise pub.PublishError("the release's was_generated_by is its publication Activity, in the document")
-    members = release.get("members") or []
-    if not members or release.get("n_members") != len(members) or len(set(members)) != len(members):
-        raise pub.PublishError("the release lists its member datasets once each")
-    missing = [m for m in members if objects.get(m, ("",))[0] != "Dataset"]
-    if missing:
-        raise pub.PublishError(f"{len(missing)} member(s) have no Dataset record in the document, e.g. {missing[0]}")
-    stored = set(check(con, {"datasets": members})["stored"]) if len(members) <= MAX_CHECK else set()
-    unstored = [m for m in members if m not in stored]
-    if unstored:
-        raise pub.PublishError(f"{len(unstored)} member dataset(s) are not stored yet, e.g. {unstored[0]}: "
-                               "push them first")
-    contexts = []
-    for m in members:
-        dataset = objects[m][1]
-        files = {}
-        for entry in dataset.get("file_roles") or []:
-            f = objects.get(entry.get("file"), (None, None))
-            if f[0] != "File":
-                raise pub.PublishError(f"dataset {m}: its {entry.get('role')} file has no File record in the document")
-            files[entry["role"]] = {"doc": f[1], "name": f[1]["filename"]}
-        for ctx in _contexts(bundle, {"doc": dataset, "files": files}):
-            contexts.append((ctx.activity["id"], m))
-            objects[ctx.activity["id"]] = ("Activity", ctx.activity)
-    recorded = set(check(con, {"contexts": [a for a, _ in contexts]})["recorded"]) if len(contexts) <= MAX_CHECK \
-        else {a for a, _ in contexts if target.context_recorded(a)}
-    unrecorded = [a for a, _ in contexts if a not in recorded]
-    if unrecorded:
-        raise pub.PublishError(f"{len(unrecorded)} mint context(s) are not recorded yet, e.g. {unrecorded[0]}: "
-                               "push their datasets again")
-    provenance = body.get("provenance")
-    code_version = body.get("code_version")
-    if not (isinstance(provenance, list) and all(isinstance(p, dict) for p in provenance)) \
-            or not (isinstance(code_version, str) and 0 < len(code_version) <= 128):
-        raise pub.PublishError("send the release's provenance record (a list) and code_version")
-    vocab = bundle.vocab()
-    target.record_release(col, release, document, objects, members, contexts, provenance, vocab,
-                          bundle.template_files, bundle.query_files, code_version)
-    with con:
-        device_login._audit(con, "release_published", publisher["email"],
-                            f"{collection} {version} as {release['id']} with {publisher['token_id']}")
+    with _lock(con, "release", collection, f"recording a release of {collection}"):
+        target = pub.SqlTarget(con, publisher["email"], publisher["token_id"])
+        existing = target.existing_release(collection, version)
+        if existing and existing["release_id"] != release["id"]:
+            raise Conflict(f"{collection} {version} is already published as {existing['release_id']} with different "
+                           "content; publish a new version")
+        if existing:
+            return {"release_id": release["id"], "collection": collection, "version": version,
+                    "already_recorded": True}
+        members = _members(con, collection, release)
+        publication = pub.publication_doc(col, version, code_version)
+        previous = target.current_release_id(collection)
+        expected = pub.release_doc(col, version, members, publication["id"], previous, bundle.manifest_file,
+                                   bundle.template_files, bundle.query_files)
+        if expected != release:
+            hint = (" (another release of this collection became current meanwhile: run the push again)"
+                    if release.get("was_revision_of") != previous else "")
+            raise pub.PublishError(f"the release is not the one this push makes ({expected['id']}){hint}")
+
+        sent: dict[str, dict] = {}
+        for group, cls in DOCUMENT_GROUPS.items():
+            if not isinstance(document.get(group, []), list):
+                raise pub.PublishError(f"document.{group} is a list")
+            for d in document.get(group, []):
+                sent[_verified(d, cls)["id"]] = d
+        objects = {release["id"]: ("ResultCollection", release), publication["id"]: ("Activity", publication)}
+        for f in (bundle.manifest_file, *bundle.template_files.values(), *bundle.query_files.values(),
+                  *pub.vocabulary_file_docs(col, bundle.prefix)):
+            objects[f["id"]] = ("File", f)
+        contexts, supplied = [], {}
+        for m in members:
+            dataset = sent.get(m)
+            if dataset is None:
+                raise pub.PublishError(f"member {m} has no Dataset record in the document")
+            objects[m] = ("Dataset", dataset)
+            files = {}
+            for entry in dataset.get("file_roles") or []:
+                role, f = entry.get("role"), sent.get(entry.get("file"))
+                if f is None or role not in col.doc["file_roles"] or idn.class_of(f["id"]) != "File":
+                    raise pub.PublishError(f"dataset {m}: its {role} file has no File record in the document")
+                if pub.result_file_doc(col, role, f["filename"], f["sha256"], f["size_in_bytes"], f["location"]) != f:
+                    raise pub.PublishError(f"dataset {m}: its {role} file's record is not this collection's record")
+                objects[f["id"]] = ("File", f)
+                files[role] = {"doc": f, "name": f["filename"]}
+            run = sent.get(dataset.get("was_generated_by"))
+            if run is None:
+                raise pub.PublishError(f"dataset {m}: its run Activity is not in the document")
+            objects[run["id"]] = ("Activity", run)
+            supplied[run["id"]] = objects[run["id"]]
+            for ctx in _contexts(bundle, {"doc": dataset, "files": files}):
+                contexts.append((ctx.activity["id"], m))
+                objects[ctx.activity["id"]] = ("Activity", ctx.activity)
+        for oid, d in sent.items():
+            if oid in objects and objects[oid][1] != d:
+                raise pub.PublishError(f"{oid}: the document's record is not the one this push makes")
+            if oid not in objects:
+                if oid not in provenance_ids:
+                    raise pub.PublishError(f"{oid} is in the document but is not a record this release carries")
+                objects[oid] = supplied[oid] = (idn.class_of(oid), d)
+        extra = body.get("objects") or []
+        if not isinstance(extra, list):
+            raise pub.PublishError("objects is a list of DAPPER documents")
+        for d in extra:
+            cls = idn.class_of(_verified(d)["id"])
+            if d["id"] in objects:  # one this service computes (a mint context's Activity): its own copy is kept
+                if objects[d["id"]][1] != d:
+                    raise pub.PublishError(f"{d['id']}: not the record this push makes")
+                continue
+            if d["id"] not in provenance_ids or cls in SERVICE_MINTED:
+                raise pub.PublishError(f"{d['id']}: only the provenance nodes the release's provenance record names "
+                                       "may be sent, and never a class the service mints")
+            objects[d["id"]] = supplied[d["id"]] = (cls, d)
+        known = set(objects) | provenance_ids
+        for group in pub_edge_groups():
+            edges = document.get(group, [])
+            if not isinstance(edges, list) or not all(
+                    isinstance(e, dict) and set(e) <= {"subject", "predicate", "object"}
+                    and all(isinstance(e.get(k), str) and len(e[k]) <= 256 for k in ("subject", "predicate", "object"))
+                    and e["subject"] in known and idn.class_of(e["object"]) for e in edges):
+                raise pub.PublishError(f"document.{group}: each edge is {{subject, predicate, object}}, from a record "
+                                       "of this release")
+        recorded = set(check(con, {"contexts": [a for a, _ in contexts]})["recorded"])
+        unrecorded = [a for a, _ in contexts if a not in recorded]
+        if unrecorded:
+            raise pub.PublishError(f"{len(unrecorded)} mint context(s) are not recorded yet, e.g. {unrecorded[0]}: "
+                                   "push their datasets again")
+        _unchanged(con, supplied)
+        target.record_release(col, release, document, objects, members, contexts, provenance, bundle.vocab(),
+                              bundle.template_files, bundle.query_files, code_version)
+        with con:
+            device_login._audit(con, "release_published", publisher["email"],
+                                f"{collection} {version} as {release['id']} with {publisher['token_id']}")
     return {"release_id": release["id"], "collection": collection, "version": version, "already_recorded": False,
             "published_by": publisher["email"]}
+
+
+def pub_edge_groups() -> list[str]:
+    from . import dapper_validation as dv
+
+    return list(dv.edge_groups())
 
 
 # --- routes ------------------------------------------------------------------------
@@ -516,10 +663,14 @@ async def check_route(collection: str, version: str, request: Request,
 @router.put("/{collection}/{version}/datasets/{dataset_id}")
 async def dataset_route(collection: str, version: str, dataset_id: str, request: Request,
                         publisher: dict = Depends(device_login.require_publisher)):
-    """Store one dataset from what its files hold, in one transaction. Repeating it changes nothing."""
+    """Store one dataset from what its files hold, in one transaction. Repeating it changes nothing. While
+    another request is storing the same dataset, answers 503 at once, before reading the body."""
     _names(collection, version)
     if idn.class_of(dataset_id) != "Dataset":
         raise HTTPException(status_code=404, detail=f"{dataset_id!r} is not a Dataset id.")
+    if await run_in_threadpool(_busy, "dataset", dataset_id):
+        raise HTTPException(status_code=503, detail=f"{dataset_id} is being stored by another request; try again",
+                            headers={"Retry-After": "30"})
     body = await _body(request)
     return await run_in_threadpool(_call, put_dataset, collection, dataset_id, body, publisher)
 

@@ -104,6 +104,52 @@ def _source_file_doc(src: SourceFile, description: str, mime_type: str = "applic
     })
 
 
+def vocabulary_file_docs(col: Collection, prefix: str | None = None) -> list[dict]:
+    """The File records of the collection's mapping and cross-reference files (prefix: as collection_file_docs)."""
+    out = []
+    for block, dim, rel in vocabulary_files(col.doc):
+        path = (col.root / rel).resolve()
+        what = "mapping" if block == "mappings" else "cross-references"
+        location = None if prefix is None else (f"{prefix}/{rel}" if prefix else rel)
+        out.append(_source_file_doc(SourceFile(path=path, rel=rel, data=path.read_bytes(), doc={}),
+                                    f"{col.key} {what} for {dim}.", "text/tab-separated-values", location=location))
+    return out
+
+
+def publication_doc(col: Collection, version: str, code_version: str) -> dict:
+    """The Activity that publishes a release."""
+    return idn.mint("Activity", {
+        "name": f"Publish {col.key} {version}",
+        "description": (f"Built release {version} of the {col.key} collection from its manifest, "
+                        "checked each result file's sha256, and recorded the release."),
+        "activity_type": "ResultCollectionPublication",
+        "software_name": engine.SOFTWARE,
+        "software_version": engine.ENGINE_VERSION,
+        "code_version": code_version,
+    })
+
+
+def release_doc(col: Collection, version: str, members: list[str], publication_id: str, previous_id: str | None,
+                manifest_file: dict, template_files: dict, query_files: dict) -> dict:
+    """A release's ResultCollection record."""
+    doc = col.doc
+    return idn.mint("ResultCollection", {
+        "name": f"{doc['title']} {version}",
+        "collection_key": col.key,
+        "version": version,
+        "description": doc.get("description"),
+        "methods": doc["methods"],
+        "dataset_dimensions": [d["name"] for d in doc["dataset_dimensions"]],
+        "members": members,
+        "n_members": len(members),
+        "has_claim_template": [template_files[t.doc["template"]]["id"] for t in col.templates],
+        "has_query_template": [query_files[n]["id"] for n in col.queries] or None,
+        "has_manifest_file": manifest_file["id"],
+        "was_generated_by": publication_id,
+        "was_revision_of": previous_id,
+    })
+
+
 def repository_prefix(col: Collection) -> str:
     """The collection directory's path in its git repository ("" when it is not in one): what a push sends so
     the API computes the same File records for the collection's files (collection_file_docs)."""
@@ -406,12 +452,8 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
     if skipped:
         warnings.append(f"{len(skipped)} dataset(s) left out: their dimension values resolve through no mapping "
                         f"(`unmapped: skip`): {', '.join(sorted(skipped)[:5])}{', ...' if len(skipped) > 5 else ''}")
-    for block, dim, rel in vocabulary_files(doc):
-        path = (col.root / rel).resolve()
-        what = "mapping" if block == "mappings" else "cross-references"
-        vocab_file = keep("File", _source_file_doc(
-            SourceFile(path=path, rel=rel, data=path.read_bytes(), doc={}), f"{col.key} {what} for {dim}.",
-            "text/tab-separated-values"))
+    for vocab_file in vocabulary_file_docs(col):
+        keep("File", vocab_file)
         used_edges.append({"subject": "__publication__", "predicate": "prov:used", "object": vocab_file["id"]})
 
     # --- the release -----------------------------------------------------
@@ -420,34 +462,13 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
         # Re-publishing a version keeps the predecessor it was first published with.
         existing = target.existing_release(col.key, spec["version"])
         previous_id = existing["was_revision_of"] if existing else target.current_release_id(col.key)
-        publication = keep("Activity", idn.mint("Activity", {
-            "name": f"Publish {col.key} {spec['version']}",
-            "description": (f"Built release {spec['version']} of the {col.key} collection from its manifest, "
-                            "checked each result file's sha256, and recorded the release."),
-            "activity_type": "ResultCollectionPublication",
-            "software_name": engine.SOFTWARE,
-            "software_version": engine.ENGINE_VERSION,
-            "code_version": code_version,
-        }))
+        publication = keep("Activity", publication_doc(col, spec["version"], code_version))
         used_edges.append({"subject": publication["id"], "predicate": "prov:used", "object": manifest_file["id"]})
         for e in used_edges:
             if e["subject"] == "__publication__":
                 e["subject"] = publication["id"]
-        release = idn.mint("ResultCollection", {
-            "name": f"{doc['title']} {spec['version']}",
-            "collection_key": col.key,
-            "version": spec["version"],
-            "description": doc.get("description"),
-            "methods": doc["methods"],
-            "dataset_dimensions": dim_names,
-            "members": [d["doc"]["id"] for d in datasets],
-            "n_members": len(datasets),
-            "has_claim_template": [template_files[t.doc["template"]]["id"] for t in col.templates],
-            "has_query_template": [query_files[n]["id"] for n in col.queries] or None,
-            "has_manifest_file": manifest_file["id"],
-            "was_generated_by": publication["id"],
-            "was_revision_of": previous_id,
-        })
+        release = release_doc(col, spec["version"], [d["doc"]["id"] for d in datasets], publication["id"],
+                              previous_id, manifest_file, template_files, query_files)
         keep("ResultCollection", release)
         if existing and existing["release_id"] != release["id"] and not dry_run:
             raise PublishError(f"{col.key} {spec['version']} is already published as {existing['release_id']} "
@@ -840,9 +861,18 @@ def assemble_rows(col: Collection, ds: dict, ents: _Entities, kind: str, extract
             if m not in row or not (isinstance(span, list) and len(span) == 3):
                 raise PublishError(f"{where}: metric {m!r} is missing")
             try:
-                idn.num(row[m])
+                value = idn.num(row[m])
             except (TypeError, ValueError) as exc:
                 raise PublishError(f"{where}: metric {m!r} is not a finite number") from exc
+            start, length, text = span
+            # The span is what a claim quotes as the file's own bytes: it must be this value's text.
+            try:
+                quoted = idn.num(json.loads(text)) if isinstance(text, str) else None
+            except (TypeError, ValueError):
+                quoted = None
+            if not (type(start) is int and type(length) is int and start >= 0 and isinstance(text, str)
+                    and length == len(text.encode()) and quoted == value):
+                raise PublishError(f"{where}: the byte span of {m!r} is not the text of its value")
         subject_id, subject_label = ents.ident(rk["subject"]["entity"], subject_value)
         if subject_id in seen:
             raise PublishError(f"{where}: {subject_value!r} appears twice in {f['name']}")
@@ -994,9 +1024,9 @@ class SqlTarget:
         _refuse_other_slice(self.con, ds)
 
     def put_dataset(self, col: Collection, ds: dict, vocab, extract: dict | None, pending: list,
-                    step: Callable[[str], None] | None = None) -> dict:
+                    step: Callable[[str], None] | None = None, on_store: Callable | None = None) -> dict:
         """Store a dataset from what its files hold (None when it is stored already) and record its pending
-        mint contexts, in one transaction."""
+        mint contexts, in one transaction; `on_store(con)` runs in it when the dataset is stored."""
         con = self.con
         for attempt in range(1, 4):
             objects: dict[str, tuple[str, dict]] = {}
@@ -1005,6 +1035,8 @@ class SqlTarget:
                 with con:
                     if extract is not None:
                         n_rows, n_edges = store_dataset(con, col, ds, extract, objects, vocab)
+                        if on_store:
+                            on_store(con)
                     for ctx in pending:
                         _record_context(con, ctx)
                     _store_objects(con, objects)

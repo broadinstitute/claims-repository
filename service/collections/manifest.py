@@ -99,6 +99,7 @@ class Collection:
 
 
 def _read(path: Path, root: Path, schema_name: str) -> SourceFile:
+    path = path.resolve()  # `..` and links are followed before the check, never after
     if not path.is_relative_to(root):
         raise ManifestError(f"{path} is outside the collection directory {root}; "
                             "template and query paths must be inside it")

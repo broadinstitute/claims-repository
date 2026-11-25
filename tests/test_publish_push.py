@@ -36,6 +36,12 @@ PUBLISHER = "publisher@example.org"
 QUERY = "top-genes-with-sets"
 
 
+@pytest.fixture(autouse=True)
+def _quick_retries(monkeypatch):
+    monkeypatch.setattr(push, "RETRIES", 2)
+    monkeypatch.setattr(push.time, "sleep", lambda _s: None)
+
+
 @pytest.fixture(scope="module")
 def pushed_db():
     """The deployed service's database for this module (the server thread connects through DB_PATH)."""
@@ -319,15 +325,15 @@ def test_a_release_is_recorded_only_as_this_push_makes_it(api, token, tmp_path):
                                                               "objects": [], "provenance": provenance,
                                                               "code_version": code_version})
 
-    assert "not pigean 0.4.0-other" in finish(version="0.4.0-other").json()["detail"]
+    assert "not the one this push makes" in finish(version="0.4.0-other").json()["detail"]
     forged = idn.mint("ResultCollection", {**{k: v for k, v in release.items() if k != "id"},
                                            "was_revision_of": "dapper:ResultCollection.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"})
     r = finish(rel=forged)
-    assert r.status_code == 400 and "was_revision_of" in r.json()["detail"]
+    assert r.status_code == 400 and "became current meanwhile" in r.json()["detail"]
     unstored = idn.mint("ResultCollection", {**{k: v for k, v in release.items() if k != "id"},
                                              "members": [*release["members"], "dapper:Dataset.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],
                                              "n_members": release["n_members"] + 1})
-    assert "no Dataset record" in finish(rel=unstored).json()["detail"]
+    assert "not stored for pigean" in finish(rel=unstored).json()["detail"]
     ok = finish()
     assert ok.status_code == 200 and ok.json()["published_by"] == PUBLISHER
     assert finish().json()["already_recorded"] is True
@@ -387,3 +393,145 @@ def test_the_cli_publishes_with_api_and_workers(api, token, pushed_db, tmp_path)
     assert out.returncode != 0 and "not signed in" in out.stderr
     out = subprocess.run(base + ["--api", "http://api.example.org"], cwd=ROOT, env=env, capture_output=True, text=True)
     assert out.returncode != 0 and "not an https URL" in out.stderr
+
+
+# --- review findings (2026-11-24) ---------------------------------------------------------
+
+def test_a_bundle_never_reads_outside_itself(api, token):
+    import yaml
+
+    col = load_collection(COLLECTION)
+    files = push.collection_files(col)
+    manifest = yaml.safe_load(files["collection.yaml"])
+    manifest["templates"] = ["../../../../../../../../etc/hosts"]
+    sent = {k: v for k, v in files.items() if not k.startswith("templates/")}
+    sent["collection.yaml"] = yaml.safe_dump(manifest)
+    r = _send(api, token, "POST", "1.0:begin", {"files": sent})
+    assert r.status_code == 400 and "not sent" in r.json()["detail"] and "localhost" not in r.text
+    before = set(publish_api._BUNDLE_DIR.iterdir())
+    broken = {**files, "templates/gene.yaml": "not: [a template"}
+    assert _send(api, token, "POST", "1.0:begin", {"files": broken}).status_code == 400
+    assert set(publish_api._BUNDLE_DIR.iterdir()) == before  # nothing left behind
+
+
+def test_finish_stores_only_what_the_release_carries(api, token, tmp_path):
+    spec = _spec(tmp_path, "0.6.0-objects", ("FIXOBJ", "FIXOBJ2"))
+    col = load_collection(COLLECTION)
+    sent = {}
+
+    class Recording(push.RemoteTarget):
+        def record_release(self, *args, **kw):
+            sent["args"], sent["bundle"] = args, self.bundle
+            raise PublishError("stopped before finishing")
+
+    with pytest.raises(PublishError, match="stopped"):
+        publish(None, col, spec, tmp_path, target=Recording(api, token["access_token"], col, spec["version"]))
+    _, release, document, _objects, *_ = sent["args"]
+    provenance, code_version = sent["args"][6], sent["args"][10]
+
+    def finish(doc=document, objects=(), prov=provenance):
+        return _send(api, token, "POST", "0.6.0-objects:finish", {
+            "bundle": sent["bundle"], "release": release, "document": doc, "objects": list(objects),
+            "provenance": prov, "code_version": code_version})
+
+    gene_set = idn.mint("GeneSet", {"name": "forged", "members": ["HGNC.SYMBOL:FIXG1"]})
+    claim_like = idn.mint("Activity", {"name": "unrelated activity"})
+    r = finish(objects=[gene_set])
+    assert r.status_code == 400 and "never a class the service mints" in r.json()["detail"]
+    r = finish(objects=[gene_set], prov=[{"ids": [gene_set["id"]]}])
+    assert r.status_code == 400 and "never a class the service mints" in r.json()["detail"]
+    r = finish(doc={**document, "activities": [*document["activities"], claim_like]})
+    assert r.status_code == 400 and "not a record this release carries" in r.json()["detail"]
+    r = finish(doc={**document, "used_edges": [{"subject": "dapper:Activity.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                                                "predicate": "prov:used", "object": release["id"]}]})
+    assert r.status_code == 400 and "from a record of this release" in r.json()["detail"]
+    r = finish(doc={**document, "extra_key": 1})
+    assert r.status_code == 400
+    tampered = json.loads(json.dumps(document))
+    member_files = {e["file"] for d in document["datasets"] for e in d["file_roles"]}
+    tampered["files"] = [idn.mint("File", {**{k: v for k, v in f.items() if k != "id"}, "mime_type": "text/plain"})
+                         if f["id"] in member_files else f for f in tampered["files"]]
+    r = finish(doc=tampered)
+    assert r.status_code == 400  # a member's File record is recomputed from the collection's file roles
+    assert finish().status_code == 200
+
+
+def test_spans_must_quote_the_value(api, token, tmp_path):
+    bundle = _begin(api, token, "9.9.8-spans")
+    dataset_id, dataset, extract = _one_dataset(tmp_path, "FIXSPAN")
+    forged = json.loads(json.dumps(extract))
+    first = forged["rows"]["gene_phenotype"][0]
+    spans = json.loads(first["spans"])
+    metric = next(iter(spans))
+    spans[metric] = [spans[metric][0], 6, "1e-300"]
+    first["spans"] = idn.canonical(spans)
+    r = _send(api, token, "PUT", f"9.9.8-spans/datasets/{dataset_id}",
+              {"bundle": bundle, "dataset": dataset, "extract": forged})
+    assert r.status_code == 400 and "byte span" in r.json()["detail"]
+
+
+def test_object_collections_and_nan_are_refused(api, token, pushed_db):
+    col = load_collection(COLLECTION)
+    con = service_db.connect(pushed_db)
+    try:
+        with con:
+            con.execute("INSERT INTO object_collections (collection_key, definition) VALUES ('pigean', '{}')")
+        r = _send(api, token, "POST", "1.0:begin", {"files": push.collection_files(col)})
+        assert r.status_code == 409 and "object collection" in r.json()["detail"]
+    finally:
+        with con:
+            con.execute("DELETE FROM object_collections WHERE collection_key = 'pigean'")
+        con.close()
+    r = httpx.post(f"{api}/v1/publish/pigean/1.0:check", content=b'{"datasets": [NaN]}',
+                   headers={"Authorization": "Bearer " + token["access_token"]})
+    assert r.status_code == 400 and "NaN" in r.json()["detail"]
+
+
+def test_a_dataset_being_stored_answers_busy_before_its_body(api, token):
+    dataset_id = "dapper:Dataset." + "B" * 32
+    _, digest = publish_api._lock_name("dataset", dataset_id)
+    lock = publish_api._LOCAL_LOCKS[int(digest[:8], 16) % len(publish_api._LOCAL_LOCKS)]
+    with lock:
+        r = _send(api, token, "PUT", f"1.0/datasets/{dataset_id}", {"bundle": "0" * 64})
+    assert r.status_code == 503 and r.headers["retry-after"] == "30"
+
+
+def test_two_finishes_of_one_version_record_one_release(api, token, pushed_db, tmp_path):
+    spec = _spec(tmp_path, "0.7.0-race", ("FIXRACE", "FIXRACE2"))
+    col = load_collection(COLLECTION)
+    captured = []
+
+    class Recording(push.RemoteTarget):
+        def record_release(self, *args, **kw):
+            captured.append((args, self.bundle))
+            raise PublishError("stopped")
+
+    with pytest.raises(PublishError):
+        publish(None, col, spec, tmp_path, target=Recording(api, token["access_token"], col, spec["version"]))
+    (args, bundle), = captured
+    _, release, document, _o, *_ = args
+    from service.collections import publish as pub
+
+    loaded = publish_api._bundle(service_db.connect(pushed_db), "pigean", bundle)
+    bodies = []
+    for code_version in ("aaaa", "bbbb"):
+        publication = pub.publication_doc(col, "0.7.0-race", code_version)
+        rel = pub.release_doc(col, "0.7.0-race", release["members"], publication["id"], release["was_revision_of"],
+                              loaded.manifest_file, loaded.template_files, loaded.query_files)
+        doc = json.loads(json.dumps(document).replace(release["was_generated_by"], publication["id"]))
+        doc["result_collections"] = [rel]
+        doc["activities"] = [publication if a["id"] == publication["id"] else a for a in doc["activities"]]
+        bodies.append({"bundle": bundle, "release": rel, "document": doc, "objects": [], "provenance": args[6],
+                       "code_version": code_version})
+    results = []
+    threads = [threading.Thread(target=lambda b=b: results.append(_send(api, token, "POST", "0.7.0-race:finish", b)))
+               for b in bodies]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sorted(r.status_code for r in results) == [200, 409], [r.text for r in results]
+    con = service_db.connect(pushed_db)
+    try:
+        current = con.execute("SELECT current_release_id FROM collections WHERE collection_key = 'pigean'").fetchone()[0]
+        assert con.execute("SELECT 1 FROM collection_releases WHERE release_id = ?", (current,)).fetchone()
+    finally:
+        con.close()

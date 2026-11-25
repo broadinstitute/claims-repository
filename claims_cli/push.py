@@ -55,7 +55,10 @@ class RemoteTarget:
         self._asked: set[str] = set()
 
     # --- HTTP --------------------------------------------------------------------
-    def _send(self, method: str, path: str, body: dict) -> dict:
+    def _send(self, method: str, path: str, body: dict, settled=None) -> dict:
+        """One request, tried again on a 5xx or a dropped connection. `settled()`, when given, is asked before
+        each retry whether the first attempt's work got done anyway (a request the load balancer timed out
+        keeps running on the service): its answer, when not None, is returned instead of sending again."""
         data = gzip.compress(json.dumps(body, separators=(",", ":")).encode(), compresslevel=6)
         headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json",
                    "Content-Encoding": "gzip", "Accept": "application/json", "User-Agent": auth.CLIENT}
@@ -76,13 +79,21 @@ class RemoteTarget:
                 if exc.code < 500 or attempt == RETRIES:
                     raise PublishError(f"{self.api} refused it ({exc.code}): {detail or exc.reason}")
                 reason = f"{exc.code} {detail or exc.reason}"
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 if attempt == RETRIES:
                     raise PublishError(f"cannot reach {self.api}: {getattr(exc, 'reason', exc)}")
                 reason = str(getattr(exc, "reason", exc))
+                retry_after = None
             wait = min(60, 5 * 2 ** (attempt - 1))
+            if retry_after and retry_after.isdigit():
+                wait = max(wait, min(120, int(retry_after)))
             print(f"  {reason}; trying again in {wait}s", file=sys.stderr, flush=True)
             time.sleep(wait)
+            if settled is not None:
+                done = settled()
+                if done is not None:
+                    return done
         raise AssertionError("unreachable")
 
     # --- what publish() asks ------------------------------------------------------
@@ -117,8 +128,16 @@ class RemoteTarget:
         dataset = {"raw_dimensions": {n: d["raw"] for n, d in ds["dims"].items()},
                    "files": {role: f["doc"] for role, f in ds["files"].items()},
                    "where": ds.get("where") or {}, "was_generated_by": ds["doc"]["was_generated_by"]}
-        done = self._send("PUT", f"datasets/{urllib.parse.quote(ds['doc']['id'], safe=':')}",
-                          {"bundle": self.bundle, "dataset": dataset, "extract": extract})
+        dataset_id = ds["doc"]["id"]
+
+        def settled():  # stored by the attempt that timed out: done, nothing to send again
+            got = self._send("POST", ":check", {"datasets": [dataset_id],
+                                                "contexts": [c.activity["id"] for c in pending]})
+            if dataset_id in got["stored"] and len(got["recorded"]) == len(pending):
+                return {"dataset_id": dataset_id, "rows": 0, "edges": 0, "contexts": 0, "objects": 0}
+            return None
+        done = self._send("PUT", f"datasets/{urllib.parse.quote(dataset_id, safe=':')}",
+                          {"bundle": self.bundle, "dataset": dataset, "extract": extract}, settled=settled)
         if done.get("dataset_id") != ds["doc"]["id"]:
             raise PublishError(f"{self.api} stored {done.get('dataset_id')}, not {ds['doc']['id']}")
         self._stored.add(ds["doc"]["id"])

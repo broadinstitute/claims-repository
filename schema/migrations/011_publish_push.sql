@@ -1,9 +1,11 @@
 -- 011_publish_push.sql — publishing a release into the deployed service with a
 -- `claims login` token (2026-11-24; design: docs/publishing-to-a-deployment.md).
 -- A release records who pushed it (NULL for one published with the database
--- password), and publish_bundles keeps the collection files each push sent,
--- once per digest, so every request of a push is checked against the same
--- collection. Additive only: the previous build keeps working on the migrated
+-- password); publish_datasets records who pushed each dataset, for which
+-- collection, so a release's members are bound to its collection and its rows
+-- to the person who sent them; publish_bundles keeps the collection files each
+-- push sent, once per digest, so every request of a push is checked against
+-- the same collection. Additive only: the previous build keeps working on the migrated
 -- database (prod shares it).
 
 ALTER TABLE collection_releases ADD COLUMN published_by VARCHAR(320) NULL;
@@ -16,4 +18,15 @@ CREATE TABLE IF NOT EXISTS publish_bundles (
   created_by VARCHAR(320) NOT NULL,
   created_at DATETIME NOT NULL,
   PRIMARY KEY (bundle_sha256)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+
+CREATE TABLE IF NOT EXISTS publish_datasets (
+  dataset_id VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  collection_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  bundle_sha256 CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  published_by VARCHAR(320) NOT NULL,
+  publisher_token_id VARCHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+  stored_at DATETIME NOT NULL,
+  PRIMARY KEY (dataset_id),
+  KEY idx_pd_collection (collection_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
