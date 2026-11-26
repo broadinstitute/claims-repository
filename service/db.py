@@ -16,6 +16,7 @@ and the Dialect object carries the few fragments that genuinely differ
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -199,13 +200,17 @@ CREATE TABLE IF NOT EXISTS api_keys (
   revoked_at TEXT,
   revoked_by TEXT
 );
+-- A deposit is made by a key (key_id) or by a `claims login` (publisher_token_id and publisher_email, 012):
+-- the service writes exactly one of the two.
 CREATE TABLE IF NOT EXISTS deposits (
   deposit_id TEXT PRIMARY KEY,
-  key_id TEXT NOT NULL,
+  key_id TEXT,
   received_at TEXT NOT NULL,
   object_count INTEGER NOT NULL,
   collection_key TEXT,
-  release_version TEXT
+  release_version TEXT,
+  publisher_token_id TEXT,
+  publisher_email TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_deposits_key ON deposits (key_id, received_at);
 -- Object collections (008_object_collections.sql): releases built from deposits.
@@ -229,8 +234,13 @@ CREATE TABLE IF NOT EXISTS object_releases (
   definition TEXT NOT NULL,
   release_id TEXT,
   opened_at TEXT NOT NULL,
-  opened_by TEXT NOT NULL,
+  opened_by TEXT,
   closed_at TEXT,
+  opened_by_token_id TEXT,
+  opened_by_email TEXT,
+  closed_by TEXT,
+  closed_by_token_id TEXT,
+  closed_by_email TEXT,
   PRIMARY KEY (collection_key, version)
 );
 CREATE TABLE IF NOT EXISTS release_objects (
@@ -627,7 +637,46 @@ def _connect_sqlite(path: str | None) -> Connection:
     if "published_by" not in cols:
         raw.execute("ALTER TABLE collection_releases ADD COLUMN published_by TEXT")
         raw.execute("ALTER TABLE collection_releases ADD COLUMN publisher_token_id TEXT")
+    # ... and for DBs created before a `claims login` could deposit and open or close a release (012).
+    _relax_not_null(raw, "deposits", "key_id")
+    _relax_not_null(raw, "object_releases", "opened_by")
     return Connection(raw, "sqlite")
+
+
+def _relax_not_null(raw, table: str, column: str) -> None:
+    """Bring a table created before 012 to SQLITE_DDL's definition: its new columns, and `column` nullable.
+    SQLite cannot drop NOT NULL in place, so the table is rebuilt as its documentation describes (create the
+    new table, copy every row, drop the old one, rename, recreate its indexes), in one transaction: an
+    interrupted upgrade leaves the old table as it was. Only local SQLite files ever take this path; MySQL
+    is migrated by schema/migrations/012_login_deposits.sql."""
+    info = {r[1]: r for r in raw.execute(f"PRAGMA table_info({table})")}
+    body = re.search(rf"CREATE TABLE IF NOT EXISTS {table} \((.*?)\n\);", SQLITE_DDL, re.S).group(1)
+    wanted = {line.strip().split()[0]: line.strip().rstrip(",") for line in body.splitlines()
+              if line.strip() and not line.strip().startswith(("PRIMARY KEY", "UNIQUE", "--"))}
+    if column not in info or not info[column][3]:  # [3]: notnull. Nullable already: add any missing column.
+        for name, definition in wanted.items():
+            if name not in info:
+                raw.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+        return
+    kept = [c for c in wanted if c in info]
+    index_sql = [r[0] for r in raw.execute("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? "
+                                           "AND sql IS NOT NULL", (table,))]
+    raw.commit()
+    try:
+        raw.execute("BEGIN IMMEDIATE")
+        if not [r for r in raw.execute(f"PRAGMA table_info({table})") if r[1] == column and r[3]]:
+            raw.rollback()  # another connection upgraded it meanwhile
+            return
+        raw.execute(f"CREATE TABLE {table}_012 ({body}\n)")
+        raw.execute(f"INSERT INTO {table}_012 ({', '.join(kept)}) SELECT {', '.join(kept)} FROM {table}")
+        raw.execute(f"DROP TABLE {table}")
+        raw.execute(f"ALTER TABLE {table}_012 RENAME TO {table}")
+        for sql in index_sql:
+            raw.execute(sql)
+        raw.commit()
+    except BaseException:
+        raw.rollback()
+        raise
 
 
 def _connect_mysql() -> Connection:
