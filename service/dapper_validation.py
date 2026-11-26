@@ -36,9 +36,6 @@ _dapper = cidn._dapper
 REF_CLASS_RE = re.compile(r"^dapper:([A-Za-z]+)\.")
 BARE_DIGEST_RE = re.compile(r"[A-Za-z0-9_-]{32}\Z")
 MAX_ERRORS = 8  # per object: enough to fix a document in one pass, bounded for the response
-# Values in one node, counted before dapper's identity code builds a graph from them. dapper's own bound: a node
-# that dapper can mint is never refused here for its size.
-MAX_VALUES = _dapper.MAX_TRIPLES
 
 
 class Invalid(ValueError):
@@ -116,14 +113,6 @@ def _is_a(class_name: str) -> frozenset[str]:
 def hashable_slots(class_name: str) -> frozenset[str]:
     """The slots dapper's identity hashes for this class."""
     return frozenset(_dapper.hashable_slot_names(cidn.schema_view(), class_name))
-
-
-def _count(value) -> int:
-    if isinstance(value, dict):
-        return 1 + sum(_count(item) for item in value.values())
-    if isinstance(value, list):
-        return 1 + sum(_count(item) for item in value)
-    return 1
 
 
 def _spelling_errors(value, slot: str, errors: list[str]) -> None:
@@ -225,8 +214,6 @@ def validate_node(node, expected_class: str | None = None) -> tuple[str, str, di
     if "class_name" in node and node["class_name"] != class_name:
         raise Invalid(f"{oid}: class_name {str(node['class_name'])[:60]!r} disagrees with the id's class {class_name}")
     content = {k: v for k, v in node.items() if k not in ("id", "class_name") and v is not None}
-    if _count(content) > MAX_VALUES:
-        raise Invalid(f"{oid}: an object holds at most {MAX_VALUES} values")
     errors = _shape_errors(class_name, content)
     for key, value in content.items():
         _spelling_errors(value, key, errors)
