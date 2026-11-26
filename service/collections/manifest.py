@@ -148,7 +148,7 @@ def check_object_collection(col: Collection) -> None:
     doc = col.doc
     problems: list[str] = []
     known = dval.node_classes()
-    kinds = doc["object_kinds"]
+    kinds = doc.get("object_kinds") or {}  # optional: a plain list collection indexes no fields
     for cls, spec in kinds.items():
         if cls not in known:
             problems.append(f"object_kinds: {cls!r} is not a class of the vendored DAPPER schema")

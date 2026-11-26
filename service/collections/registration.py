@@ -167,7 +167,7 @@ def manifest_facets(doc: dict) -> dict:
     """The parts of a manifest the console shows, camelCased at the top level."""
     if doc.get("kind") == "objects":  # an object collection: classes and their fields instead of files and rows
         return {"kind": "objects", "dimensions": [], "entities": {}, "rowKinds": {}, "edgeKinds": {}, "fileRoles": {},
-                "metrics": [], "tierRules": {}, "objectKinds": doc["object_kinds"]}
+                "metrics": [], "tierRules": {}, "objectKinds": doc.get("object_kinds") or {}}
     return {
         "kind": "files",
         "dimensions": [{"name": d["name"], "resolve": d.get("resolve"), "description": d.get("description")}

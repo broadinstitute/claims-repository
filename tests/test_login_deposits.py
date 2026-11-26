@@ -263,3 +263,53 @@ def test_still_valid_rechecks_a_login_for_revocation_and_expiry(token):
         assert not api_keys.still_valid(con, {**actor, "token_id": "tok_0000000000000000"})
     finally:
         con.close()
+
+
+# --- a plain list collection: no object_kinds, no queries ----------------------------------------------------
+
+PLAIN_MANIFEST = """collection: plain-list
+kind: objects
+title: A plain list of gene sets
+methods: [tests]
+dapper_profile: 0.2.1-a1
+"""
+GSC = _mint("GeneSetCollection", name="Plain sets", collection_key="plain", version="1")
+SETS = [_mint("GeneSet", name=f"PLAIN_{i}", members=["NOD2"], member_type="gene", n_members=1,
+              in_gene_set_collection=[GSC["id"]]) for i in range(3)]
+
+
+def test_a_plain_list_collection_holds_members_without_kinds_or_queries(isolated_db, token, tmp_path, monkeypatch):
+    (tmp_path / "collection.yaml").write_text(PLAIN_MANIFEST)
+    col = load_collection(tmp_path)
+    assert col.queries == {} and "object_kinds" not in col.doc
+    con = _con()
+    try:
+        assert objects.register(con, col)["queries"] == []
+    finally:
+        con.close()
+    h = bearer(token)
+    assert writer.post("/v1/collections/plain-list/releases", json={"version": "1"}, headers=h).status_code == 201
+    part = writer.post("/v1/deposits", json={"document": {"gene_set_collections": [GSC], "gene_sets": SETS},
+                                             "collection": "plain-list", "release": "1"}, headers=h)
+    assert part.status_code == 200 and part.json()["collection"]["objects"] == 4, part.text
+    closed = writer.post("/v1/collections/plain-list/releases/1:close", headers=h)
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["classes"] == {"GeneSet": 3, "GeneSetCollection": 1}
+    assert not _rows("SELECT 1 FROM release_object_fields WHERE collection_key = 'plain-list'")
+
+    members = writer.get("/v1/collections/plain-list/releases/1/members", params={"class": "GeneSet"})
+    assert members.status_code == 200 and members.text.split() == sorted(s["id"] for s in SETS)
+    assert writer.get(f"/v1/objects/{SETS[0]['id']}").json()["name"] == "PLAIN_0"
+    described = writer.get("/v1/collections/plain-list")
+    assert described.status_code == 200, described.text
+    assert described.json()["queries"] == [] and described.json()["object_kinds"] == {}
+    assert described.json()["objects"]["total"] == 4
+    document = writer.get("/v1/collections/plain-list/releases/1/document").json()
+    rc = document["result_collections"][0]
+    assert "has_query_template" not in rc and rc["id"] == closed.json()["release_id"]
+    assert writer.get("/v1/collections/plain-list/queries").json()["queries"] == []
+    assert any(c["id"] == "plain-list" for c in writer.get("/v1/collections").json()["collections"])
+    assert writer.get("/v1/queries").status_code == 200
+    admin = _admin(monkeypatch)
+    for path in ("collections", "collections/plain-list", "overview"):
+        assert writer.get(f"/v1/admin/api/{path}", headers=admin("admin_read")).status_code == 200, path

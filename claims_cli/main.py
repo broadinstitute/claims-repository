@@ -505,7 +505,10 @@ def cmd_collection_validate(args):
               f"{len(d.get('relations') or {})} relations")
         print("templates    ok   " + ", ".join(f"{t.doc['template']} ({len(t.doc['claims'])} claims)"
                                                for t in col.templates) + "; every placeholder resolves")
-    print("queries      ok   " + ", ".join(col.queries) + ": no step orders or filters on another kind's metric")
+    if col.queries:
+        print("queries      ok   " + ", ".join(col.queries) + ": no step orders or filters on another kind's metric")
+    else:
+        print("queries      ok   none")
     commit, dirty, _ = _git_info(col.manifest.path)
     git = (f"{commit[:7]}{', uncommitted changes' if dirty else ', clean'}" if commit
            else "not in git (a release records it as uncommitted)")

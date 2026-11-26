@@ -190,7 +190,7 @@ def _values(value) -> list:
 def add_objects(con, key: str, version: str, defn: dict, deposit_id: str, items: list[dict]) -> int:
     """Record deposited objects as members of the release, and index the fields its object kinds declare.
     Idempotent: a member already recorded keeps its first deposit."""
-    kinds = defn["manifest"]["object_kinds"]
+    kinds = defn["manifest"].get("object_kinds") or {}  # none: members only, no indexed fields
     members, fields = [], []
     for item in items:
         members.append((key, version, item["id"], item["class_name"], deposit_id))
@@ -283,7 +283,7 @@ def close_release(con, depositor: dict, key: str, version: str) -> tuple[dict, b
             "members": [d["id"] for d in datasets],
             "n_members": len(datasets),
             "has_manifest_file": defn["manifest_file_id"],
-            "has_query_template": sorted(q["file_id"] for q in defn["queries"].values()) or None,
+            "has_query_template": sorted(q["file_id"] for q in (defn.get("queries") or {}).values()) or None,
             "was_revision_of": (current["current_release_id"] if current else None) or None,
         })
         for doc in (rc, *datasets, *(d for c, d in new.values() if c == "File")):
@@ -353,7 +353,7 @@ def describe(con, key: str, rel, record: dict) -> dict:
         "owners": m.get("owners", []), "methods": m["methods"], "dapper_profile": m["dapper_profile"],
         "release": {"id": rel["release_id"], "version": rel["version"], "git_commit": rel["git_commit"]},
         "releases": releases,
-        "object_kinds": m["object_kinds"],
+        "object_kinds": m.get("object_kinds") or {},
         "objects": {"total": sum(counts.values()), "classes": counts},
         "queries": sorted(record["queries"]),
         "vocabulary": sorted((record.get("mappings") or {})),
@@ -363,7 +363,7 @@ def describe(con, key: str, rel, record: dict) -> dict:
 
 def field_values(con, key: str, rel, record: dict, field: str, search: str | None, first: int | None,
                  max_values: int) -> dict:
-    if field not in {f for k in record["manifest"]["object_kinds"].values() for f in k["fields"]}:
+    if field not in {f for k in (record["manifest"].get("object_kinds") or {}).values() for f in k["fields"]}:
         raise CollectionNotFound(f"collection {key!r} has no field {field!r}")
     rows = con.execute("SELECT value, COUNT(*) AS n FROM release_object_fields WHERE collection_key = ? AND "
                        "version = ? AND field = ? GROUP BY value ORDER BY value", (key, rel["version"], field)).fetchall()
@@ -445,7 +445,7 @@ def _order(alias: str, order: dict | None) -> tuple[str, list]:
 def _view(payload: dict, cls: str, record: dict) -> dict:
     from ..objects import present
 
-    spec = record["manifest"]["object_kinds"].get(cls) or {}
+    spec = (record["manifest"].get("object_kinds") or {}).get(cls) or {}
     return {"class": cls, "id": payload["id"],
             "fields": {n: payload.get(r["slot"]) for n, r in spec.get("fields", {}).items()},
             "object": present(payload)}
@@ -462,7 +462,7 @@ def run_query(con, collection: str, name: str, variables: dict | None, release: 
         raise CollectionNotFound(f"collection {collection!r} has no query {name!r}; it has {sorted(record['queries'])}")
     qdoc = record["queries"][name]["doc"]
     bound = bind_params(qdoc, variables)
-    kinds = record["manifest"]["object_kinds"]
+    kinds = record["manifest"].get("object_kinds") or {}
     version = rel["version"]
     a = qdoc["plan"][0]["anchor"]
     conds, params = _conditions(con, "ro", a.get("where"), bound, record)
