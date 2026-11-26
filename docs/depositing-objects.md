@@ -116,3 +116,7 @@ Login deposits need `schema/migrations/012_login_deposits.sql` (deposits' `key_i
 `opened_by` become nullable; the token id, email and closer columns are added). It is additive: the previous
 build keeps working on the migrated database. Apply it before deploying the build that accepts login deposits.
 A local SQLite file is upgraded when the service connects.
+
+A plain list (no `object_kinds`) needs this build on every service reading the shared database: an older build
+expects `object_kinds` in a closed release's manifest, and its collection catalog (`/v1/queries`) and collection
+page would fail once such a release is current. Close a plain list's first release only after the deploy.
