@@ -11,6 +11,7 @@ strict: true
 nav:
   - Home: index.md
   - Introduction: introduction.md
+  - Architecture: architecture.md
   - Inputs and outputs: inputs-and-outputs.md
   - Collections: collections.md
   - Creating a collection: creating-a-collection.md
