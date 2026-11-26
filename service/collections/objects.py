@@ -9,7 +9,9 @@ held left as stored), and membership in the release is a record beside them.
 
 Life of a release:
 1. The collection's definition (manifest, query templates, vocabulary files)
-   is registered once from its directory (scripts/publish_collection.py).
+   is registered from its directory: `claims objects register` with a login
+   (POST /v1/publish/objects/{c}:register), or scripts/publish_collection.py
+   on the database.
 2. A key granted the collection, or a `claims login` (any collection), opens a
    release: POST /v1/collections/{c}/releases {"version": ...}.
 3. Deposits naming the collection and that release add their objects (any
@@ -51,11 +53,12 @@ def is_objects(record: dict) -> bool:
 
 # --- the definition ----------------------------------------------------------------------------------------
 
-def register(con, col: Collection, git_commit: str | None = None) -> dict:
-    """Record an object collection's definition from its directory: the manifest, query templates and
-    vocabulary as parsed, each file stored as a DAPPER File. Registering again replaces the definition;
-    releases already opened keep the one they were opened with."""
-    from .publish import SourceFile, _source_file_doc, _store_objects
+def build_definition(col: Collection, prefix: str | None = None) -> tuple[dict, dict]:
+    """(the definition record an object collection's directory makes, its File records by id): the manifest,
+    query templates and vocabulary as parsed, each file a DAPPER File. `prefix` is the collection directory's
+    path in its repository, as a push sends it (each File's location is `prefix/relpath`); None asks git, for
+    a directory on this machine. A File's id does not depend on its location."""
+    from .publish import SourceFile, _source_file_doc
 
     if not col.is_objects:
         raise ManifestError(f"{col.key} is not an object collection (kind: objects)")
@@ -69,31 +72,51 @@ def register(con, col: Collection, git_commit: str | None = None) -> dict:
         files[doc["id"]] = ("File", doc)
         return doc["id"]
 
-    manifest_file = keep(_source_file_doc(col.manifest, f"{col.key} collection manifest."))
-    queries = {name: {"file_id": keep(_source_file_doc(q, f"{col.key} query template {name}.")), "path": q.rel,
-                      "doc": q.doc} for name, q in col.queries.items()}
+    def at(rel: str) -> str | None:
+        return None if prefix is None else (f"{prefix}/{rel}" if prefix else rel)
+
+    manifest_file = keep(_source_file_doc(col.manifest, f"{col.key} collection manifest.",
+                                          location=at(col.manifest.rel)))
+    queries = {name: {"file_id": keep(_source_file_doc(q, f"{col.key} query template {name}.", location=at(q.rel))),
+                      "path": q.rel, "doc": q.doc} for name, q in col.queries.items()}
     vocab_files = []
     for block, dim, rel in vocabulary_files(col.doc):
         path = (col.root / rel).resolve()
         what = "mapping" if block == "mappings" else "cross-references"
         vocab_files.append(keep(_source_file_doc(SourceFile(path=path, rel=rel, data=path.read_bytes(), doc={}),
-                                                 f"{col.key} {what} for {dim}.", "text/tab-separated-values")))
+                                                 f"{col.key} {what} for {dim}.", "text/tab-separated-values",
+                                                 location=at(rel))))
     record = {"kind": "objects", "manifest": col.doc, "templates": [], "queries": queries,
               "manifest_file_id": manifest_file, "vocabulary_file_ids": vocab_files,
               "mappings": {dim: {k: list(v) for k, v in m.items()} for dim, m in vocab.mappings.items()},
               "vocabulary": vocab.entries}
+    return json.loads(json.dumps(record)), files
+
+
+def store_definition(con, col: Collection, record: dict, files: dict, git_commit: str | None) -> dict:
+    """Record a definition (build_definition) as the collection's: replaces any registered one. No commit."""
+    from .publish import _store_objects
+
+    _store_objects(con, files)
+    con.execute("DELETE FROM object_collections WHERE collection_key = ?", (col.key,))
+    con.execute("INSERT INTO object_collections (collection_key, definition, git_commit) VALUES (?, ?, ?)",
+                (col.key, json.dumps(record), git_commit))
+    if con.execute("SELECT 1 FROM collections WHERE collection_key = ?", (col.key,)).fetchone():
+        con.execute("UPDATE collections SET title = ?, description = ? WHERE collection_key = ?",
+                    (col.doc["title"], col.doc.get("description"), col.key))
+    else:
+        con.execute("INSERT INTO collections (collection_key, title, description, current_release_id) "
+                    "VALUES (?, ?, ?, NULL)", (col.key, col.doc["title"], col.doc.get("description")))
+    return {"collection": col.key, "queries": sorted(record["queries"]), "files": len(files)}
+
+
+def register(con, col: Collection, git_commit: str | None = None, prefix: str | None = None) -> dict:
+    """Record an object collection's definition from its directory: the manifest, query templates and
+    vocabulary as parsed, each file stored as a DAPPER File. Registering again replaces the definition;
+    releases already opened keep the one they were opened with."""
+    record, files = build_definition(col, prefix)
     with con:
-        _store_objects(con, files)
-        con.execute("DELETE FROM object_collections WHERE collection_key = ?", (col.key,))
-        con.execute("INSERT INTO object_collections (collection_key, definition, git_commit) VALUES (?, ?, ?)",
-                    (col.key, json.dumps(record), git_commit))
-        if con.execute("SELECT 1 FROM collections WHERE collection_key = ?", (col.key,)).fetchone():
-            con.execute("UPDATE collections SET title = ?, description = ? WHERE collection_key = ?",
-                        (col.doc["title"], col.doc.get("description"), col.key))
-        else:
-            con.execute("INSERT INTO collections (collection_key, title, description, current_release_id) "
-                        "VALUES (?, ?, ?, NULL)", (col.key, col.doc["title"], col.doc.get("description")))
-    return {"collection": col.key, "queries": sorted(queries), "files": len(files)}
+        return store_definition(con, col, record, files, git_commit)
 
 
 def definition(con, key: str) -> dict | None:

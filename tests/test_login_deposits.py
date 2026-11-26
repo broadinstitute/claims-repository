@@ -313,3 +313,107 @@ def test_a_plain_list_collection_holds_members_without_kinds_or_queries(isolated
     admin = _admin(monkeypatch)
     for path in ("collections", "collections/plain-list", "overview"):
         assert writer.get(f"/v1/admin/api/{path}", headers=admin("admin_read")).status_code == 200, path
+
+
+# --- registering a definition with a login -------------------------------------------------------------------
+
+def _files(root: Path) -> dict:
+    from claims_cli.push import collection_files
+
+    return collection_files(load_collection(root))
+
+
+def test_a_login_registers_an_object_collection(isolated_db, token, tmp_path):
+    import shutil
+
+    col = tmp_path / "registered-by-login"
+    shutil.copytree(COLLECTION, col)
+    (col / "collection.yaml").write_text((col / "collection.yaml").read_text().replace(
+        "collection: catalog-test", "collection: login-catalog"))
+    files = _files(col)
+    assert sorted(files) == ["collection.yaml", "mappings/disease.tsv", "queries/gap-with-anchors.yaml",
+                             "queries/gaps-by-disease.yaml", "queries/gene-sets-in-collection.yaml"]
+    url = "/v1/publish/objects/login-catalog:register"
+    body = {"files": files, "prefix": "collections/login-catalog", "git_commit": "abc1234"}
+    first = writer.post(url, json=body, headers=bearer(token))
+    assert first.status_code == 201, first.text
+    assert first.json() == {"collection": "login-catalog", "status": "registered", "files": 5, "git_commit": "abc1234",
+                            "queries": ["gap-with-anchors", "gaps-by-disease", "gene-sets-in-collection"]}
+    stored = _rows("SELECT definition, git_commit FROM object_collections WHERE collection_key = 'login-catalog'")[0]
+    assert stored["git_commit"] == "abc1234"
+    manifest_file = writer.get(f"/v1/objects/{__import__('json').loads(stored['definition'])['manifest_file_id']}")
+    assert manifest_file.json()["location"] == "collections/login-catalog/collection.yaml"
+
+    # The same definition again (another commit, another path) changes nothing; File ids ignore the location.
+    again = writer.post(url, json={**body, "prefix": "", "git_commit": "def5678"}, headers=bearer(token))
+    assert again.status_code == 200 and again.json()["status"] == "unchanged"
+    # Registered on the database by scripts/publish_collection.py: the same definition.
+    con = _con()
+    try:
+        objects.register(con, load_collection(col), "fromdisk")
+    finally:
+        con.close()
+    assert writer.post(url, json=body, headers=bearer(token)).json()["status"] == "unchanged"
+
+    changed = {**files, "collection.yaml": files["collection.yaml"].replace("title: Test catalog", "title: Renamed catalog")}
+    refused = writer.post(url, json={**body, "files": changed}, headers=bearer(token))
+    assert refused.status_code == 409 and "claims objects register --replace" in refused.json()["detail"]
+    replaced = writer.post(url, json={**body, "files": changed, "replace": True}, headers=bearer(token))
+    assert replaced.status_code == 200 and replaced.json()["status"] == "replaced"
+    assert objects.definition(_con(), "login-catalog")["manifest"]["title"].startswith("Renamed catalog")
+    events = [r["detail"].split()[1] for r in _rows(
+        "SELECT detail FROM admin_auth_events WHERE event = 'object_collection_registered' ORDER BY id")]
+    assert events == ["registered", "replaced"]
+
+    # Then the login opens a release of it, with no key and no grant.
+    opened = writer.post("/v1/collections/login-catalog/releases", json={"version": "1"}, headers=bearer(token))
+    assert opened.status_code == 201, opened.text
+
+
+def test_registering_refuses_what_is_not_an_object_collection(isolated_db, token, tmp_path):
+    pigean = ROOT / "tests" / "fixtures" / "collections" / "pigean"
+    files = _files(pigean)
+    key = load_collection(pigean).key
+    refused = writer.post(f"/v1/publish/objects/{key}:register", json={"files": files}, headers=bearer(token))
+    assert refused.status_code == 409 and "claims release publish" in refused.json()["detail"]
+
+    plain = {"collection.yaml": PLAIN_MANIFEST.replace("plain-list", "other-key")}
+    wrong = writer.post("/v1/publish/objects/not-this-key:register", json={"files": plain}, headers=bearer(token))
+    assert wrong.status_code == 400 and "not 'not-this-key'" in wrong.json()["detail"]
+    extra = writer.post("/v1/publish/objects/other-key:register",
+                        json={"files": {**plain, "notes.txt": "x"}}, headers=bearer(token))
+    assert extra.status_code == 400 and "does not use" in extra.json()["detail"]
+    missing = writer.post("/v1/publish/objects/other-key:register", json={"files": {
+        "collection.yaml": plain["collection.yaml"] + "queries: [queries/q.yaml]\n"}}, headers=bearer(token))
+    assert missing.status_code == 400 and "not sent" in missing.json()["detail"]
+
+    # A key a file collection holds cannot be taken over by an object collection.
+    con = _con()
+    try:
+        with con:
+            con.execute("INSERT INTO collections (collection_key, title, description, current_release_id) "
+                        "VALUES ('file-held', 'A file collection', NULL, NULL)")
+    finally:
+        con.close()
+    held = writer.post("/v1/publish/objects/file-held:register",
+                       json={"files": {"collection.yaml": PLAIN_MANIFEST.replace("plain-list", "file-held")}},
+                       headers=bearer(token))
+    assert held.status_code == 409 and "is a file collection" in held.json()["detail"]
+    assert objects.definition(_con(), "file-held") is None
+
+
+def test_registering_needs_a_valid_login(isolated_db, depositor):
+    revoked, expired = login("r2@example.org"), login("e2@example.org")
+    con = _con()
+    try:
+        with con:
+            device_login.revoke(con, revoked["token_id"], "admin@example.org")
+            con.execute("UPDATE publisher_tokens SET expires_at = '2020-01-01 00:00:00' WHERE token_id = ?",
+                        (expired["token_id"],))
+    finally:
+        con.close()
+    body = {"files": {"collection.yaml": PLAIN_MANIFEST.replace("plain-list", "nobody")}}
+    for headers in (bearer(revoked), bearer(expired), {"X-API-Key": depositor["key"]}, {}):
+        response = writer.post("/v1/publish/objects/nobody:register", json=body, headers=headers)
+        assert response.status_code == 401, response.text
+    assert objects.definition(_con(), "nobody") is None
