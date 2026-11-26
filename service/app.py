@@ -16,6 +16,7 @@ import math
 import os
 import re
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -29,6 +30,7 @@ from starlette.requests import Request
 
 from . import api_keys
 from . import explorer
+from . import jobs as query_jobs
 from . import objects as obj_reads
 from . import dapper_validation as dval
 from . import db
@@ -789,6 +791,13 @@ def resolve_row_joined(row, info, via, kind, orderBy, first=10, where=None):
     return crows.joined(_con(info), row, via, kind, order=orderBy, first=first, where=where)
 
 
+@row_type.field("containedIn")
+def resolve_row_contained_in(row, info, kind, setsFrom, memberField, sharing, orderBy, first=10, dimensions=None,
+                             where=None):
+    return crows.contained_in(_con(info), row, kind, sets_from=setsFrom, member_field=memberField, sharing=sharing,
+                              order=orderBy, first=first, dimensions=dimensions, where=where)
+
+
 @edge_type.field("claim")
 def resolve_edge_claim(edge, info, key):
     return crows.edge_envelope(_con(info), edge, key, envelopes)
@@ -826,8 +835,43 @@ schema = make_executable_schema(
 
 # Auto-docs are off: the hand-written api/openapi.yaml is the contract
 # authority, served at /v1/openapi.yaml with Swagger UI at /v1/docs.
+def start_index_prewarm():
+    """CLAIMS_INDEX_PREWARM=1: fill the index cache from the bucket in a background thread (store.prewarm), which
+    this returns. The service answers health checks and queries at once; the fill only spares the first queries
+    the S3 reads. Called from this app's lifespan; an app that mounts this one (dig-service-platform's
+    claims/app/main.py) must call it from its own, since a mounted app's lifespan does not run."""
+    if os.environ.get("CLAIMS_INDEX_PREWARM") != "1":
+        return None
+    import threading
+
+    from .collections import store as cstore
+
+    def run():
+        started = time.time()
+        try:
+            con = db.connect()
+            try:
+                n = cstore.prewarm(con)
+            finally:
+                con.close()
+            print(f"index cache prewarm: {n} datasets in {time.time() - started:.0f}s", flush=True)
+        except Exception as exc:  # a failed prewarm costs only speed: queries read what they need themselves
+            print(f"index cache prewarm failed after {time.time() - started:.0f}s: {exc!r}", flush=True)
+
+    thread = threading.Thread(target=run, name="index-prewarm", daemon=True)
+    thread.start()
+    return thread
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    start_index_prewarm()
+    yield
+
+
 app = FastAPI(
     title="Claims Repository",
+    lifespan=_lifespan,
     version=CONTRACT_VERSION,
     docs_url=None,
     redoc_url=None,
@@ -1034,13 +1078,17 @@ def _run_collection_query(collection, name, body):
 
 
 @app.post("/v1/collections/{collection}/queries/{name}:run")
-async def run_collection_query(collection: str, name: str, request: Request):
+async def run_collection_query(collection: str, name: str, request: Request,
+                               run_async: bool = Query(False, alias="async")):
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Request body must be JSON.")
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+    if run_async:
+        return _submitted("query", {"collection": collection, "query": name, "variables": body.get("variables")},
+                          lambda: _run_collection_query(collection, name, body))
     status, payload = await run_in_threadpool(_run_collection_query, collection, name, body)
     if status == 200:
         return Response(payload, media_type="application/json")
@@ -1220,14 +1268,64 @@ def _renderable_errors(result):
 
 
 @app.post("/v1/graphql")
-async def graphql_endpoint(request: Request):
+async def graphql_endpoint(request: Request, run_async: bool = Query(False, alias="async")):
     try:
         data = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Request body must be JSON.")
+    if run_async:
+        def work():
+            success, body = _execute_graphql(data)
+            return (200 if success else 400), body
+        return _submitted("graphql", {"operationName": data.get("operationName") if isinstance(data, dict) else None},
+                          work)
     # graphql_sync blocks on the database; keep it off the event loop.
     success, body = await run_in_threadpool(_execute_graphql, data)
     return Response(body, status_code=200 if success else 400, media_type="application/json")
+
+
+# --- query jobs: the same requests, answered in the background (service/jobs.py) ---------------------------
+
+def _job_url(job_id: str) -> str:
+    return f"{PUBLIC_BASE}/v1/jobs/{job_id}"
+
+
+def _submitted(kind: str, describe: dict, work) -> JSONResponse:
+    try:
+        job = query_jobs.submit(kind, describe, work)
+    except query_jobs.Busy as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=429, headers={"Retry-After": "10"})
+    return JSONResponse(query_jobs.summary(job, _job_url(job["id"])), status_code=202,
+                        headers={"Location": _job_url(job["id"]), "Retry-After": "2"})
+
+
+def _job(job_id: str) -> dict:
+    job = query_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"no query job {job_id}: unknown, or its result expired "
+                                                    f"({int(query_jobs.RESULT_TTL)} s after it finished)")
+    return job
+
+
+@app.get("/v1/jobs/{job_id}")
+def query_job(job_id: str):
+    """A query job's state: queued, running, done or failed, with result_url for its response."""
+    job = _job(job_id)
+    headers = {} if job["finished"] else {"Retry-After": "2"}
+    return JSONResponse(query_jobs.summary(job, _job_url(job_id)), headers=headers)
+
+
+@app.get("/v1/jobs/{job_id}/result")
+def query_job_result(job_id: str):
+    """The job's response exactly as the synchronous request would have answered (status and body); 202 with the
+    job's state while it runs."""
+    job = _job(job_id)
+    if not job["finished"]:
+        return JSONResponse(query_jobs.summary(job, _job_url(job_id)), status_code=202, headers={"Retry-After": "2"})
+    body = job["body"]
+    if isinstance(body, (bytes, str)):
+        return Response(body, status_code=job["http_status"], media_type="application/json")
+    return JSONResponse(body, status_code=job["http_status"])
 
 
 def _hint_str(hint, key, required=False):

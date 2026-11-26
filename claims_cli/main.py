@@ -1079,6 +1079,25 @@ def cmd_sources_verify(args):
         print(f"  {e}")
 
 
+def _await_job(base: str, job: dict, every: float = 2.0, limit: float = 3600.0) -> dict:
+    """Wait for a query job (submitted with ?async=true) and return its result: the synchronous response."""
+    import urllib.error
+    import urllib.request
+
+    url = f"{base}/v1/jobs/{job['id']}/result"
+    print(f"job {job['id']} submitted; waiting for {url}", file=sys.stderr)
+    started = time.time()
+    while time.time() - started < limit:
+        try:
+            resp = urllib.request.urlopen(url, timeout=60)
+        except urllib.error.HTTPError as exc:
+            sys.exit(f"{exc.code}: {exc.read()[:500].decode(errors='replace')}")
+        if resp.status != 202:
+            return json.loads(resp.read())
+        time.sleep(every)
+    sys.exit(f"job {job['id']} did not finish in {limit:.0f} s; its result stays at {url} for an hour after it does")
+
+
 def cmd_query_run(args):
     variables = {}
     for item in args.var or []:
@@ -1095,9 +1114,12 @@ def cmd_query_run(args):
     if args.api:
         import urllib.request
 
-        req = urllib.request.Request(args.api.rstrip("/") + path, data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
+        base = args.api.rstrip("/")
+        req = urllib.request.Request(base + path + ("?async=true" if args.run_async else ""),
+                                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
         out = json.loads(urllib.request.urlopen(req, timeout=300).read())
+        if args.run_async:
+            out = _await_job(base, out)
     else:
         _deployment(args)
         from fastapi.testclient import TestClient
@@ -1216,6 +1238,9 @@ def main(argv=None):
     p.add_argument("--api", help="a deployed service's base URL instead of the local deployment")
     p.add_argument("--no-claims", action="store_true", help="return rows only; serve (and so record) no claims")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--async", dest="run_async", action="store_true",
+                   help="with --api: run it as a background job and wait for the result (for queries that take "
+                        "longer than the gateway's 60 s)")
     p.set_defaults(func=cmd_query_run)
 
     vocab_p = sub.add_parser("vocab", help="how a collection's values resolve to identifiers").add_subparsers(

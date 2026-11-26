@@ -131,6 +131,29 @@ type Row {
   claimKeys: [String!]!
   "Rows reached from this one through an edge kind (e.g. member_of from a gene to its gene sets), ordered and limited per row (at most 50)."
   joined(via: String!, kind: String!, where: [MetricCondition!], orderBy: MetricOrder!, first: Int = 10): [JoinedRow!]!
+  """
+  Rows of `kind` about sets that hold this row's subject, when the membership
+  is not an edge of the dataset but is listed by set objects deposited in an
+  object collection: a gene's CFDE gene sets for the same trait, whose members
+  cfde-genesets lists. `setsFrom` names that object collection and
+  `memberField` the field it indexes members under (cfde-genesets: gene, values
+  HGNC.SYMBOL:<symbol>, the gene rows' subject ids). The rows come from the
+  datasets that share this row's values of the `sharing` dimensions (e.g.
+  ["trait"]: the same trait, any library) and have the `dimensions` given (e.g.
+  library GTEx); each row's subject is the set object's id, which
+  /v1/objects resolves to its members. Ordered and limited per row (at most
+  50), filtered by `where` on the kind's own metrics.
+  Example, IBD genes with a low prior and the CFDE gene sets holding each:
+  rows(collection: "pigean-cfde", kind: "gene_phenotype",
+       dimensions: [{name: "trait", value: "IBD"}, {name: "library", value: "mouse_msigdb"}],
+       where: [{metric: "prior", lt: 0.5}], orderBy: {metric: "combined"}, first: 10) {
+    rows { subject { value } containedIn(kind: "cfde_gene_set_phenotype", setsFrom: "cfde-genesets",
+           memberField: "gene", sharing: ["trait"], orderBy: {metric: "beta_uncorrected"}, first: 5) {
+      subject { id } columns metric(name: "beta_uncorrected") } } }
+  """
+  containedIn(kind: String!, setsFrom: String!, memberField: String!, sharing: [String!]!,
+              dimensions: [DimensionFilter!], where: [MetricCondition!], orderBy: MetricOrder!,
+              first: Int = 10): [Row!]!
 }
 
 type RowDataset {

@@ -37,6 +37,8 @@ tags:
     description: The resolver — dereference ANY dapper ID (Claim, Proposition, ClaimScore, GeneSet, EvidenceItem, ValueLocator, File, Activity, ...) to its stored document. Content-negotiated (JSON / landing page).
   - name: GraphQL
     description: The constrained query surface, composed from core + per-method modules.
+  - name: Jobs
+    description: Requests answered in the background (?async=true on GraphQL and query runs).
   - name: Collections
     description: >-
       Registered collections of method results (docs/collections.md). Each
@@ -1061,6 +1063,7 @@ paths:
           in: path
           required: true
           schema: { type: string, examples: [top-genes-with-sets] }
+        - $ref: '#/components/parameters/Async'
       requestBody:
         required: true
         content:
@@ -1083,6 +1086,10 @@ paths:
           content:
             application/json:
               schema: { type: object }
+        '202':
+          $ref: '#/components/responses/JobSubmitted'
+        '429':
+          $ref: '#/components/responses/JobsBusy'
         '400':
           $ref: '#/components/responses/ValidationProblem'
         '404':
@@ -1135,6 +1142,8 @@ paths:
         MINTS the claim it implies: the claim is synthesized from its index row,
         verified, and recorded with every assertion in one batch after the whole
         response succeeded (docs/inputs-and-outputs.md §3.5).
+      parameters:
+        - $ref: '#/components/parameters/Async'
       requestBody:
         required: true
         content:
@@ -1147,6 +1156,10 @@ paths:
                 variables: { type: object }
                 operationName: { type: string }
       responses:
+        '202':
+          $ref: '#/components/responses/JobSubmitted'
+        '429':
+          $ref: '#/components/responses/JobsBusy'
         '200':
           description: GraphQL response per the GraphQL-over-HTTP spec.
           content:
@@ -1171,8 +1184,63 @@ paths:
                   detail: { type: string }
                   data: { type: [object, 'null'] }
                   errors: { type: array, items: { type: object } }
+  /v1/jobs/{id}:
+    get:
+      operationId: queryJob
+      tags: [Jobs]
+      summary: A query job's state
+      description: >-
+        A request submitted with ?async=true: queued, running, done or failed,
+        with result_url for its response. Jobs are kept in the service's
+        process: a finished job's result is kept for an hour, and is lost if the
+        service restarts.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryJob' }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
+  /v1/jobs/{id}/result:
+    get:
+      operationId: queryJobResult
+      tags: [Jobs]
+      summary: A query job's response
+      description: >-
+        Once the job finished, exactly the response the synchronous request
+        would have given (its status and body: 200 with the result, or the
+        request's error). While it runs, 202 with the job's state and a
+        Retry-After header.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: The synchronous request's response.
+          content:
+            application/json:
+              schema: { type: object }
+        '202':
+          description: Still running.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryJob' }
+        '404':
+          $ref: '#/components/responses/NotFoundProblem'
 components:
   parameters:
+    Async:
+      name: async
+      in: query
+      required: false
+      schema: { type: boolean, default: false }
+      description: >-
+        true: run the request in the background and answer 202 at once with a
+        job (Location: its URL); read the response from the job's result_url.
+        For requests that may take longer than the gateway's 60 s. The work,
+        the response and the claims it asserts are the synchronous request's.
     Collection:
       name: collection
       in: path
@@ -1194,6 +1262,18 @@ components:
         and close (a `claims login` token may be sent instead). Keys are issued and revoked by an operator, in the
         admin console or with scripts/api_key.py; the service stores only a key's SHA-256. Read endpoints are open.
   responses:
+    JobSubmitted:
+      description: Submitted with ?async=true; the job's state, its URL in Location.
+      headers:
+        Location: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/QueryJob' }
+    JobsBusy:
+      description: Too many jobs are waiting; try again after Retry-After seconds.
+      content:
+        application/json:
+          schema: { type: object, properties: { detail: { type: string } } }
     ValidationProblem:
       description: >-
         The request failed validation (malformed JSON, invalid identifier,
@@ -1229,6 +1309,21 @@ components:
           schema:
             $ref: '#/components/schemas/Problem'
   schemas:
+    QueryJob:
+      type: object
+      properties:
+        id: { type: string }
+        kind: { type: string, enum: [graphql, query] }
+        status: { type: string, enum: [queued, running, done, failed] }
+        url: { type: string }
+        result_url: { type: string }
+        request: { type: object }
+        submitted_at: { type: string }
+        started_at: { type: [string, 'null'] }
+        finished_at: { type: [string, 'null'] }
+        seconds: { type: number }
+        expires_at: { type: [string, 'null'] }
+        http_status: { type: [integer, 'null'] }
     Problem:
       type: object
       required: [detail]

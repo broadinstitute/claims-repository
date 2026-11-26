@@ -29,6 +29,7 @@ from .store import FILTER_OPS, get_store
 MAX_ROWS = 500
 MAX_JOINED = 50
 MAX_SUBJECTS = 100
+MAX_SET_ROWS = 50_000   # rows a containedIn step ranks for one group of rows (IBD's CFDE gene sets: a few thousand)
 
 
 def _metrics_of(manifest: dict, kind: str) -> list[str]:
@@ -86,7 +87,7 @@ def rows(con, collection: str, kind: str, *, order: dict, first: int = 20, relea
         raise ValueError(f"subject takes at most {MAX_SUBJECTS} values")
     dataset_ids = _datasets_matching(con, rel["release_id"], dims)
     found = get_store(con, dataset_ids).anchor(dataset_ids, kind, conds, metric, direction, first, subjects)
-    root = {"release_id": rel["release_id"], "manifest": manifest, "groups": {}}
+    root = {"release_id": rel["release_id"], "manifest": manifest, "groups": {}, "mappings": record.get("mappings")}
     out = _batch(con, found, root)
     warnings = [] if out else [
         f"No {kind} rows in {collection} release {rel['version']} match. Check dimension values with "
@@ -154,6 +155,103 @@ def _join_batch(con, batch: dict, via: str, kind: str, order: dict, first: int, 
     return out
 
 
+def contained_in(con, row: dict, kind: str, *, sets_from: str, member_field: str, sharing: list[str], order: dict,
+                 first: int = 10, dimensions=None, where=None) -> list[dict]:
+    """Rows of `kind` whose subject is a set object of the object collection `sets_from` listing `row`'s subject
+    under its indexed field `member_field`, from the datasets that share `row`'s values of the `sharing`
+    dimensions (and have any `dimensions` given): for a trait's gene, the trait's CFDE gene sets that hold the
+    gene, ordered and limited per row. Computed for the whole list the first time a row asks."""
+    _bounded("first", first, MAX_JOINED)
+    batch = row["_batch"]
+    key = json.dumps(["containedIn", kind, sets_from, member_field, sharing, order, first, dimensions, where],
+                     sort_keys=True, default=str)
+    if key not in batch["joins"]:
+        batch["joins"][key] = _contained_batch(con, batch, kind, sets_from, member_field, list(sharing or []),
+                                               order, first, dimensions, where)
+    return batch["joins"][key].get((row["dataset"]["id"], row["subject"]["id"]), [])
+
+
+def _object_release(con, collection: str, field: str) -> str:
+    """The current version of an object collection whose object kinds index `field`."""
+    rel = release_row(con, collection)
+    record = _json(rel["manifest"])
+    if record.get("kind") != "objects":
+        raise ValueError(f"setsFrom: {collection} is not an object collection; name one whose objects list members, "
+                         "e.g. cfde-genesets")
+    fields = {f for k in (record["manifest"].get("object_kinds") or {}).values() for f in k["fields"]}
+    if field not in fields:
+        raise ValueError(f"memberField: {collection} indexes no field {field!r}; it indexes {sorted(fields)}")
+    return rel["version"]
+
+
+def _contained_batch(con, batch: dict, kind: str, sets_from: str, member_field: str, sharing: list[str],
+                     order: dict, first: int, dimensions, where) -> dict:
+    """{(dataset id, subject id): rows} for every row of a batch. Per group of rows sharing the `sharing`
+    dimension values: rank every row of `kind` in the group's datasets once, read which of those rows' set
+    objects hold which of the group's subjects from the object collection's field index (one indexed lookup per
+    500 sets), and keep each subject's first `first`."""
+    root = batch["root"]
+    manifest = root["manifest"]
+    _check_kind("this collection", manifest, kind)
+    conds, metric, direction = _conditions("this collection", manifest, kind, where, order)
+    names = [d["name"] for d in manifest["dataset_dimensions"]]
+    for name in sharing:
+        if name not in names:
+            raise ValueError(f"sharing: no dimension {name!r}; there are {names}")
+    fixed = {}
+    for d in dimensions or []:
+        if d["name"] not in names:
+            raise ValueError(f"dimensions: no dimension {d['name']!r}; there are {names}")
+        if d["name"] in sharing:
+            raise ValueError(f"dimensions: {d['name']!r} is shared with each row already; name it in one of the two")
+        fixed[d["name"]] = _resolve_value(con, manifest, d["name"], d["value"], root.get("mappings"))
+    version = _object_release(con, sets_from, member_field)
+
+    groups: dict[tuple, set] = {}
+    for r in batch["rows"]:
+        dims = r["dataset"]["dimensions"]
+        if any(n not in dims for n in sharing):
+            continue
+        groups.setdefault(tuple(dims[n] for n in sharing), set()).add(r["subject"]["id"])
+    picked: dict[tuple, list] = {}   # (group, subject id) -> ranked rows
+    for values, subjects in sorted(groups.items()):
+        dataset_ids = _datasets_matching(con, root["release_id"], {**fixed, **dict(zip(sharing, values))})
+        if not dataset_ids:
+            continue
+        ranked = get_store(con, dataset_ids).anchor(dataset_ids, kind, conds, metric, direction, MAX_SET_ROWS + 1)
+        if len(ranked) > MAX_SET_ROWS:
+            raise ValueError(f"containedIn: more than {MAX_SET_ROWS} {kind} rows for {dict(zip(sharing, values))}; "
+                             "narrow them with where or dimensions")
+        holds: dict[str, set] = {}
+        set_ids = sorted({r["subject_id"] for r in ranked})
+        wanted = sorted(subjects)
+        for i in range(0, len(set_ids), 500):
+            part = set_ids[i:i + 500]
+            for m in con.execute(
+                    "SELECT object_id, value FROM release_object_fields WHERE collection_key = ? AND version = ? "
+                    f"AND field = ? AND object_id IN ({','.join('?' * len(part))}) "
+                    f"AND value IN ({','.join('?' * len(wanted))})",
+                    [sets_from, version, member_field, *part, *wanted]).fetchall():
+                holds.setdefault(m["object_id"], set()).add(m["value"])
+        for subject in wanted:
+            hits = [r for r in ranked if subject in holds.get(r["subject_id"], ())][:first]
+            if hits:
+                picked[(values, subject)] = hits
+    unique = {}
+    for hits in picked.values():
+        for r in hits:
+            unique.setdefault(r["row_id"], r)
+    views = dict(zip(unique, _batch(con, list(unique.values()), root)))
+    out: dict[tuple, list] = {}
+    for r in batch["rows"]:
+        dims = r["dataset"]["dimensions"]
+        if any(n not in dims for n in sharing):
+            continue
+        hits = picked.get((tuple(dims[n] for n in sharing), r["subject"]["id"]), [])
+        out[(r["dataset"]["id"], r["subject"]["id"])] = [views[h["row_id"]] for h in hits]
+    return out
+
+
 def row_envelope(con, row: dict, key: str, many):
     """The envelope of `row`'s claim under `key`, served for every row of its batch at once (`many` is
     app.envelopes)."""
@@ -200,5 +298,5 @@ def edge_claims(con, edge: dict) -> dict:
     return root["groups"][key]
 
 
-__all__ = ["rows", "joined", "row_claims", "edge_claims", "row_envelope", "edge_envelope", "CollectionNotFound",
+__all__ = ["rows", "joined", "contained_in", "row_claims", "edge_claims", "row_envelope", "edge_envelope", "CollectionNotFound",
            "MAX_ROWS", "MAX_JOINED"]

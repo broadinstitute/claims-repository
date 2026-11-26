@@ -651,3 +651,32 @@ def test_another_collection_may_hold_the_same_files(api, token, pushed_db, bucke
     target = _target(api, token, col, "0.1.0", bucket)
     out = publish(None, col, {**looser, "version": "0.1.0"}, tmp_path, target=target)
     assert out.complete and out.stats["datasets_ingested"] == 2
+
+
+def test_prewarm_reads_every_current_release_into_a_fresh_cache(api, token, pushed_db, bucket, tmp_path, monkeypatch):
+    """store.prewarm (CLAIMS_INDEX_PREWARM=1 at startup) reads every dataset of every current release that has
+    a bucket index into the cache, before any query asks."""
+    from service import app as service_app
+    from service.collections import store as cstore
+
+    spec = _spec(tmp_path, "0.9.0-prewarm", ("FIXWARM", "FIXWARM2"))
+    assert _push(api, token, bucket, spec, tmp_path).complete
+    fresh = tmp_path / "fresh-cache"
+    monkeypatch.setenv("CLAIMS_INDEX_CACHE", str(fresh))
+    monkeypatch.setattr(cstore, "_BUCKET", {})
+    con = service_db.connect(pushed_db)
+    try:
+        current = {r[0] for r in con.execute("SELECT di.dataset_id FROM dataset_indexes di JOIN release_datasets rd "
+                                             "ON rd.dataset_id = di.dataset_id JOIN collections c ON "
+                                             "c.current_release_id = rd.release_id").fetchall()}
+    finally:
+        con.close()
+    assert current
+    monkeypatch.setenv("CLAIMS_INDEX_PREWARM", "1")
+    thread = service_app.start_index_prewarm()
+    thread.join(60)
+    store = cstore.bucket_store()
+    assert set(store.known) >= current
+    assert all((store.cache.dir(d) / ".checked").exists() for d in current)
+    monkeypatch.delenv("CLAIMS_INDEX_PREWARM")
+    assert service_app.start_index_prewarm() is None

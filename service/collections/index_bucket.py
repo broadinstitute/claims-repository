@@ -59,10 +59,38 @@ def dataset_location(location: str, dataset_id: str) -> str:
     return f"{location.rstrip('/')}/datasets/{_safe(dataset_id)}"
 
 
-def _s3():
-    import boto3
+FETCH_WORKERS = int(os.environ.get("CLAIMS_INDEX_FETCH_WORKERS") or 32)
+_S3 = None
+_S3_LOCK = threading.Lock()
+_POOL = None
 
-    return boto3.client("s3")
+
+def _s3():
+    """One S3 client for the process: boto3 clients are safe to share between threads once made, and making
+    one per file costs more than reading a small file. Its connection pool fits FETCH_WORKERS."""
+    global _S3
+    if _S3 is None:
+        with _S3_LOCK:
+            if _S3 is None:
+                import boto3
+                from botocore.config import Config
+
+                _S3 = boto3.client("s3", config=Config(max_pool_connections=FETCH_WORKERS + 4,
+                                                       retries={"max_attempts": 5, "mode": "standard"}))
+    return _S3
+
+
+def _pool():
+    """The threads that read datasets into the cache: shared by every request and the prewarm, so the reads in
+    flight never exceed FETCH_WORKERS however many requests wait on them."""
+    global _POOL
+    if _POOL is None:
+        with _S3_LOCK:
+            if _POOL is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                _POOL = ThreadPoolExecutor(max_workers=FETCH_WORKERS, thread_name_prefix="index-fetch")
+    return _POOL
 
 
 def sha256_file(path: Path) -> str:
@@ -139,3 +167,20 @@ class Cache:
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
         return final
+
+    def ensure_many(self, entries: list[tuple[str, dict]]) -> None:
+        """Every dataset's checked local copy, reading the missing ones in parallel (FETCH_WORKERS at a time).
+        A cross-trait query names about 1,400 datasets: read one after another from S3 they took over a
+        minute, past the gateway's 60 s; in parallel they take a few seconds. The first error is raised once
+        every read has finished, so no read is left writing behind a failed request."""
+        missing = [(d, e) for d, e in entries if not (self.dir(d) / ".checked").exists()]
+        if not missing:
+            return
+        if len(missing) == 1:
+            self.ensure(*missing[0])
+            return
+        futures = [_pool().submit(self.ensure, d, e) for d, e in missing]
+        errors = [f.exception() for f in futures]
+        first = next((e for e in errors if e is not None), None)
+        if first is not None:
+            raise first

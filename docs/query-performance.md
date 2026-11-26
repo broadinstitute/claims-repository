@@ -72,11 +72,35 @@ queries. None is built.
 The `claims` option already exists: a request may name the claim keys it wants (`claims: ["gene"]`), or
 `claims: []` for rows only. It is the fastest path today.
 
+## Built: reading a cross-trait query's datasets in parallel, and only those that hold the kind
+
+A query across traits names every dataset of a library (about 1,440 in pigean-cfde). The cache read them
+one after another, four S3 reads each with a new S3 client per file, which took longer than the gateway's
+60 s on a cold cache (504). It now reads the missing datasets on a shared pool of
+`CLAIMS_INDEX_FETCH_WORKERS` threads (default 32) through one S3 client, and the bucket store skips every
+dataset whose recorded counts hold no row of the kind asked for (a CFDE library's datasets hold no gene
+rows; many hold no rows at all), so those are never read.
+
+Measured on a laptop: 400 index files in 1.2 s in parallel, against 40 in 2.8 s one after another. Not yet
+measured on QA, whose task has half a CPU. Parallel reads do not speed up a warm query: its DuckDB scan
+over every trait's files stays (FTO across traits took 43 s warm on QA). Run those with `?async=true`.
+
+## Built: answering in the background (`?async=true`)
+
+`POST /v1/graphql?async=true` and `POST /v1/collections/{c}/queries/{name}:run?async=true` answer 202
+at once with a job (`Location: /v1/jobs/{id}`); `GET /v1/jobs/{id}/result` gives the synchronous
+response, status and body, once it is done (202 until then). The CLI waits for it with
+`claims query run ... --api <url> --async`. Jobs live in the service's process (one task): a result is
+kept an hour after it finishes and is lost if the task restarts.
+
 ## Next, without syntax changes
 
 - **Keep cached indexes in memory.** Load each dataset's Parquet into DuckDB once rather than reopening the
   files on every index query: QA's half CPU pays for each open.
-- **Fill the cache on startup.** QA's task runs on Spot and can be replaced at any time, which empties the
-  cache; the first query after that pays for the downloads (7.9 s against 4 s warm).
+- **Fill the cache on startup.** Built: with `CLAIMS_INDEX_PREWARM=1` the service reads every current
+  release's bucket index into the cache in the background as it starts (pigean-cfde 2026.11: 20,253
+  datasets, 81,012 files, 481 MB), and queries meanwhile read what they need themselves. The cache still
+  starts empty on each new task (a deploy, or a Spot replacement: QA now runs on demand), so the fill
+  covers the minutes after it.
 - **One index file set per release.** For cross-dataset queries over many datasets: rows, metrics and edges
   of the whole release in a few files sorted by dataset and subject, instead of four files per dataset.
