@@ -50,7 +50,8 @@ flowchart LR
 | What the API trusts | Only the values read from the files (row values and their byte spans, edge ends) and each result file's name, sha256, size and location. Before recording a dataset it reads the index back and computes every identifier, gene set, metric and edge again from those values; any difference is refused. It also computes the Dataset, File, mint-context and release records itself. |
 | A recorded version | Immutable: pushing different content under a recorded version is refused. |
 | QA and prod | Share the database. A release pushed to QA is listed by prod too; prod serves it only once it runs this build and can read the bucket. Test with a test collection handle. |
-| Out of scope | Object collections (`kind: objects`), which publish through deposits. Releases already in MySQL (the current `pigean`) keep being served from MySQL. |
+| Object collections | Not pushed: an object collection (`kind: objects`) is registered and filled through deposits with the same login, `claims objects register` and `claims objects deposit` ([Depositing objects](depositing-objects.md)). |
+| Out of scope | Releases already in MySQL (the current `pigean`) keep being served from MySQL. |
 
 ## The flow
 

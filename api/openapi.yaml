@@ -253,6 +253,30 @@ paths:
         '400': { description: The release is not what this push makes. }
         '401': { description: No valid publisher token. }
         '409': { description: The version is recorded with other content. }
+  /v1/publish/objects/{collection}:register:
+    post:
+      operationId: registerObjectCollection
+      tags: [Publish]
+      summary: Register an object collection's definition
+      description: >-
+        Body {files: {relative path: text}, prefix, git_commit, replace}: an object collection's (kind: objects)
+        manifest, query templates and vocabulary files, exactly the files the manifest names; the collection
+        directory's path in its git repository (each File record's location is prefix/relative path); its commit
+        (null when not in git, with -dirty when uncommitted); and whether to replace a different registered
+        definition. The files are checked as `claims collection validate` checks them. Releases already opened keep
+        the definition they were opened with. `claims objects register` sends this. Audited.
+      security: [{ PublisherToken: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Collection'
+      responses:
+        '201': { description: 'Registered: {collection, status: registered, queries, files, git_commit}.' }
+        '200': { description: 'status unchanged (this definition was registered; nothing written) or replaced.' }
+        '400': { description: The files are not a valid object collection named collection. }
+        '401': { description: No valid publisher token. }
+        '409':
+          description: >-
+            Another definition is registered and replace is not set; or the files are a file collection's, or the
+            key is a file collection's (publish those with `claims release publish --api`).
   /v1/vocabulary:
     get:
       operationId: getVocabulary
@@ -389,7 +413,7 @@ paths:
         and what to add.
         `match=slot:value` (repeatable) is exact equality on a top-level string
         slot, e.g. match=relation:has_members or match=subject_entity:NOD2.
-        `deposited_by=<key id>` returns objects that depositor sent through
+        `deposited_by=<key id or login token id>` returns objects that depositor sent through
         a deposit, and `deposit=<deposit id>` the objects one deposit
         carried; objects the service minted when serving a query, or a loader
         wrote, belong to no deposit.
@@ -397,7 +421,7 @@ paths:
         GraphQL (docs/inputs-and-outputs.md).
       parameters:
         - { name: class_name, in: query, schema: { type: string }, example: Proposition }
-        - { name: deposited_by, in: query, schema: { type: string, pattern: '^key_[0-9a-f]{16}$' }, description: "A depositor's key id (400 if not one)." }
+        - { name: deposited_by, in: query, schema: { type: string, pattern: '^(key|tok)_[0-9a-f]{16}$' }, description: "A depositor's key id, or a login's token id (400 if neither)." }
         - { name: deposit, in: query, schema: { type: string, pattern: '^dep_[0-9a-f]{32}$' }, description: 'A deposit id (400 if not one).' }
         - { name: references, in: query, schema: { type: string }, description: 'A dapper ID the matched objects reference (400 if not a dapper identifier).' }
         - { name: q, in: query, schema: { type: string, maxLength: 300 }, description: 'Words to find; each must begin a word of the statement, name, or description.' }
@@ -466,22 +490,26 @@ paths:
         References that resolve neither in the bundle nor in the store are
         reported in `unresolved_references`, not refused. Addresses the loaded
         data implies are RESERVED: a Claim deposited at one must equal the
-        claim its data implies, else 400. Requires the
-        depositor's X-API-Key, checked before the body is read; the accepted
-        bundle is recorded as one deposit by that key.
+        claim its data implies, else 400. Requires a deposit key (X-API-Key)
+        or a `claims login` token (Authorization: Bearer clp_...), checked
+        before the body is read; not both (400). A login token that is
+        unknown, revoked or expired is 401. The accepted bundle is recorded as
+        one deposit by that key or login.
 
         A deposit may name an object collection (`collection`) and one of its
         open releases (`release`; it may be left out while exactly one is
         open). Its objects are then stored exactly as without a collection,
         and also become members of that release, which the collection's named
-        queries read once the release is closed. The key must have been
+        queries read once the release is closed. A key must have been
         granted the collection in the admin console (403 otherwise; a key
-        without the grant can still deposit with no collection). A closed or
+        without the grant can still deposit with no collection); a login may
+        deposit into any object collection. A closed or
         unopened release answers 409. A catalog larger than one deposit goes
         in several: open the release, send the parts, close it; resending a
         part changes nothing. The receipt names the collection and release.
       security:
         - ApiKeyHeader: []
+        - PublisherToken: []
       requestBody:
         required: true
         content:
@@ -523,7 +551,7 @@ paths:
                   $ref: '#/components/schemas/IndexHints'
                 collection:
                   type: string
-                  description: An object collection whose open release these objects also join. Needs a grant.
+                  description: An object collection whose open release these objects also join. A key needs a grant.
                   example: dismech
                 release:
                   type: string
@@ -576,13 +604,15 @@ paths:
       description: >-
         Deposit records, newest first: every deposit, the deposits that carried
         one object (`object=<dapper id>`), or the deposits one depositor sent
-        (`deposited_by=<key id>`). Open like every read. A depositor is a key
-        id and the name the key was issued under; the key is never served.
+        (`deposited_by=<key id or login token id>`). Open like every read. A
+        depositor is a key id and the name the key was issued under, or, for a
+        `claims login`, {kind: login, name: claims login}: no key, token or
+        email is served.
         Objects the service minted when serving a query, or a loader wrote,
         belong to no deposit.
       parameters:
         - { name: object, in: query, schema: { type: string }, description: 'A dapper ID (400 if not a dapper identifier).' }
-        - { name: deposited_by, in: query, schema: { type: string, pattern: '^key_[0-9a-f]{16}$' }, description: "A depositor's key id (400 if not one)." }
+        - { name: deposited_by, in: query, schema: { type: string, pattern: '^(key|tok)_[0-9a-f]{16}$' }, description: "A depositor's key id, or a login's token id (400 if neither)." }
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
         - { name: offset, in: query, schema: { type: integer, default: 0 } }
       responses:
@@ -874,12 +904,15 @@ paths:
       tags: [Collections]
       summary: Open a release of an object collection
       description: >-
-        An object collection (kind: objects) is registered from its directory
-        (scripts/publish_collection.py). A key granted the collection opens a release here, deposits
-        into it (POST /v1/deposits with `collection` and `release`, in as many parts as needed), then
-        closes it. 201 when opened; 200 when it was already open. 409 if the version is closed.
+        An object collection (kind: objects) is registered from its directory (`claims objects register`,
+        POST /v1/publish/objects/{collection}:register, or scripts/publish_collection.py). A key granted
+        the collection, or a `claims login` (any collection), opens a release here, deposits into it
+        (POST /v1/deposits with `collection` and `release`, in as many parts as needed), then closes it.
+        `claims objects deposit` does all three. 201 when opened; 200 when it was already open. 409 if the
+        version is closed. Send a key or a login token, not both (400).
       security:
         - ApiKeyHeader: []
+        - PublisherToken: []
       parameters:
         - $ref: '#/components/parameters/Collection'
       requestBody:
@@ -905,6 +938,8 @@ paths:
               schema: { type: object }
         '403':
           description: The key was not granted this collection.
+        '401':
+          $ref: '#/components/responses/AuthProblem'
         '404':
           $ref: '#/components/responses/NotFoundProblem'
         '409':
@@ -938,10 +973,12 @@ paths:
         a File listing their ids, plus the manifest and query template Files), records it, and makes it
         the collection's current release: its named queries now read it. Closing again returns it
         unchanged. The response adds `unresolved_references`: ids the members reference that this
-        repository does not hold (the first 100).
+        repository does not hold (the first 100). A key needs a grant for the collection; a login
+        does not, and is recorded as the release's publisher.
         Example: POST /v1/collections/dismech/releases/2026.11.0:close
       security:
         - ApiKeyHeader: []
+        - PublisherToken: []
       parameters:
         - $ref: '#/components/parameters/Collection'
         - name: version
@@ -956,6 +993,8 @@ paths:
               schema: { type: object }
         '403':
           description: The key was not granted this collection.
+        '401':
+          $ref: '#/components/responses/AuthProblem'
         '404':
           $ref: '#/components/responses/NotFoundProblem'
         '409':
@@ -1151,9 +1190,9 @@ components:
       in: header
       name: X-API-Key
       description: >-
-        A depositor's key (clm_ followed by 43 characters), required for POST /v1/deposits and enforced. Keys are
-        issued and revoked by an operator, in the admin console or with scripts/api_key.py; the service stores only
-        a key's SHA-256. Read endpoints are open.
+        A depositor's key (clm_ followed by 43 characters), for POST /v1/deposits and an object collection's open
+        and close (a `claims login` token may be sent instead). Keys are issued and revoked by an operator, in the
+        admin console or with scripts/api_key.py; the service stores only a key's SHA-256. Read endpoints are open.
   responses:
     ValidationProblem:
       description: >-
@@ -1173,8 +1212,9 @@ components:
               detail: { type: array, items: { type: object } }
     AuthProblem:
       description: >-
-        The X-API-Key header is missing, is not a key, or names an unknown or revoked key. The answer is the same in
-        every case, and nothing was stored.
+        The X-API-Key header is missing, is not a key, or names an unknown or revoked key; or a `claims login`
+        token (Authorization: Bearer clp_...) is unknown, revoked or expired. The answer is the same in every case
+        for that credential, and nothing was stored.
       content:
         application/json:
           schema:
@@ -1248,11 +1288,17 @@ components:
         description: { type: string }
     Depositor:
       type: object
-      description: Who sent a deposit. Public; the key itself is never served.
-      required: [key_id, name]
+      description: >-
+        Who sent a deposit. Public: a key's id and the name it was issued under, or, for a `claims login`, only
+        {kind: login, name: claims login}; no key, token or email is served. (The receipt of a login's own deposit
+        adds its email and token_id; the admin console shows them.)
+      required: [name]
       properties:
         key_id: { type: string, examples: ['key_0123456789abcdef'] }
-        name: { type: string, description: The name the key was issued under., examples: ['REVEAL agent service (QA)'] }
+        kind: { type: string, enum: [login], description: Present for a login's deposit. }
+        name: { type: string, description: 'The name the key was issued under, or "claims login".', examples: ['REVEAL agent service (QA)'] }
+        email: { type: string, description: Only in the receipt of a login's own deposit. }
+        token_id: { type: string, description: Only in the receipt of a login's own deposit. }
     Deposit:
       type: object
       required: [deposit_id, received_at, object_count, depositor]

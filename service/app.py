@@ -1068,8 +1068,8 @@ def _release_call(fn, *args):
 @app.post("/v1/collections/{collection}/releases")
 async def open_object_release(collection: str, request: Request, depositor: dict = Depends(api_keys.require_writer)):
     """Open a release of an object collection, to be filled by deposits naming the collection and this version
-    (any number of parts), then closed. Needs a key granted the collection. Opening an open release again
-    returns it unchanged (200); a new one is 201."""
+    (any number of parts), then closed. Needs a key granted the collection, or a `claims login` (any
+    collection). Opening an open release again returns it unchanged (200); a new one is 201."""
     try:
         body = await request.json()
     except Exception:
@@ -1109,7 +1109,8 @@ def object_release_members(collection: str, version: str, class_name: str = Quer
 async def close_object_release(collection: str, version: str, depositor: dict = Depends(api_keys.require_writer)):
     """Close an open release: mint its DAPPER ResultCollection (the members, the manifest and query Files),
     record it, and make it the collection's current release, which queries read. Needs a key granted the
-    collection. Closing a closed release again returns it unchanged."""
+    collection, or a `claims login` (recorded as the release's publisher). Closing a closed release again
+    returns it unchanged."""
     state, _closed = await run_in_threadpool(_release_call, cobjects.close_release, depositor, collection, version)
     return state
 
@@ -1639,11 +1640,12 @@ def _unresolved_references(con, bundle_objects, edges) -> list[str]:
 
 @app.post("/v1/deposits")
 async def deposit(request: Request, depositor: dict = Depends(api_keys.require_writer)):
-    """The only external write path: deposit DAPPER objects of any class, validated. The depositor's X-API-Key is checked before
-    the body is read. The body is either a DAPPER document (`document`: nodes and edges under dapper's group names,
+    """The only external write path: deposit DAPPER objects of any class, validated. The depositor's X-API-Key, or a
+    `claims login` token (Authorization: Bearer), is checked before the body is read. The body is either a DAPPER document (`document`: nodes and edges under dapper's group names,
     which is what dapper's tooling mints, e.g. a whole ScientificAccount) or a flat list (`objects`). Every node must
     be valid for its class in the vendored DAPPER schema and sit at the DAPPER-ID-1 address of its content
-    (service/dapper_validation.py). The bundle is stored whole or not at all and recorded as one deposit by the key."""
+    (service/dapper_validation.py). The bundle is stored whole or not at all and recorded as one deposit by the key or
+    login."""
     body = await _deposit_body(request)
     if ("document" in body) == ("objects" in body):
         raise HTTPException(status_code=400, detail="send exactly one of document (a DAPPER document) or objects (a list of DAPPER nodes)")

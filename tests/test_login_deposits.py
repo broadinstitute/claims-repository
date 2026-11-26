@@ -417,3 +417,14 @@ def test_registering_needs_a_valid_login(isolated_db, depositor):
         response = writer.post("/v1/publish/objects/nobody:register", json=body, headers=headers)
         assert response.status_code == 401, response.text
     assert objects.definition(_con(), "nobody") is None
+
+
+def test_the_contract_lists_the_register_route_and_both_credentials():
+    import yaml
+
+    contract = yaml.safe_load(writer.get("/v1/openapi.yaml").text)
+    register = contract["paths"]["/v1/publish/objects/{collection}:register"]["post"]
+    assert register["security"] == [{"PublisherToken": []}]
+    for path, method in (("/v1/deposits", "post"), ("/v1/collections/{collection}/releases", "post"),
+                         ("/v1/collections/{collection}/releases/{version}:close", "post")):
+        assert contract["paths"][path][method]["security"] == [{"ApiKeyHeader": []}, {"PublisherToken": []}], path
