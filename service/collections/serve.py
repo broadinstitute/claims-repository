@@ -388,10 +388,12 @@ def provenance_resolver(con, object_id: str) -> str | None:
     document resolves: <resolver>/v1/entities/<id>, or None."""
     from urllib.parse import quote
 
-    # Read only each manifest's provenance list. Sorting whole JSON manifests is the likely cause of QA
-    # answering 500, not 404, for every unknown id (MySQL sorts the full rows), and it read them all each time.
-    for r in con.execute("SELECT json_extract(manifest, '$.provenance') AS provenance FROM collection_releases "
-                         "ORDER BY published_at DESC").fetchall():
+    # No ORDER BY in SQL: MySQL carries the whole manifest column through a filesort, even under
+    # json_extract, and a manifest over the sort buffer (pigean-cfde's) fails the query with error 1038
+    # ("Out of sort memory"), which made every unknown id answer 500. Sort the small result here instead.
+    rows = con.execute("SELECT release_id, published_at, json_extract(manifest, '$.provenance') AS provenance "
+                       "FROM collection_releases").fetchall()
+    for r in sorted(rows, key=lambda r: (r["published_at"], r["release_id"]), reverse=True):
         sources = _json(r["provenance"]) if r["provenance"] is not None else None
         for src in sources if isinstance(sources, list) else []:
             if not isinstance(src, dict):
