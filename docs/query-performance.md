@@ -91,7 +91,7 @@ Measured on QA on 2026-11-26, after the deploy and its index prewarm (half a CPU
 | IBD top 50 genes with `containedIn`, 5 CFDE sets each | (new) | 11 s first, 4.5 s after |
 | The same with `?async=true` | (new) | 202 in 0.13 s, result after 6.7 s |
 
-The warm cross-trait gain comes from skipping datasets that hold no row of the kind, not from the parallel
+The warm cross-trait gain most likely comes from skipping datasets that hold no row of the kind, not from the parallel
 read. A query that is still slow can be run with `?async=true`.
 
 ## Built: answering in the background (`?async=true`)
