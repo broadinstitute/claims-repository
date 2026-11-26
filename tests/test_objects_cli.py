@@ -368,3 +368,18 @@ def test_the_cfde_shape_an_s3_source_with_a_manifest_under_it(api, tmp_path, mon
     assert synced == [["*geneset.provenance.dapper.yaml"]]
     assert "selected     2 document(s)" in out and "deposited    2 document(s)" in out
     assert "skipped c2m2_files: 4" in out and "GeneSet: 6" in out
+
+
+def test_part_mb_makes_smaller_parts(api, tmp_path, capsys):
+    """--part-mb caps each deposit's JSON, so a document of big objects is sent in more, smaller parts."""
+    col = _collection(tmp_path, "cli-partmb")
+    source = tmp_path / "release"
+    _documents(source, 1, c2m2=False)
+    rel = sorted(p.relative_to(source).as_posix() for p in source.rglob("*.dapper.yaml"))[0]
+    document = yaml.safe_load((source / rel).read_text())
+    whole = list(objects_cli.parts(document, set()))
+    small = list(objects_cli.parts(document, set(), max_bytes=200))
+    assert len(small) > len(whole)
+    claims("objects", "deposit", col, "1", "--api", api, "--from", source, "--part-mb", "0.05",
+           "--state-file", tmp_path / "p.sent")
+    assert "deposited    1 document(s)" in capsys.readouterr().out

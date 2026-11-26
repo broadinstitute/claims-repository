@@ -74,7 +74,8 @@ claims objects deposit ~/src/research/kpn-dapper-toolkit/collections/cfde-genese
 A deposit holds at most 1,000 objects, 5,000 edges and 16 MB. The CLI sends a document in parts of at most 800
 objects, 4,000 edges and 10 MB (its own size estimate). A deposit must hold an object, so a part that would hold
 edges only repeats the document's first object; depositing an object again changes nothing. Documents are sent
-`--workers` at a time (default 4). A 5xx or a dropped connection is tried again (honouring Retry-After); any
+`--workers` at a time (default 4). `--part-mb` lowers the most JSON one deposit carries (default 10 MB) for documents whose
+objects carry many indexed values (see Known costs). A 5xx or a dropped connection is tried again (honouring Retry-After); any
 other refusal stops the run after the documents in flight.
 
 ### Resuming
@@ -122,3 +123,17 @@ the database reads both from every current release's manifest (its `/v1/queries`
 
 Until every service runs this build, an older one lists only key deposits: its `GET /v1/deposits` leaves login
 deposits out of a page while its `total` still counts them, and `GET /v1/deposits/{id}` is 404 for one.
+
+## Known costs (open design item)
+
+Each value of a declared field is one `release_object_fields` row in the service database. A multi-valued field
+over big objects is therefore expensive: `cfde-genesets` indexes every member gene (`GeneSet.gene: {slot:
+members}`), about 10.1 million rows for 35,441 gene sets, only to serve its `gene-sets-with-gene` query. Its three
+largest producer documents (up to 95 MB) also need `--part-mb 1` so that one deposit finishes within the
+deployment's request timeout; normal documents deposit in about 0.1 s each.
+
+This is a modeling question to settle as a best practice, not a limit of one collection. The repository should
+support both a plain list (objects only: no fields, no queries) and an indexed, queryable collection, but one row
+per value in the shared database is an inefficient way to do the latter. Alternatives to measure include an
+index kept in the owner's bucket and served with DuckDB, as file collections already are
+([publishing-to-a-deployment.md](publishing-to-a-deployment.md)).
