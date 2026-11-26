@@ -230,6 +230,9 @@ def test_a_key_opened_release_records_the_key(registered, depositor):
 def test_every_deposit_row_names_exactly_one_writer(released, depositor):
     """The migrated schema takes a key deposit and a login deposit; the app never writes a row with neither (or
     both)."""
+    keyed = TestClient(app, headers={"X-API-Key": depositor["key"]})
+    assert keyed.post("/v1/deposits", json={"objects": [MECH]}).status_code == 200
+    assert released["part"].status_code == 200  # the login's
     for actor in ({"kind": "login", "name": "claims login", "email": None, "token_id": None},
                   {"kind": "key", "key_id": None, "name": "x"},
                   {"kind": "key", "key_id": "key_0123456789abcdef", "token_id": "tok_0123456789abcdef"},
@@ -282,12 +285,10 @@ def test_a_plain_list_collection_holds_members_without_kinds_or_queries(isolated
     (tmp_path / "collection.yaml").write_text(PLAIN_MANIFEST)
     col = load_collection(tmp_path)
     assert col.queries == {} and "object_kinds" not in col.doc
-    con = _con()
-    try:
-        assert objects.register(con, col)["queries"] == []
-    finally:
-        con.close()
     h = bearer(token)
+    registered = writer.post("/v1/publish/objects/plain-list:register", json={"files": {
+        "collection.yaml": PLAIN_MANIFEST}}, headers=h)
+    assert registered.status_code == 201 and registered.json()["queries"] == [], registered.text
     assert writer.post("/v1/collections/plain-list/releases", json={"version": "1"}, headers=h).status_code == 201
     part = writer.post("/v1/deposits", json={"document": {"gene_set_collections": [GSC], "gene_sets": SETS},
                                              "collection": "plain-list", "release": "1"}, headers=h)
@@ -362,7 +363,8 @@ def test_a_login_registers_an_object_collection(isolated_db, token, tmp_path):
     assert replaced.status_code == 200 and replaced.json()["status"] == "replaced"
     assert objects.definition(_con(), "login-catalog")["manifest"]["title"].startswith("Renamed catalog")
     events = [r["detail"].split()[1] for r in _rows(
-        "SELECT detail FROM admin_auth_events WHERE event = 'object_collection_registered' ORDER BY id")]
+        "SELECT detail FROM admin_auth_events WHERE event = 'object_collection_registered' AND detail LIKE "
+        "'login-catalog %' ORDER BY id")]
     assert events == ["registered", "replaced"]
 
     # Then the login opens a release of it, with no key and no grant.

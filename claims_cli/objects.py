@@ -193,6 +193,16 @@ def _register(api: Api, col, replace: bool = False) -> dict:
     return answer
 
 
+def _exit_on_refusal(fn):
+    """A command whose request still failed after its retries ends with a message, not a traceback."""
+    def run(args):
+        try:
+            return fn(args)
+        except Refused as exc:
+            sys.exit(f"claims: the service failed ({exc.status}): {exc.detail}. Run the same command again later.")
+    return run
+
+
 def cmd_register(args) -> None:
     col = _collection(args.collection)
     api = _login(args)
@@ -449,27 +459,36 @@ def cmd_deposit(args) -> None:
     failure = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         futures = {pool.submit(_send_document, api, key, version, root, rel, skip, stop): rel for rel in todo}
-        for future in concurrent.futures.as_completed(futures):
-            rel = futures[future]
-            try:
-                got = future.result()
-            except BaseException as exc:  # a refusal, an unreadable document, or a sys.exit in a worker
-                if failure is None:
-                    failure = (rel, exc)
-                    stop.set()
-                    for f in futures:
-                        f.cancel()
-                continue
-            state.add(rel)
-            totals["documents"] += 1
-            for k in ("parts", "objects", "edges", "unresolved_references"):
-                totals[k] += got[k]
-            for g, n in got["skipped"].items():
-                skipped[g] = skipped.get(g, 0) + n
-            if totals["documents"] % PROGRESS_EVERY == 0 or time.time() - last > PROGRESS_SECONDS:
-                last = time.time()
-                print(f"  {totals['documents']:,} / {len(todo):,} documents, {totals['parts']:,} parts, "
-                      f"{totals['objects']:,} objects, {totals['edges']:,} edges ({last - started:.0f}s)", flush=True)
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                rel = futures[future]
+                try:
+                    got = future.result()
+                except BaseException as exc:  # a refusal, an unreadable document, or a sys.exit in a worker
+                    if failure is None:
+                        failure = (rel, exc)
+                        stop.set()
+                        for f in futures:
+                            f.cancel()
+                    continue
+                state.add(rel)
+                totals["documents"] += 1
+                for k in ("parts", "objects", "edges", "unresolved_references"):
+                    totals[k] += got[k]
+                for g, n in got["skipped"].items():
+                    skipped[g] = skipped.get(g, 0) + n
+                if totals["documents"] % PROGRESS_EVERY == 0 or time.time() - last > PROGRESS_SECONDS:
+                    last = time.time()
+                    print(f"  {totals['documents']:,} / {len(todo):,} documents, {totals['parts']:,} parts, "
+                          f"{totals['objects']:,} objects, {totals['edges']:,} edges ({last - started:.0f}s)",
+                          flush=True)
+        except KeyboardInterrupt:  # stop at the next part; documents not finished are not recorded as sent
+            stop.set()
+            for f in futures:
+                f.cancel()
+            print("\nclaims: stopping after the parts in flight; run the same command again to continue",
+                  file=sys.stderr, flush=True)
+            raise
     print(f"deposited    {totals['documents']:,} document(s) in {totals['parts']:,} part(s) "
           f"({time.time() - started:.0f}s): {totals['objects']:,} objects, {totals['edges']:,} edges")
     for g, n in sorted(skipped.items()):
@@ -519,7 +538,7 @@ def add_commands(sub) -> None:
     p.add_argument("--api", required=True, help=api_help)
     p.add_argument("--replace", action="store_true", help="replace a different registered definition (releases "
                                                           "already opened keep theirs)")
-    p.set_defaults(func=cmd_register)
+    p.set_defaults(func=_exit_on_refusal(cmd_register))
 
     p = group.add_parser("deposit", help="deposit DAPPER documents into a release; resumable")
     p.add_argument("collection", help="the collection directory")
@@ -538,17 +557,17 @@ def add_commands(sub) -> None:
     p.add_argument("--workdir", help=f"where an s3:// source is mirrored and the state file kept (default "
                                      f"{default_workdir()})")
     p.add_argument("--key-env", metavar="VAR", help=key_help)
-    p.set_defaults(func=cmd_deposit)
+    p.set_defaults(func=_exit_on_refusal(cmd_deposit))
 
     p = group.add_parser("close", help="close a release: it becomes the collection's current release")
     p.add_argument("collection")
     p.add_argument("version")
     p.add_argument("--api", required=True, help=api_help)
     p.add_argument("--key-env", metavar="VAR", help=key_help)
-    p.set_defaults(func=cmd_close)
+    p.set_defaults(func=_exit_on_refusal(cmd_close))
 
     p = group.add_parser("status", help="a release's state, objects and deposits")
     p.add_argument("collection")
     p.add_argument("version")
     p.add_argument("--api", required=True, help=api_help)
-    p.set_defaults(func=cmd_status)
+    p.set_defaults(func=_exit_on_refusal(cmd_status))

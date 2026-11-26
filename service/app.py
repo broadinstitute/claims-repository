@@ -1821,8 +1821,8 @@ def _object_search(con, *, class_name=None, q=None, references=None, match=None,
     # queries) and loaders record no deposit, so such an object matches only if someone also deposited it.
     if deposited_by:
         where.append("EXISTS (SELECT 1 FROM deposit_objects dx JOIN deposits dp ON dp.deposit_id = dx.deposit_id "
-                     "WHERE dx.object_id = o.id AND (dp.key_id = ? OR dp.publisher_token_id = ?))")
-        params += [deposited_by, deposited_by]
+                     f"WHERE dx.object_id = o.id AND dp.{api_keys.depositor_column(deposited_by)} = ?)")
+        params.append(deposited_by)
     if deposit:
         where.append("EXISTS (SELECT 1 FROM deposit_objects dy WHERE dy.object_id = o.id AND dy.deposit_id = ?)")
         params.append(deposit)

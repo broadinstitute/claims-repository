@@ -312,7 +312,10 @@ def depositor_id_ok(value) -> bool:
     return isinstance(value, str) and bool(KEY_ID_RE.match(value) or TOKEN_ID_RE.match(value))
 
 
-DEPOSITED_BY_SQL = "(d.key_id = ? OR d.publisher_token_id = ?)"
+def depositor_column(depositor_id: str) -> str:
+    """The deposits column a depositor id names: key_id for a key id, publisher_token_id for a token id. One
+    column, so a key's filter keeps using idx_deposits_key."""
+    return "publisher_token_id" if depositor_id.startswith("tok_") else "key_id"
 
 
 def deposits(con, *, object_id=None, deposited_by=None, limit=50, offset=0, admin: bool = False) -> dict:
@@ -322,8 +325,8 @@ def deposits(con, *, object_id=None, deposited_by=None, limit=50, offset=0, admi
         where.append("EXISTS (SELECT 1 FROM deposit_objects o WHERE o.deposit_id = d.deposit_id AND o.object_id = ?)")
         params.append(object_id)
     if deposited_by is not None:
-        where.append(DEPOSITED_BY_SQL)
-        params += [deposited_by, deposited_by]
+        where.append(f"d.{depositor_column(deposited_by)} = ?")
+        params.append(deposited_by)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
     total = con.execute(f"SELECT COUNT(*) AS c FROM deposits d{clause}", params).fetchone()["c"]
     rows = con.execute(

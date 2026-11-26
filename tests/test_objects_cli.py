@@ -318,3 +318,39 @@ def test_deposits_may_be_sent_with_a_key(api, tmp_path, monkeypatch, depositor, 
     assert "depositing with a key" in out and "closed       cli-keyed 1" in out
     assert {r["key_id"] for r in _rows("SELECT key_id FROM deposits WHERE collection_key = 'cli-keyed'")} == {
         depositor["key_id"]}
+
+
+def test_the_cfde_shape_an_s3_source_with_a_manifest_under_it(api, tmp_path, monkeypatch, capsys):
+    """--from s3://... --manifest run/<x>.tsv --role provenance: the manifest is fetched from under the prefix, and
+    only the documents it selects are mirrored and sent."""
+    col = _collection(tmp_path, "cli-s3-manifest")
+    bucket = tmp_path / "bucket" / "collections" / "x" / "2026.11"
+    rels = _documents(bucket, 3)
+    (bucket / "run").mkdir()
+    with open(bucket / "run" / "x.cfde_manifest.tsv", "w", newline="") as fh:
+        w = csv.writer(fh, delimiter="\t")
+        w.writerow(["relative_path", "role", "library"])
+        w.writerow([rels[0], "provenance", "lib0"])
+        w.writerow([rels[2], "provenance", "lib0"])
+        w.writerow(["library_gmts/lib0.gmt", "gmt", "lib0"])
+    fetched, synced = [], []
+
+    def fetch(location, dest):
+        fetched.append(location)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(bucket / location.split("2026.11/", 1)[1], dest)
+
+    def sync(prefix, dest, includes):
+        synced.append(includes)
+        shutil.copytree(bucket, dest, dirs_exist_ok=True)
+
+    monkeypatch.setattr(objects_cli, "s3_fetch", fetch)
+    monkeypatch.setattr(objects_cli, "s3_sync", sync)
+    claims("objects", "deposit", col, "2026.11.0", "--api", api, "--from", "s3://kpn-test/collections/x/2026.11/",
+           "--manifest", "run/x.cfde_manifest.tsv", "--role", "provenance", "--skip-group", "c2m2_files",
+           "--workdir", tmp_path / "work", "--close")
+    out = capsys.readouterr().out
+    assert fetched == ["s3://kpn-test/collections/x/2026.11/run/x.cfde_manifest.tsv"]
+    assert synced == [["*geneset.provenance.dapper.yaml"]]
+    assert "selected     2 document(s)" in out and "deposited    2 document(s)" in out
+    assert "skipped c2m2_files: 4" in out and "GeneSet: 6" in out
