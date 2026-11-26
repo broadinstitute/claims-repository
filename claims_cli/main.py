@@ -13,13 +13,18 @@
     claims query run pigean top-genes-with-sets --var trait=IBD --var topGenes=5
     claims serve --port 8100
     claims login [--api URL] [--no-wait | --continue]     (also: claims whoami, claims logout)
+    claims objects register <collection dir> --api qa      (an object collection; needs claims login)
+    claims objects deposit <collection dir> 2026.11.0 --api qa --from s3://bucket/prefix/ [--close]
+    claims objects close|status <collection dir> 2026.11.0 --api qa
 
 Every command that touches a deployment needs --db (the control-plane SQLite
 file) and --index-dir (the Parquet index), or CLAIMS_DB and CLAIMS_INDEX_DIR.
 It refuses to run when CLAIMS_MYSQL_HOST is set: this CLI is for local stacks.
 `claims login` signs in to a deployed API instead (device code; docs/cli-login.md),
 and `release publish --api` publishes into one with that sign-in, reading the files
-here (docs/publishing-to-a-deployment.md).
+here (docs/publishing-to-a-deployment.md). `claims objects` registers an object
+collection and deposits DAPPER documents into its releases with the same sign-in
+(docs/depositing-objects.md).
 
 A collection directory holds the manifest (collection.yaml), templates,
 queries, and source.yaml, which says where the result files live:
@@ -65,6 +70,7 @@ _require_cli_packages()
 import yaml  # noqa: E402
 
 from . import auth  # noqa: E402
+from . import objects as objects_cli  # noqa: E402
 from . import scaffold  # noqa: E402
 from . import vocab  # noqa: E402
 from . import sources as src  # noqa: E402
@@ -1245,6 +1251,7 @@ def main(argv=None):
     p.set_defaults(func=cmd_provenance_draft)
 
     auth.add_commands(sub)
+    objects_cli.add_commands(sub)
 
     p = sub.add_parser("serve", help="run the service over the local deployment")
     p.add_argument("--port", type=int, default=8100)
