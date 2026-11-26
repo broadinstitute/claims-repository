@@ -368,6 +368,18 @@ def test_validator_is_pure_and_names_every_group_dapper_names():
     assert ACCOUNT == untouched
 
 
+def test_dapper_identity_has_no_size_limit_and_a_big_node_deposits():
+    """DAPPER-ID-1 sets no size limit (dapper #35): a release of 20,253 Datasets mints, and a node with more than
+    10,000 values is not refused for its size. Request bodies are bounded where they are accepted."""
+    assert not hasattr(cidn._dapper, "MAX_TRIPLES")
+    members = [f"dapper:Dataset.{i:032d}" for i in range(20_253)]
+    rc = cidn.mint("ResultCollection", {"name": "big", "collection_key": "big", "version": "1", "methods": ["m"],
+                                        "members": members, "n_members": len(members)})
+    assert cidn.verify(rc)
+    big = _minted("GeneSet", name="many members", members=[f"G{i}" for i in range(12_000)])
+    assert dval.validate_node(big)[2] == big
+
+
 # --- admin console: deposit keys -----------------------------------------------------------------------------
 
 def _token(purpose, email="admin@example.org"):
