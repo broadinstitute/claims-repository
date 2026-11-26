@@ -1066,7 +1066,7 @@ def _release_call(fn, *args):
 
 
 @app.post("/v1/collections/{collection}/releases")
-async def open_object_release(collection: str, request: Request, depositor: dict = Depends(api_keys.require_depositor)):
+async def open_object_release(collection: str, request: Request, depositor: dict = Depends(api_keys.require_writer)):
     """Open a release of an object collection, to be filled by deposits naming the collection and this version
     (any number of parts), then closed. Needs a key granted the collection. Opening an open release again
     returns it unchanged (200); a new one is 201."""
@@ -1106,7 +1106,7 @@ def object_release_members(collection: str, version: str, class_name: str = Quer
 
 
 @app.post("/v1/collections/{collection}/releases/{version}:close")
-async def close_object_release(collection: str, version: str, depositor: dict = Depends(api_keys.require_depositor)):
+async def close_object_release(collection: str, version: str, depositor: dict = Depends(api_keys.require_writer)):
     """Close an open release: mint its DAPPER ResultCollection (the members, the manifest and query Files),
     record it, and make it the collection's current release, which queries read. Needs a key granted the
     collection. Closing a closed release again returns it unchanged."""
@@ -1429,7 +1429,6 @@ def _same_document(a, b) -> bool:
 MAX_DEPOSIT_OBJECTS = 1000
 MAX_DEPOSIT_BYTES = 16 * 1024 * 1024
 MAX_DEPOSIT_EDGES = 5000
-_UNAUTHORIZED = {"WWW-Authenticate": "ApiKey"}
 
 
 async def _deposit_body(request: Request) -> dict:
@@ -1552,7 +1551,7 @@ def _write_deposit(depositor, prepared, hints, edges=(), collection=None, releas
             # Last, after this transaction's own writes and as a locking read: a key revoked before this point
             # deposits nothing, and a revocation that arrives now waits for this deposit to finish.
             if not api_keys.still_valid(con, depositor):
-                raise HTTPException(status_code=401, detail=api_keys.UNAUTHORIZED, headers=_UNAUTHORIZED)
+                raise api_keys.unauthorized(depositor)
             # Same transaction as the objects: a rejected bundle records no deposit.
             deposit_id = api_keys.record_deposit(con, depositor, deposited, edges, collection,
                                                  target[0] if target else None)
@@ -1561,7 +1560,7 @@ def _write_deposit(depositor, prepared, hints, edges=(), collection=None, releas
                 added = cobjects.add_objects(con, collection, target[0], target[1], deposit_id, prepared)
                 in_collection = {"key": collection, "release": target[0], "state": "open", "objects": added}
             unresolved = _unresolved_references(con, bundle_objects, edges)
-        return {"deposit_id": deposit_id, "depositor": depositor, "collection": in_collection,
+        return {"deposit_id": deposit_id, "depositor": api_keys.receipt_depositor(depositor), "collection": in_collection,
                 "deposited": deposited}, unresolved
     except HTTPException:
         raise
@@ -1639,7 +1638,7 @@ def _unresolved_references(con, bundle_objects, edges) -> list[str]:
 
 
 @app.post("/v1/deposits")
-async def deposit(request: Request, depositor: dict = Depends(api_keys.require_depositor)):
+async def deposit(request: Request, depositor: dict = Depends(api_keys.require_writer)):
     """The only external write path: deposit DAPPER objects of any class, validated. The depositor's X-API-Key is checked before
     the body is read. The body is either a DAPPER document (`document`: nodes and edges under dapper's group names,
     which is what dapper's tooling mints, e.g. a whole ScientificAccount) or a flat list (`objects`). Every node must
@@ -1806,8 +1805,9 @@ def _object_search(con, *, class_name=None, q=None, references=None, match=None,
         raise HTTPException(status_code=400, detail=f"class_name must be letters only, got {class_name!r}")
     if references is not None and (not DAPPER_ID_RE.match(references) or len(references) > MAX_ID_LENGTH):
         raise HTTPException(status_code=400, detail=f"references must be a dapper identifier, got {references[:140]!r}")
-    if deposited_by is not None and not api_keys.KEY_ID_RE.match(deposited_by):
-        raise HTTPException(status_code=400, detail="deposited_by must be a key id such as key_0123456789abcdef")
+    if deposited_by is not None and not api_keys.depositor_id_ok(deposited_by):
+        raise HTTPException(status_code=400, detail="deposited_by must be a key id such as key_0123456789abcdef, "
+                                                    "or a login's token id such as tok_0123456789abcdef")
     if deposit is not None and not api_keys.DEPOSIT_ID_RE.match(deposit):
         raise HTTPException(status_code=400, detail="deposit must be a deposit id (dep_ followed by 32 hex characters)")
     je = con.dialect.je
@@ -1815,12 +1815,12 @@ def _object_search(con, *, class_name=None, q=None, references=None, match=None,
     if references:
         joins = " JOIN object_refs r ON r.from_id = o.id AND r.to_id = ?"
         params.append(references)
-    # Deposit provenance: objects one key sent, or one deposit carried. Minting on serve (GraphQL, collection
+    # Deposit provenance: objects one key or login sent, or one deposit carried. Minting on serve (GraphQL, collection
     # queries) and loaders record no deposit, so such an object matches only if someone also deposited it.
     if deposited_by:
         where.append("EXISTS (SELECT 1 FROM deposit_objects dx JOIN deposits dp ON dp.deposit_id = dx.deposit_id "
-                     "WHERE dx.object_id = o.id AND dp.key_id = ?)")
-        params.append(deposited_by)
+                     "WHERE dx.object_id = o.id AND (dp.key_id = ? OR dp.publisher_token_id = ?))")
+        params += [deposited_by, deposited_by]
     if deposit:
         where.append("EXISTS (SELECT 1 FROM deposit_objects dy WHERE dy.object_id = o.id AND dy.deposit_id = ?)")
         params.append(deposit)
@@ -1973,13 +1973,15 @@ def list_deposits(
 ):
     """Who deposited what, newest first: every deposit, the deposits that
     carried one object (`object=<dapper id>`), or the deposits one depositor
-    sent (`deposited_by=<key id>`). A depositor is a key id and the name it was
-    issued under; the key itself is never served. Objects the service minted
+    sent (`deposited_by=<key id or login token id>`). A depositor is a key id and
+    the name it was issued under, or, for a `claims login`, only the name
+    "claims login"; no key, token or email is served. Objects the service minted
     when serving a query, or a loader wrote, belong to no deposit."""
     if object is not None and (not DAPPER_ID_RE.match(object) or len(object) > MAX_ID_LENGTH):
         raise HTTPException(status_code=400, detail=f"object must be a dapper identifier, got {object[:140]!r}")
-    if deposited_by is not None and not api_keys.KEY_ID_RE.match(deposited_by):
-        raise HTTPException(status_code=400, detail="deposited_by must be a key id such as key_0123456789abcdef")
+    if deposited_by is not None and not api_keys.depositor_id_ok(deposited_by):
+        raise HTTPException(status_code=400, detail="deposited_by must be a key id such as key_0123456789abcdef, "
+                                                    "or a login's token id such as tok_0123456789abcdef")
     con = db.connect()
     try:
         return api_keys.deposits(con, object_id=object, deposited_by=deposited_by, limit=limit, offset=offset)

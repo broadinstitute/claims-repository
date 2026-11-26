@@ -10,8 +10,8 @@ held left as stored), and membership in the release is a record beside them.
 Life of a release:
 1. The collection's definition (manifest, query templates, vocabulary files)
    is registered once from its directory (scripts/publish_collection.py).
-2. A key granted the collection opens a release: POST
-   /v1/collections/{c}/releases {"version": ...}.
+2. A key granted the collection, or a `claims login` (any collection), opens a
+   release: POST /v1/collections/{c}/releases {"version": ...}.
 3. Deposits naming the collection and that release add their objects (any
    number of parts; resending a part changes nothing).
 4. Closing it mints the release's DAPPER ResultCollection (its members, the
@@ -42,7 +42,7 @@ class ReleaseError(ValueError):
 
 
 class NotGranted(PermissionError):
-    """The key was not granted the collection (403)."""
+    """The key was not granted the collection (403). A login needs no grant."""
 
 
 def is_objects(record: dict) -> bool:
@@ -121,8 +121,17 @@ def _granted(con, depositor: dict, key: str) -> None:
         raise NotGranted(f"this key may not write into the collection {key!r}: grant it in the admin console")
 
 
+def _audit(con, event: str, email: str, detail: str) -> None:
+    from ..device_login import _audit as audit
+
+    audit(con, event, email, detail)
+
+
 def open_release(con, depositor: dict, key: str, version: str) -> tuple[dict, bool]:
-    """(release state, whether this call opened it). Opening an open release again is a no-op."""
+    """(release state, whether this call opened it). Opening an open release again is a no-op. Who opened it is
+    recorded: a key's id, or a login's token id and email (audited as object_release_opened)."""
+    from .. import api_keys
+
     if not isinstance(version, str) or not version or len(version) > 64 or not version.isascii() or " " in version:
         raise ValueError("version must be a short ASCII string without spaces, e.g. 2026.11.0")
     with con:
@@ -138,9 +147,12 @@ def open_release(con, depositor: dict, key: str, version: str) -> tuple[dict, bo
         if con.execute("SELECT 1 FROM collection_releases WHERE collection_key = ? AND version = ?",
                        (key, version)).fetchone():
             raise ReleaseError(f"{key} already has a release {version}")
-        con.execute(f"INSERT INTO object_releases (collection_key, version, state, definition, opened_at, opened_by) "
-                    f"VALUES (?, ?, 'open', ?, {con.dialect.now}, ?)", (key, version, defn["definition"],
-                                                                         depositor["key_id"]))
+        key_id, token_id, email = api_keys.writer_columns(depositor)
+        con.execute(f"INSERT INTO object_releases (collection_key, version, state, definition, opened_at, opened_by, "
+                    f"opened_by_token_id, opened_by_email) VALUES (?, ?, 'open', ?, {con.dialect.now}, ?, ?, ?)",
+                    (key, version, defn["definition"], key_id, token_id, email))
+        if token_id:
+            _audit(con, "object_release_opened", email, f"{key} {version} with {token_id}")
         return _state(_release(con, key, version)), True
 
 
@@ -212,15 +224,21 @@ def release_status(con, key: str, version: str) -> dict:
 
 def close_release(con, depositor: dict, key: str, version: str) -> tuple[dict, bool]:
     """(release status, whether this call closed it). Closing mints the release's ResultCollection, records
-    the release, and makes it the collection's current one. Closing a closed release again is a no-op."""
+    the release, and makes it the collection's current one. Closing a closed release again is a no-op. A login's
+    close records its email and token id as the release's publisher (audited as object_release_closed); a key's
+    records its id on the object release."""
+    from .. import api_keys
     from .publish import _store_objects
 
     with con:
         _granted(con, depositor, key)
         # Flip the state first: the update takes the release row's write lock, so a part in flight (which holds
         # a share lock on it) finishes before the members are read, and a part arriving later sees it closed.
-        flipped = con.execute(f"UPDATE object_releases SET state = 'closed', closed_at = {con.dialect.now} "
-                              "WHERE collection_key = ? AND version = ? AND state = 'open'", (key, version)).rowcount
+        key_id, token_id, email = api_keys.writer_columns(depositor)
+        flipped = con.execute(f"UPDATE object_releases SET state = 'closed', closed_at = {con.dialect.now}, "
+                              "closed_by = ?, closed_by_token_id = ?, closed_by_email = ? "
+                              "WHERE collection_key = ? AND version = ? AND state = 'open'",
+                              (key_id, token_id, email, key, version)).rowcount
         row = _release(con, key, version)
         if row is None:
             raise CollectionNotFound(f"{key} has no release {version}")
@@ -280,9 +298,11 @@ def close_release(con, depositor: dict, key: str, version: str) -> tuple[dict, b
                     "files": sorted(files, key=lambda f: f["id"])}
         _store_objects(con, {rc["id"]: ("ResultCollection", rc), **new})
         con.execute("INSERT INTO collection_releases (release_id, collection_key, version, manifest, document, "
-                    "git_commit) VALUES (?, ?, ?, ?, ?, ?)",
+                    "git_commit, published_by, publisher_token_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (rc["id"], key, version, json.dumps({**defn, "objects": len(members)}), json.dumps(document),
-                     None))
+                     None, email, token_id))
+        if token_id:
+            _audit(con, "object_release_closed", email, f"{key} {version} as {rc['id']} with {token_id}")
         con.execute("UPDATE object_releases SET release_id = ? WHERE collection_key = ? AND version = ?",
                     (rc["id"], key, version))
         con.execute("UPDATE collections SET current_release_id = ? WHERE collection_key = ?", (rc["id"], key))

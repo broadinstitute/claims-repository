@@ -1,0 +1,265 @@
+"""Depositing into an object collection with a `claims login` instead of a deposit key (docs/depositing-objects.md).
+
+A login (Authorization: Bearer clp_...) may open, fill and close a release of any object collection, with no key
+and no grant. Its deposits and releases are recorded under its token id and email (schema 012), never a key id;
+publicly they are attributed to "claims login", and the admin console shows the email. The key path is unchanged.
+"""
+from __future__ import annotations
+
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from service import api_keys, device_login
+from service import db as service_db
+from service.app import app
+from service.collections import identity as cidn
+from service.collections import objects
+from service.collections.manifest import load_collection
+
+ROOT = Path(__file__).resolve().parent.parent
+COLLECTION = ROOT / "tests" / "fixtures" / "collections" / "catalog-test"
+PUBLISHER = "depositor@example.org"
+# Not named `client`: conftest gives every module's `client` the session's deposit key, and a login request
+# carrying a key as well is refused (400).
+writer = TestClient(app)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def isolated_db():
+    saved = service_db.DB_PATH
+    service_db.DB_PATH = str(Path(tempfile.mkdtemp()) / "login-deposits.db")
+    yield service_db.DB_PATH
+    service_db.DB_PATH = saved
+
+
+def _con():
+    return service_db.connect()
+
+
+def _rows(sql, params=()):
+    con = _con()
+    try:
+        return [dict(r) for r in con.execute(sql, params).fetchall()]
+    finally:
+        con.close()
+
+
+def login(email=PUBLISHER) -> dict:
+    """A publisher token, issued the way `claims login` gets one: {access_token, token_id, email, ...}."""
+    con = _con()
+    try:
+        started = device_login.start(con, "claims-cli/1", "test-runner", "34.1.2.3")
+        con.commit()
+        with con:
+            assert device_login.decide(con, device_login.normalize_user_code(started["user_code"]), email, True)
+        return device_login.exchange(con, started["device_code"])
+    finally:
+        con.close()
+
+
+def bearer(token: dict) -> dict:
+    return {"Authorization": f"Bearer {token['access_token']}"}
+
+
+def _mint(cls, **content):
+    return cidn.mint(cls, content)
+
+
+@pytest.fixture(scope="module")
+def registered(isolated_db):
+    con = _con()
+    try:
+        return objects.register(con, load_collection(COLLECTION))
+    finally:
+        con.close()
+
+
+@pytest.fixture(scope="module")
+def token(isolated_db):
+    return login()
+
+
+def _admin(monkeypatch):
+    import jwt
+
+    from service import admin_gateway
+
+    secret = "s" * 40
+    monkeypatch.setattr(admin_gateway, "SECRET", secret)
+
+    def headers(purpose):
+        now = int(time.time())
+        return {"Authorization": "Bearer " + jwt.encode(
+            {"iss": admin_gateway.ISSUER, "aud": admin_gateway.AUDIENCE, "iat": now, "exp": now + 120,
+             "jti": str(uuid.uuid4()), "sub": "admin@example.org", "purpose": purpose, "email": "admin@example.org",
+             "email_verified": True}, secret, algorithm="HS256")}
+    return headers
+
+
+GAP = _mint("KnowledgeGap", name="Login gap", text="Deposited with a login?", gap_description="d",
+            gap_kind="KNOWLEDGE_GAP", about_entities=["http://purl.obolibrary.org/obo/MONDO_0021661"])
+MECH = _mint("Mechanism", name="Login mechanism", description="Deposited with a login.")
+
+
+@pytest.fixture(scope="module")
+def released(registered, token):
+    """A release opened, filled and closed by a login: no key, no grant."""
+    opened = writer.post("/v1/collections/catalog-test/releases", json={"version": "2026.12.0"}, headers=bearer(token))
+    again = writer.post("/v1/collections/catalog-test/releases", json={"version": "2026.12.0"}, headers=bearer(token))
+    part = writer.post("/v1/deposits", json={"document": {"knowledge_gaps": [GAP], "mechanisms": [MECH]},
+                                             "collection": "catalog-test", "release": "2026.12.0"}, headers=bearer(token))
+    closed = writer.post("/v1/collections/catalog-test/releases/2026.12.0:close", headers=bearer(token))
+    return {"opened": opened, "again": again, "part": part, "closed": closed}
+
+
+def test_a_login_opens_fills_and_closes_a_release_without_a_key_or_grant(released, token):
+    assert released["opened"].status_code == 201, released["opened"].text
+    assert released["again"].status_code == 200
+    part = released["part"]
+    assert part.status_code == 200, part.text
+    receipt = part.json()
+    assert receipt["depositor"] == {"kind": "login", "name": "claims login", "email": PUBLISHER,
+                                    "token_id": token["token_id"]}
+    assert receipt["collection"] == {"key": "catalog-test", "release": "2026.12.0", "state": "open", "objects": 2}
+    closed = released["closed"]
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["state"] == "closed" and closed.json()["objects"] == 2
+    assert not _rows("SELECT 1 FROM api_key_grants WHERE collection_key = 'catalog-test'")
+
+    deposit = _rows("SELECT * FROM deposits WHERE deposit_id = ?", (receipt["deposit_id"],))[0]
+    assert deposit["key_id"] is None and deposit["publisher_token_id"] == token["token_id"]
+    assert deposit["publisher_email"] == PUBLISHER and deposit["collection_key"] == "catalog-test"
+    release = _rows("SELECT * FROM object_releases WHERE version = '2026.12.0'")[0]
+    assert release["opened_by"] is None and release["closed_by"] is None
+    assert (release["opened_by_token_id"], release["opened_by_email"]) == (token["token_id"], PUBLISHER)
+    assert (release["closed_by_token_id"], release["closed_by_email"]) == (token["token_id"], PUBLISHER)
+    published = _rows("SELECT published_by, publisher_token_id FROM collection_releases WHERE version = '2026.12.0'")
+    assert published == [{"published_by": PUBLISHER, "publisher_token_id": token["token_id"]}]
+    events = [(r["event"], r["email"]) for r in _rows(
+        "SELECT event, email FROM admin_auth_events WHERE event LIKE 'object_release_%' ORDER BY id")]
+    assert events == [("object_release_opened", PUBLISHER), ("object_release_closed", PUBLISHER)]
+
+
+def test_login_deposits_are_public_as_claims_login_and_show_their_email_only_to_admins(released, token, monkeypatch):
+    receipt = released["part"].json()
+    listed = writer.get("/v1/deposits").json()["deposits"]
+    mine = next(d for d in listed if d["deposit_id"] == receipt["deposit_id"])
+    assert mine["depositor"] == {"kind": "login", "name": "claims login"}
+    one = writer.get(f"/v1/deposits/{receipt['deposit_id']}").json()
+    assert one["depositor"] == {"kind": "login", "name": "claims login"}
+    assert PUBLISHER not in writer.get("/v1/deposits").text and token["token_id"] not in writer.get("/v1/deposits").text
+    by_token = writer.get("/v1/deposits", params={"deposited_by": token["token_id"]}).json()
+    assert [d["deposit_id"] for d in by_token["deposits"]] == [receipt["deposit_id"]]
+    found = writer.get("/v1/objects/search", params={"deposited_by": token["token_id"]}).json()
+    assert {o["id"] for o in found["objects"]} == {GAP["id"], MECH["id"]}
+    assert writer.get("/v1/deposits", params={"deposited_by": "tok_nothex"}).status_code == 400
+
+    admin = _admin(monkeypatch)
+    rows = writer.get("/v1/admin/api/deposits", headers=admin("admin_read")).json()["rows"]
+    row = next(r for r in rows if r["depositId"] == receipt["deposit_id"])
+    assert row["depositor"] == {"kind": "login", "keyId": None, "name": PUBLISHER, "email": PUBLISHER,
+                                "tokenId": token["token_id"]}
+    detail = writer.get(f"/v1/admin/api/objects/{GAP['id']}", headers=admin("admin_read")).json()
+    assert detail["deposits"][0]["depositor"]["email"] == PUBLISHER
+
+
+def test_revoked_or_expired_login_tokens_are_refused_on_every_write(registered):
+    revoked, expired = login("revoked@example.org"), login("expired@example.org")
+    con = _con()
+    try:
+        with con:
+            device_login.revoke(con, revoked["token_id"], "admin@example.org")
+            con.execute("UPDATE publisher_tokens SET expires_at = '2020-01-01 00:00:00' WHERE token_id = ?",
+                        (expired["token_id"],))
+    finally:
+        con.close()
+    malformed = {"access_token": "clp_" + "A" * 43}
+    for token in (revoked, expired, malformed):
+        for response in (
+            writer.post("/v1/collections/catalog-test/releases", json={"version": "2026.12.9"}, headers=bearer(token)),
+            writer.post("/v1/deposits", json={"objects": [MECH]}, headers=bearer(token)),
+            writer.post("/v1/collections/catalog-test/releases/2026.12.0:close", headers=bearer(token)),
+        ):
+            assert response.status_code == 401, response.text
+            assert response.headers["www-authenticate"] == "Bearer"
+            assert response.json() == {"detail": device_login.UNAUTHORIZED}
+    assert not _rows("SELECT 1 FROM object_releases WHERE version = '2026.12.9'")
+
+
+def test_a_key_and_a_login_together_are_refused(token, depositor):
+    response = writer.post("/v1/deposits", json={"objects": [MECH]},
+                           headers={**bearer(token), "X-API-Key": depositor["key"]})
+    assert response.status_code == 400 and response.json() == {"detail": api_keys.BOTH_CREDENTIALS}
+
+
+def test_a_key_still_needs_its_grant(registered, depositor):
+    keyed = TestClient(app, headers={"X-API-Key": depositor["key"]})
+    refused = keyed.post("/v1/collections/catalog-test/releases", json={"version": "2026.12.1"})
+    assert refused.status_code == 403 and "grant it in the admin console" in refused.json()["detail"]
+    plain = keyed.post("/v1/deposits", json={"objects": [MECH]})
+    assert plain.status_code == 200 and plain.json()["depositor"] == {"key_id": depositor["key_id"],
+                                                                      "name": depositor["name"]}
+    row = _rows("SELECT * FROM deposits WHERE deposit_id = ?", (plain.json()["deposit_id"],))[0]
+    assert row["key_id"] == depositor["key_id"] and row["publisher_token_id"] is None and row["publisher_email"] is None
+
+
+def test_a_key_opened_release_records_the_key(registered, depositor):
+    con = _con()
+    try:
+        with con:
+            api_keys.grant(con, depositor["key_id"], "catalog-test", "tests")
+    finally:
+        con.close()
+    keyed = TestClient(app, headers={"X-API-Key": depositor["key"]})
+    assert keyed.post("/v1/collections/catalog-test/releases", json={"version": "2026.12.2"}).status_code == 201
+    assert keyed.post("/v1/deposits", json={"objects": [MECH], "collection": "catalog-test",
+                                            "release": "2026.12.2"}).status_code == 200
+    assert keyed.post("/v1/collections/catalog-test/releases/2026.12.2:close").status_code == 200
+    release = _rows("SELECT * FROM object_releases WHERE version = '2026.12.2'")[0]
+    assert release["opened_by"] == release["closed_by"] == depositor["key_id"]
+    assert release["opened_by_token_id"] is None and release["closed_by_email"] is None
+    published = _rows("SELECT published_by, publisher_token_id FROM collection_releases WHERE version = '2026.12.2'")
+    assert published == [{"published_by": None, "publisher_token_id": None}]
+
+
+def test_every_deposit_row_names_exactly_one_writer(released, depositor):
+    """The migrated schema takes a key deposit and a login deposit; the app never writes a row with neither (or
+    both)."""
+    for actor in ({"kind": "login", "name": "claims login", "email": None, "token_id": None},
+                  {"kind": "key", "key_id": None, "name": "x"},
+                  {"kind": "key", "key_id": "key_0123456789abcdef", "token_id": "tok_0123456789abcdef"},
+                  {"kind": "login", "email": "a@b.c", "token_id": "tok_0123456789abcdef", "key_id": "key_1"},
+                  {"kind": "other", "key_id": "key_0123456789abcdef"}):
+        con = _con()
+        try:
+            with pytest.raises(ValueError):
+                with con:
+                    api_keys.record_deposit(con, actor, [{"id": MECH["id"], "status": "exists"}])
+        finally:
+            con.close()
+    rows = _rows("SELECT key_id, publisher_token_id, publisher_email FROM deposits")
+    assert rows and all((r["key_id"] is None) != (r["publisher_token_id"] is None) for r in rows)
+    assert all((r["publisher_token_id"] is None) == (r["publisher_email"] is None) for r in rows)
+    kinds = {"key" if r["key_id"] else "login" for r in rows}
+    assert kinds == {"key", "login"}
+    assert not _rows("SELECT 1 FROM object_releases WHERE opened_by IS NULL AND opened_by_token_id IS NULL")
+
+
+def test_still_valid_rechecks_a_login_for_revocation_and_expiry(token):
+    actor = {"kind": "login", "name": "claims login", "email": PUBLISHER, "token_id": token["token_id"]}
+    con = _con()
+    try:
+        assert api_keys.still_valid(con, actor)
+        con.execute("UPDATE publisher_tokens SET expires_at = '2020-01-01 00:00:00' WHERE token_id = ?",
+                    (token["token_id"],))
+        assert not api_keys.still_valid(con, actor)
+        con.rollback()
+        assert api_keys.still_valid(con, {**actor, "token_id": token["token_id"]})
+        assert not api_keys.still_valid(con, {**actor, "token_id": "tok_0000000000000000"})
+    finally:
+        con.close()
