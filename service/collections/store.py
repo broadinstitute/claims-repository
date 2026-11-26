@@ -319,12 +319,28 @@ class BucketStore(ParquetStore):
         return self.cache.dir(dataset_id)
 
     def _files(self, dataset_ids, name):
-        out = []
-        for d in dataset_ids:
-            entry = self.known.get(d)
-            if entry is not None:
-                out.append(str(self.cache.ensure(d, entry) / name))
-        return out
+        entries = [(d, self.known[d]) for d in dataset_ids if d in self.known]
+        self.cache.ensure_many(entries)
+        return [str(self.cache.dir(d) / name) for d, _ in entries]
+
+    def _holding(self, dataset_ids, kind):
+        """The datasets whose recorded counts have rows (or edges) of this kind: the others are not read at all.
+        Many datasets of a release hold none of a kind (a CFDE library's dataset has no gene rows; some have no
+        rows), and reading their files only to find nothing is most of a cross-trait query's work."""
+        return [d for d in dataset_ids if self.counts(d).get(kind)]
+
+    def anchor(self, dataset_ids, kind, conds, order_metric, direction, limit, subjects=None):
+        return super().anchor(self._holding(dataset_ids, kind), kind, conds, order_metric, direction, limit,
+                              subjects)
+
+    def has_edges(self, dataset_id, edge_kind):
+        return bool(self._holding([dataset_id], edge_kind)) and super().has_edges(dataset_id, edge_kind)
+
+    def prewarm(self, dataset_ids) -> int:
+        """Read these datasets into the cache (those recorded in `known`); how many it holds now."""
+        entries = [(d, self.known[d]) for d in dataset_ids if d in self.known]
+        self.cache.ensure_many(entries)
+        return len(entries)
 
     def counts(self, dataset_id):
         entry = self.known.get(dataset_id)
@@ -376,6 +392,26 @@ def _bucket_indexed(con, dataset_ids) -> set[str]:
             if d not in hit:
                 _NOT_INDEXED[d] = now
     return {d for d in dataset_ids if d in store.known}
+
+
+def prewarm(con) -> int:
+    """Read every dataset of every collection's current release that has a bucket index into the local cache,
+    so the first query after a deploy or a task replacement does not wait on S3. Run at startup in a
+    background thread (CLAIMS_INDEX_PREWARM=1); a query meanwhile reads what it needs itself, sharing the same
+    fetch threads. Returns how many datasets the cache holds."""
+    if index_dir():
+        return 0
+    found = con.execute("SELECT di.dataset_id, di.location, di.files, di.counts FROM dataset_indexes di "
+                        "JOIN release_datasets rd ON rd.dataset_id = di.dataset_id "
+                        "JOIN collections c ON c.current_release_id = rd.release_id").fetchall()
+    store = bucket_store()
+    for r in found:
+        store.known.setdefault(r["dataset_id"], {"location": r["location"], "files": json.loads(r["files"]),
+                                                 "counts": json.loads(r["counts"])})
+    ids = sorted({r["dataset_id"] for r in found})
+    for i in range(0, len(ids), 1000):   # in parts, so a request's own reads are not queued behind all of them
+        store.prewarm(ids[i:i + 1000])
+    return len(ids)
 
 
 def get_store(con, dataset_ids=None):
