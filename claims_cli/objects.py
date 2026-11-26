@@ -213,7 +213,7 @@ def cmd_register(args) -> None:
 
 # --- documents -------------------------------------------------------------------------------------------------
 
-def parts(document: dict, skip: set[str]):
+def parts(document: dict, skip: set[str], max_bytes: int | None = None):
     """A document's node and edge groups as deposits within the limits: ({group: [items]}, objects, edges) each.
     Skipped: the groups named in `skip`, `prefixes` and `id`, and any value that is not a list. A deposit holds at
     least one object, so a part that would hold edges only repeats the document's first object (not counted in
@@ -234,7 +234,7 @@ def parts(document: dict, skip: set[str]):
         is_edge = group.endswith("_edges")
         for item in items:
             item_size = len(json.dumps(item, separators=(",", ":")).encode()) + 2  # sized as sent (ensure_ascii, as _call)
-            if part and (size + item_size > MAX_BYTES or (objects >= MAX_OBJECTS and not is_edge)
+            if part and (size + item_size > (max_bytes or MAX_BYTES) or (objects >= MAX_OBJECTS and not is_edge)
                          or (edges >= MAX_EDGES and is_edge)):
                 yield done()
                 part, objects, edges, size = {}, 0, 0, 0
@@ -410,7 +410,8 @@ def _print_release(answer: dict, closing: bool) -> None:
             print(f"  unresolved_references: {len(unresolved)}" + (f", e.g. {unresolved[0]}" if unresolved else ""))
 
 
-def _send_document(api: Api, key: str, version: str, root: Path, rel: str, skip: set[str], stop: threading.Event) -> dict:
+def _send_document(api: Api, key: str, version: str, root: Path, rel: str, skip: set[str], stop: threading.Event,
+                   max_bytes: int | None = None) -> dict:
     with open(root / rel) as fh:
         document = yaml.load(fh, Loader=Loader)
     if not isinstance(document, dict):
@@ -418,7 +419,7 @@ def _send_document(api: Api, key: str, version: str, root: Path, rel: str, skip:
     out = {"parts": 0, "objects": 0, "edges": 0, "unresolved_references": 0,
            "skipped": skipped_counts(document, skip)}
     try:
-        split = list(parts(document, skip))
+        split = list(parts(document, skip, max_bytes))
     except ValueError as exc:
         raise Refused(0, f"{rel}: {exc}")
     for part, objects, edges in split:
@@ -454,13 +455,16 @@ def cmd_deposit(args) -> None:
     _open(api, key, version)
 
     skip = set(args.skip_group or [])
+    if args.part_mb is not None and not 0.05 <= args.part_mb <= MAX_BYTES / 1e6:
+        sys.exit(f"claims: --part-mb is between 0.05 and {MAX_BYTES / 1e6:g}")
+    max_bytes = int(args.part_mb * 1e6) if args.part_mb is not None else None
     totals = {"documents": 0, "parts": 0, "objects": 0, "edges": 0, "unresolved_references": 0}
     skipped: dict[str, int] = {}
     started = last = time.time()
     stop = threading.Event()
     failure = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = {pool.submit(_send_document, api, key, version, root, rel, skip, stop): rel for rel in todo}
+        futures = {pool.submit(_send_document, api, key, version, root, rel, skip, stop, max_bytes): rel for rel in todo}
         try:
             for future in concurrent.futures.as_completed(futures):
                 rel = futures[future]
@@ -555,6 +559,9 @@ def add_commands(sub) -> None:
     p.add_argument("--state-file", help="documents already deposited (default <workdir>/<collection>-<version>.sent)")
     p.add_argument("--workers", type=int, default=4, help="documents deposited in parallel (default 4)")
     p.add_argument("--limit", type=int, help="the first N selected documents only (a trial)")
+    p.add_argument("--part-mb", type=float, default=None,
+                   help=f"at most this many MB of JSON per deposit (default {MAX_BYTES / 1e6:g}); smaller parts keep a "
+                        "document with many indexed values (e.g. big gene sets) within a gateway's request timeout")
     p.add_argument("--close", action="store_true", help="close the release after the last document")
     p.add_argument("--workdir", help=f"where an s3:// source is mirrored and the state file kept (default "
                                      f"{default_workdir()})")
