@@ -81,9 +81,18 @@ one after another, four S3 reads each with a new S3 client per file, which took 
 dataset whose recorded counts hold no row of the kind asked for (a CFDE library's datasets hold no gene
 rows; many hold no rows at all), so those are never read.
 
-Measured on a laptop: 400 index files in 1.2 s in parallel, against 40 in 2.8 s one after another. Not yet
-measured on QA, whose task has half a CPU. Parallel reads do not speed up a warm query: its DuckDB scan
-over every trait's files stays (FTO across traits took 43 s warm on QA). Run those with `?async=true`.
+Measured on a laptop: 400 index files in 1.2 s in parallel, against 40 in 2.8 s one after another.
+
+Measured on QA on 2026-11-26, after the deploy and its index prewarm (half a CPU):
+
+| Query | Before | After |
+| --- | --- | --- |
+| One gene across every trait (`rows`, `subject: ["FTO"]`, library `mouse_msigdb`) | 504 cold; 43 s warm | 10.6 s (APOE 9.7 s) |
+| IBD top 50 genes with `containedIn`, 5 CFDE sets each | (new) | 11 s first, 4.5 s after |
+| The same with `?async=true` | (new) | 202 in 0.13 s, result after 6.7 s |
+
+The warm cross-trait gain most likely comes from skipping datasets that hold no row of the kind, not from the parallel
+read. A query that is still slow can be run with `?async=true`.
 
 ## Built: answering in the background (`?async=true`)
 
