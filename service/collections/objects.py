@@ -9,9 +9,11 @@ held left as stored), and membership in the release is a record beside them.
 
 Life of a release:
 1. The collection's definition (manifest, query templates, vocabulary files)
-   is registered once from its directory (scripts/publish_collection.py).
-2. A key granted the collection opens a release: POST
-   /v1/collections/{c}/releases {"version": ...}.
+   is registered from its directory: `claims objects register` with a login
+   (POST /v1/publish/objects/{c}:register), or scripts/publish_collection.py
+   on the database.
+2. A key granted the collection, or a `claims login` (any collection), opens a
+   release: POST /v1/collections/{c}/releases {"version": ...}.
 3. Deposits naming the collection and that release add their objects (any
    number of parts; resending a part changes nothing).
 4. Closing it mints the release's DAPPER ResultCollection (its members, the
@@ -42,7 +44,7 @@ class ReleaseError(ValueError):
 
 
 class NotGranted(PermissionError):
-    """The key was not granted the collection (403)."""
+    """The key was not granted the collection (403). A login needs no grant."""
 
 
 def is_objects(record: dict) -> bool:
@@ -51,11 +53,12 @@ def is_objects(record: dict) -> bool:
 
 # --- the definition ----------------------------------------------------------------------------------------
 
-def register(con, col: Collection, git_commit: str | None = None) -> dict:
-    """Record an object collection's definition from its directory: the manifest, query templates and
-    vocabulary as parsed, each file stored as a DAPPER File. Registering again replaces the definition;
-    releases already opened keep the one they were opened with."""
-    from .publish import SourceFile, _source_file_doc, _store_objects
+def build_definition(col: Collection, prefix: str | None = None) -> tuple[dict, dict]:
+    """(the definition record an object collection's directory makes, its File records by id): the manifest,
+    query templates and vocabulary as parsed, each file a DAPPER File. `prefix` is the collection directory's
+    path in its repository, as a push sends it (each File's location is `prefix/relpath`); None asks git, for
+    a directory on this machine. A File's id does not depend on its location."""
+    from .publish import SourceFile, _source_file_doc
 
     if not col.is_objects:
         raise ManifestError(f"{col.key} is not an object collection (kind: objects)")
@@ -69,31 +72,54 @@ def register(con, col: Collection, git_commit: str | None = None) -> dict:
         files[doc["id"]] = ("File", doc)
         return doc["id"]
 
-    manifest_file = keep(_source_file_doc(col.manifest, f"{col.key} collection manifest."))
-    queries = {name: {"file_id": keep(_source_file_doc(q, f"{col.key} query template {name}.")), "path": q.rel,
-                      "doc": q.doc} for name, q in col.queries.items()}
+    def at(rel: str) -> str | None:
+        return None if prefix is None else (f"{prefix}/{rel}" if prefix else rel)
+
+    manifest_file = keep(_source_file_doc(col.manifest, f"{col.key} collection manifest.",
+                                          location=at(col.manifest.rel)))
+    queries = {name: {"file_id": keep(_source_file_doc(q, f"{col.key} query template {name}.", location=at(q.rel))),
+                      "path": q.rel, "doc": q.doc} for name, q in col.queries.items()}
     vocab_files = []
     for block, dim, rel in vocabulary_files(col.doc):
         path = (col.root / rel).resolve()
         what = "mapping" if block == "mappings" else "cross-references"
         vocab_files.append(keep(_source_file_doc(SourceFile(path=path, rel=rel, data=path.read_bytes(), doc={}),
-                                                 f"{col.key} {what} for {dim}.", "text/tab-separated-values")))
-    record = {"kind": "objects", "manifest": col.doc, "templates": [], "queries": queries,
+                                                 f"{col.key} {what} for {dim}.", "text/tab-separated-values",
+                                                 location=at(rel))))
+    # object_kinds and queries are optional now, but a build from before that (QA and prod share the database and
+    # deploy apart) reads manifest["object_kinds"] / ["queries"] of every current release: store them, empty.
+    manifest = {**col.doc, "object_kinds": col.doc.get("object_kinds") or {}, "queries": col.doc.get("queries") or []}
+    record = {"kind": "objects", "manifest": manifest, "templates": [], "queries": queries,
               "manifest_file_id": manifest_file, "vocabulary_file_ids": vocab_files,
               "mappings": {dim: {k: list(v) for k, v in m.items()} for dim, m in vocab.mappings.items()},
               "vocabulary": vocab.entries}
+    return json.loads(json.dumps(record)), files
+
+
+def store_definition(con, col: Collection, record: dict, files: dict, git_commit: str | None) -> dict:
+    """Record a definition (build_definition) as the collection's: replaces any registered one. No commit."""
+    from .publish import _store_objects
+
+    _store_objects(con, files)
+    con.execute("DELETE FROM object_collections WHERE collection_key = ?", (col.key,))
+    con.execute("INSERT INTO object_collections (collection_key, definition, git_commit) VALUES (?, ?, ?)",
+                (col.key, json.dumps(record), git_commit))
+    if con.execute("SELECT 1 FROM collections WHERE collection_key = ?", (col.key,)).fetchone():
+        con.execute("UPDATE collections SET title = ?, description = ? WHERE collection_key = ?",
+                    (col.doc["title"], col.doc.get("description"), col.key))
+    else:
+        con.execute("INSERT INTO collections (collection_key, title, description, current_release_id) "
+                    "VALUES (?, ?, ?, NULL)", (col.key, col.doc["title"], col.doc.get("description")))
+    return {"collection": col.key, "queries": sorted(record["queries"]), "files": len(files)}
+
+
+def register(con, col: Collection, git_commit: str | None = None, prefix: str | None = None) -> dict:
+    """Record an object collection's definition from its directory: the manifest, query templates and
+    vocabulary as parsed, each file stored as a DAPPER File. Registering again replaces the definition;
+    releases already opened keep the one they were opened with."""
+    record, files = build_definition(col, prefix)
     with con:
-        _store_objects(con, files)
-        con.execute("DELETE FROM object_collections WHERE collection_key = ?", (col.key,))
-        con.execute("INSERT INTO object_collections (collection_key, definition, git_commit) VALUES (?, ?, ?)",
-                    (col.key, json.dumps(record), git_commit))
-        if con.execute("SELECT 1 FROM collections WHERE collection_key = ?", (col.key,)).fetchone():
-            con.execute("UPDATE collections SET title = ?, description = ? WHERE collection_key = ?",
-                        (col.doc["title"], col.doc.get("description"), col.key))
-        else:
-            con.execute("INSERT INTO collections (collection_key, title, description, current_release_id) "
-                        "VALUES (?, ?, ?, NULL)", (col.key, col.doc["title"], col.doc.get("description")))
-    return {"collection": col.key, "queries": sorted(queries), "files": len(files)}
+        return store_definition(con, col, record, files, git_commit)
 
 
 def definition(con, key: str) -> dict | None:
@@ -117,12 +143,24 @@ def _state(row) -> dict:
 def _granted(con, depositor: dict, key: str) -> None:
     from .. import api_keys
 
+    if api_keys.is_login(depositor) and not api_keys.still_valid(con, depositor):
+        # re-checked inside the open/close transaction, as a deposit re-checks it (api_keys.still_valid)
+        raise NotGranted("this claims login was revoked or has expired: run `claims login` again")
     if not api_keys.has_grant(con, depositor, key):
         raise NotGranted(f"this key may not write into the collection {key!r}: grant it in the admin console")
 
 
+def _audit(con, event: str, email: str, detail: str) -> None:
+    from ..device_login import _audit as audit
+
+    audit(con, event, email, detail)
+
+
 def open_release(con, depositor: dict, key: str, version: str) -> tuple[dict, bool]:
-    """(release state, whether this call opened it). Opening an open release again is a no-op."""
+    """(release state, whether this call opened it). Opening an open release again is a no-op. Who opened it is
+    recorded: a key's id, or a login's token id and email (audited as object_release_opened)."""
+    from .. import api_keys
+
     if not isinstance(version, str) or not version or len(version) > 64 or not version.isascii() or " " in version:
         raise ValueError("version must be a short ASCII string without spaces, e.g. 2026.11.0")
     with con:
@@ -138,9 +176,12 @@ def open_release(con, depositor: dict, key: str, version: str) -> tuple[dict, bo
         if con.execute("SELECT 1 FROM collection_releases WHERE collection_key = ? AND version = ?",
                        (key, version)).fetchone():
             raise ReleaseError(f"{key} already has a release {version}")
-        con.execute(f"INSERT INTO object_releases (collection_key, version, state, definition, opened_at, opened_by) "
-                    f"VALUES (?, ?, 'open', ?, {con.dialect.now}, ?)", (key, version, defn["definition"],
-                                                                         depositor["key_id"]))
+        key_id, token_id, email = api_keys.writer_columns(depositor)
+        con.execute(f"INSERT INTO object_releases (collection_key, version, state, definition, opened_at, opened_by, "
+                    f"opened_by_token_id, opened_by_email) VALUES (?, ?, 'open', ?, {con.dialect.now}, ?, ?, ?)",
+                    (key, version, defn["definition"], key_id, token_id, email))
+        if token_id:
+            _audit(con, "object_release_opened", email, f"{key} {version} with {token_id}")
         return _state(_release(con, key, version)), True
 
 
@@ -178,7 +219,7 @@ def _values(value) -> list:
 def add_objects(con, key: str, version: str, defn: dict, deposit_id: str, items: list[dict]) -> int:
     """Record deposited objects as members of the release, and index the fields its object kinds declare.
     Idempotent: a member already recorded keeps its first deposit."""
-    kinds = defn["manifest"]["object_kinds"]
+    kinds = defn["manifest"].get("object_kinds") or {}  # none: members only, no indexed fields
     members, fields = [], []
     for item in items:
         members.append((key, version, item["id"], item["class_name"], deposit_id))
@@ -212,15 +253,21 @@ def release_status(con, key: str, version: str) -> dict:
 
 def close_release(con, depositor: dict, key: str, version: str) -> tuple[dict, bool]:
     """(release status, whether this call closed it). Closing mints the release's ResultCollection, records
-    the release, and makes it the collection's current one. Closing a closed release again is a no-op."""
+    the release, and makes it the collection's current one. Closing a closed release again is a no-op. A login's
+    close records its email and token id as the release's publisher (audited as object_release_closed); a key's
+    records its id on the object release."""
+    from .. import api_keys
     from .publish import _store_objects
 
     with con:
         _granted(con, depositor, key)
         # Flip the state first: the update takes the release row's write lock, so a part in flight (which holds
         # a share lock on it) finishes before the members are read, and a part arriving later sees it closed.
-        flipped = con.execute(f"UPDATE object_releases SET state = 'closed', closed_at = {con.dialect.now} "
-                              "WHERE collection_key = ? AND version = ? AND state = 'open'", (key, version)).rowcount
+        key_id, token_id, email = api_keys.writer_columns(depositor)
+        flipped = con.execute(f"UPDATE object_releases SET state = 'closed', closed_at = {con.dialect.now}, "
+                              "closed_by = ?, closed_by_token_id = ?, closed_by_email = ? "
+                              "WHERE collection_key = ? AND version = ? AND state = 'open'",
+                              (key_id, token_id, email, key, version)).rowcount
         row = _release(con, key, version)
         if row is None:
             raise CollectionNotFound(f"{key} has no release {version}")
@@ -265,7 +312,7 @@ def close_release(con, depositor: dict, key: str, version: str) -> tuple[dict, b
             "members": [d["id"] for d in datasets],
             "n_members": len(datasets),
             "has_manifest_file": defn["manifest_file_id"],
-            "has_query_template": sorted(q["file_id"] for q in defn["queries"].values()) or None,
+            "has_query_template": sorted(q["file_id"] for q in (defn.get("queries") or {}).values()) or None,
             "was_revision_of": (current["current_release_id"] if current else None) or None,
         })
         for doc in (rc, *datasets, *(d for c, d in new.values() if c == "File")):
@@ -280,9 +327,11 @@ def close_release(con, depositor: dict, key: str, version: str) -> tuple[dict, b
                     "files": sorted(files, key=lambda f: f["id"])}
         _store_objects(con, {rc["id"]: ("ResultCollection", rc), **new})
         con.execute("INSERT INTO collection_releases (release_id, collection_key, version, manifest, document, "
-                    "git_commit) VALUES (?, ?, ?, ?, ?, ?)",
+                    "git_commit, published_by, publisher_token_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (rc["id"], key, version, json.dumps({**defn, "objects": len(members)}), json.dumps(document),
-                     None))
+                     None, email, token_id))
+        if token_id:
+            _audit(con, "object_release_closed", email, f"{key} {version} as {rc['id']} with {token_id}")
         con.execute("UPDATE object_releases SET release_id = ? WHERE collection_key = ? AND version = ?",
                     (rc["id"], key, version))
         con.execute("UPDATE collections SET current_release_id = ? WHERE collection_key = ?", (rc["id"], key))
@@ -333,7 +382,7 @@ def describe(con, key: str, rel, record: dict) -> dict:
         "owners": m.get("owners", []), "methods": m["methods"], "dapper_profile": m["dapper_profile"],
         "release": {"id": rel["release_id"], "version": rel["version"], "git_commit": rel["git_commit"]},
         "releases": releases,
-        "object_kinds": m["object_kinds"],
+        "object_kinds": m.get("object_kinds") or {},
         "objects": {"total": sum(counts.values()), "classes": counts},
         "queries": sorted(record["queries"]),
         "vocabulary": sorted((record.get("mappings") or {})),
@@ -343,7 +392,7 @@ def describe(con, key: str, rel, record: dict) -> dict:
 
 def field_values(con, key: str, rel, record: dict, field: str, search: str | None, first: int | None,
                  max_values: int) -> dict:
-    if field not in {f for k in record["manifest"]["object_kinds"].values() for f in k["fields"]}:
+    if field not in {f for k in (record["manifest"].get("object_kinds") or {}).values() for f in k["fields"]}:
         raise CollectionNotFound(f"collection {key!r} has no field {field!r}")
     rows = con.execute("SELECT value, COUNT(*) AS n FROM release_object_fields WHERE collection_key = ? AND "
                        "version = ? AND field = ? GROUP BY value ORDER BY value", (key, rel["version"], field)).fetchall()
@@ -425,7 +474,7 @@ def _order(alias: str, order: dict | None) -> tuple[str, list]:
 def _view(payload: dict, cls: str, record: dict) -> dict:
     from ..objects import present
 
-    spec = record["manifest"]["object_kinds"].get(cls) or {}
+    spec = (record["manifest"].get("object_kinds") or {}).get(cls) or {}
     return {"class": cls, "id": payload["id"],
             "fields": {n: payload.get(r["slot"]) for n, r in spec.get("fields", {}).items()},
             "object": present(payload)}
@@ -442,7 +491,7 @@ def run_query(con, collection: str, name: str, variables: dict | None, release: 
         raise CollectionNotFound(f"collection {collection!r} has no query {name!r}; it has {sorted(record['queries'])}")
     qdoc = record["queries"][name]["doc"]
     bound = bind_params(qdoc, variables)
-    kinds = record["manifest"]["object_kinds"]
+    kinds = record["manifest"].get("object_kinds") or {}
     version = rel["version"]
     a = qdoc["plan"][0]["anchor"]
     conds, params = _conditions(con, "ro", a.get("where"), bound, record)

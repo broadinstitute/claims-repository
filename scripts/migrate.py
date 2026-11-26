@@ -66,11 +66,14 @@ REQUIRED_COLUMNS = {
     "admin_auth_events": {"at", "event", "email", "detail"},
     # 007_deposit_keys.sql
     "api_keys": {"key_id", "name", "key_sha256", "created_at", "created_by", "revoked_at", "revoked_by"},
-    "deposits": {"deposit_id", "key_id", "received_at", "object_count", "collection_key", "release_version"},
+    "deposits": {"deposit_id", "key_id", "received_at", "object_count", "collection_key", "release_version",
+                 "publisher_token_id", "publisher_email"},  # 012
     # 008_object_collections.sql
     "api_key_grants": {"key_id", "collection_key", "granted_at"},
     "object_collections": {"collection_key", "definition"},
-    "object_releases": {"collection_key", "version", "state", "definition", "release_id"},
+    "object_releases": {"collection_key", "version", "state", "definition", "release_id", "opened_by",
+                        "opened_by_token_id", "opened_by_email", "closed_by", "closed_by_token_id",
+                        "closed_by_email"},  # 012
     "release_objects": {"collection_key", "version", "object_id", "class_name", "deposit_id"},
     "release_object_fields": {"collection_key", "version", "object_id", "field", "value", "num"},
     "deposit_objects": {"deposit_id", "object_id", "status"},
@@ -80,6 +83,11 @@ REQUIRED_COLUMNS = {
                      "last_polled_at", "decided_by", "decided_at", "token_id"},
     "publisher_tokens": {"token_id", "token_sha256", "email", "host", "created_at", "expires_at", "last_used_at",
                          "revoked_at", "revoked_by"},
+}
+# Post-condition: columns that must accept NULL (012: a login deposit or release has no key id).
+REQUIRED_NULLABLE = {
+    "deposits": {"key_id"},
+    "object_releases": {"opened_by"},
 }
 REQUIRED_PRIMARY_KEYS = {
     "claim_memberships": ["phenotype", "collection", "gene", "gene_set"],
@@ -144,16 +152,23 @@ def parse_migration(path: Path) -> tuple[list[str], list[str]]:
 def verify_schema(cur, database: str) -> list[str]:
     problems = []
     cur.execute(
-        "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = %s",
+        "SELECT table_name, column_name, is_nullable FROM information_schema.columns WHERE table_schema = %s",
         (database,),
     )
     columns: dict[str, set] = {}
-    for table, column in cur.fetchall():
+    nullable: dict[str, set] = {}
+    for table, column, is_nullable in cur.fetchall():
         columns.setdefault(table, set()).add(column)
+        if is_nullable == "YES":
+            nullable.setdefault(table, set()).add(column)
     for table, required in REQUIRED_COLUMNS.items():
         missing = required - columns.get(table, set())
         if missing:
             problems.append(f"{table}: missing columns {sorted(missing)}")
+    for table, wanted in REQUIRED_NULLABLE.items():
+        strict = (wanted & columns.get(table, set())) - nullable.get(table, set())
+        if strict:
+            problems.append(f"{table}: columns {sorted(strict)} must accept NULL (012_login_deposits.sql)")
     for table, key in REQUIRED_PRIMARY_KEYS.items():
         cur.execute(
             "SELECT column_name FROM information_schema.key_column_usage "

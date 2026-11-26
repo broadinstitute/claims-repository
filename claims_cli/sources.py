@@ -68,9 +68,10 @@ def list_prefix(uri: str, versioned: bool = False) -> list[Listed]:
 def fetch(location: str, dest: Path, version_id: str | None = None, attempts: int = 4) -> None:
     """Download one object (a pinned version when given), retrying transient failures."""
     bucket, key = split_s3(location)
-    args = ["s3api", "get-object", "--bucket", bucket, "--key", key, str(dest)]
+    args = ["s3api", "get-object", "--bucket", bucket, "--key", key]
     if version_id:
-        args[5:5] = ["--version-id", version_id]
+        args += ["--version-id", version_id]
+    args.append(str(dest))  # the outfile is positional and comes last
     for attempt in range(1, attempts + 1):
         try:
             _aws(*args)

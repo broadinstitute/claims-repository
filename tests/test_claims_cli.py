@@ -144,3 +144,15 @@ def test_validate_reports_an_object_collection():
                          cwd=ROOT, capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert "catalog-test (objects): 4 object kind(s)" in out.stdout
+
+
+def test_fetch_puts_a_pinned_version_after_the_key(monkeypatch, tmp_path):
+    """`aws s3api get-object` takes the outfile last; --version-id must not split --key from its value."""
+    calls = []
+    monkeypatch.setattr(src, "_aws", lambda *args: calls.append(args))
+    src.fetch("s3://b/a/key.json", tmp_path / "out.json", version_id="v123")
+    src.fetch("s3://b/a/key.json", tmp_path / "out.json")
+    out = str(tmp_path / "out.json")
+    assert calls[0] == ("s3api", "get-object", "--bucket", "b", "--key", "a/key.json",
+                        "--version-id", "v123", out)
+    assert calls[1] == ("s3api", "get-object", "--bucket", "b", "--key", "a/key.json", out)

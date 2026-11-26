@@ -11,6 +11,11 @@ request that would change something recorded is refused; one repeated after a lo
     POST /v1/publish/{collection}/{version}:check                 which datasets and mint contexts are stored
     PUT  /v1/publish/{collection}/{version}/datasets/{dataset_id}  one dataset's index, in the push's bucket
     POST /v1/publish/{collection}/{version}:finish                the release: recorded, and made current
+
+An object collection (kind: objects) is not pushed: its releases are built from deposits. Its definition is
+registered here with the same sign-in (docs/depositing-objects.md):
+
+    POST /v1/publish/objects/{collection}:register                its files -> registered, unchanged or refused
 """
 from __future__ import annotations
 
@@ -29,6 +34,7 @@ from pathlib import Path
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import db, device_login
@@ -222,17 +228,20 @@ def _digest(files: dict, prefix: str) -> str:
                                      ensure_ascii=False).encode()).hexdigest()
 
 
-def _named_files(files: dict) -> set[str]:
+def _named_files(files: dict, objects: bool = False) -> set[str]:
     """Every file the manifest names, each of which must be among the files sent: nothing outside the bundle is
-    ever read."""
+    ever read. `objects`: the files of an object collection being registered (a file collection is refused)."""
     try:
         doc = yaml.safe_load(files["collection.yaml"])
     except yaml.YAMLError as exc:
         raise pub.PublishError(f"collection.yaml is not valid YAML: {exc}") from exc
     if not isinstance(doc, dict):
         raise pub.PublishError("collection.yaml is not a manifest")
-    if doc.get("kind") == "objects":
+    if doc.get("kind") == "objects" and not objects:
         raise pub.PublishError(f"{doc.get('collection')} is an object collection: its releases are built from deposits")
+    if objects and doc.get("kind") != "objects":
+        raise Conflict(f"{doc.get('collection')} is a file collection, not an object collection (kind: objects): "
+                       "publish its releases with `claims release publish --api`")
     named = {"collection.yaml"}
     for block in ("templates", "queries"):
         value = doc.get(block) or []
@@ -674,7 +683,69 @@ def pub_edge_groups() -> list[str]:
     return list(dv.edge_groups())
 
 
+# --- object collections: registering a definition ---------------------------------
+
+def register_objects(con, collection: str, body: dict, publisher: dict) -> dict:
+    """Register an object collection's definition from its files, as `scripts/publish_collection.py` does on the
+    database: unchanged when the same definition is registered (nothing written), refused (409) when another is
+    and the request does not say `replace`. Each File's location is `prefix/relpath`, as for a push."""
+    from .collections import objects
+
+    files, prefix = _bundle_files(body)
+    git_commit, replace = body.get("git_commit"), body.get("replace", False)
+    if git_commit is not None and not (isinstance(git_commit, str) and 0 < len(git_commit) <= 64
+                                       and git_commit.isascii() and git_commit.isprintable()):
+        raise pub.PublishError("git_commit is the collection's commit (at most 64 characters), or null")
+    if not isinstance(replace, bool):
+        raise pub.PublishError("replace is true or false")
+    _named_files(files, objects=True)
+    tmp = Path(tempfile.mkdtemp(dir=_BUNDLE_DIR, prefix="objects-"))
+    try:
+        for rel, text in files.items():
+            (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
+            (tmp / rel).write_text(text)
+        col = load_collection(tmp)
+        if col.key != collection:
+            raise pub.PublishError(f"collection.yaml is the collection {col.key!r}, not {collection!r}")
+        record, file_docs = objects.build_definition(col, prefix)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    with _lock(con, "register", collection, f"registering {collection}"):
+        registered = objects.definition(con, collection)
+        if registered is None and con.execute("SELECT 1 FROM collections WHERE collection_key = ?",
+                                              (collection,)).fetchone():
+            raise Conflict(f"{collection} is a file collection: publish its releases with `claims release publish "
+                           "--api`; an object collection needs a key of its own")
+        out = {"collection": collection, "queries": sorted(record["queries"]), "files": len(file_docs),
+               "git_commit": git_commit}
+        if registered == record:
+            return {**out, "status": "unchanged"}
+        if registered is not None and not replace:
+            raise Conflict(f"{collection} is registered with a different definition. Releases already opened keep "
+                           "theirs; to register this one for new releases, run `claims objects register --replace` "
+                           "(or send \"replace\": true)")
+        status = "replaced" if registered is not None else "registered"
+        with con:
+            objects.store_definition(con, col, record, file_docs, git_commit)
+            device_login._audit(con, "object_collection_registered", publisher["email"],
+                                f"{collection} {status} with {publisher['token_id']} at {git_commit or '-'}")
+    return {**out, "status": status}
+
+
 # --- routes ------------------------------------------------------------------------
+
+@router.post("/objects/{collection}:register")
+async def register_objects_route(collection: str, request: Request,
+                                 publisher: dict = Depends(device_login.require_publisher)):
+    """Register an object collection's definition (manifest, query templates, vocabulary files): 201 when
+    registered, 200 when the same definition was already registered (or `replace` replaced another), 409 when
+    another is registered and `replace` is not set, or the key is a file collection's."""
+    if not KEY_RE.match(collection):
+        raise HTTPException(status_code=404, detail=f"{collection!r} is not a collection key.")
+    body = await _body(request)
+    result = await run_in_threadpool(_call, register_objects, collection, body, publisher)
+    return JSONResponse(result, status_code=201 if result["status"] == "registered" else 200)
+
 
 @router.post("/{collection}/{version}:begin")
 async def begin_route(collection: str, version: str, request: Request,

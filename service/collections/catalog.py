@@ -101,7 +101,7 @@ def plan_parts(collection: str, record: dict) -> dict:
     """What a question over this collection can name: its row kinds and their metrics, dimensions and edges."""
     m = record["manifest"]
     if record.get("kind") == "objects":
-        return {"collection": collection, "kind": "objects", "object_kinds": m["object_kinds"]}
+        return {"collection": collection, "kind": "objects", "object_kinds": m.get("object_kinds") or {}}
     return {
         "collection": collection, "kind": "files",
         "dimensions": [d["name"] for d in m["dataset_dimensions"]],
@@ -262,7 +262,7 @@ def _field_params(qdoc: dict) -> dict:
 
 
 def _object_shape(manifest: dict, cls: str) -> dict:
-    spec = manifest["object_kinds"].get(cls) or {}
+    spec = (manifest.get("object_kinds") or {}).get(cls) or {}
     return {"class": cls, "fields": {n: r["slot"] for n, r in spec.get("fields", {}).items()},
             "links": {n: r["slot"] for n, r in (spec.get("links") or {}).items()},
             **({"description": spec["description"]} if spec.get("description") else {})}

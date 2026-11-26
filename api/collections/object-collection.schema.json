@@ -10,9 +10,7 @@
     "kind",
     "title",
     "methods",
-    "dapper_profile",
-    "object_kinds",
-    "queries"
+    "dapper_profile"
   ],
   "properties": {
     "collection": {

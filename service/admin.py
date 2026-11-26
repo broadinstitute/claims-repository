@@ -772,11 +772,20 @@ def _summaries_of(con, ids) -> dict:
 
 def _deposits_of(con, object_id) -> list[dict]:
     rows = con.execute(
-        "SELECT d.deposit_id, d.received_at, d.object_count, d.key_id, k.name, o.status FROM deposit_objects o "
-        "JOIN deposits d ON d.deposit_id = o.deposit_id JOIN api_keys k ON k.key_id = d.key_id "
+        "SELECT d.deposit_id, d.received_at, d.object_count, d.key_id, k.name, d.publisher_token_id, d.publisher_email, "
+        "o.status FROM deposit_objects o JOIN deposits d ON d.deposit_id = o.deposit_id "
+        "LEFT JOIN api_keys k ON k.key_id = d.key_id "
         "WHERE o.object_id = ? ORDER BY d.received_at DESC, d.deposit_id DESC LIMIT 50", (object_id,)).fetchall()
     return [{"depositId": r["deposit_id"], "receivedAt": _ts(r["received_at"]), "objectCount": int(r["object_count"]),
-             "depositor": {"keyId": r["key_id"], "name": r["name"]}, "status": r["status"]} for r in rows]
+             "depositor": _admin_depositor(api_keys.depositor_of(r, admin=True)), "status": r["status"]} for r in rows]
+
+
+def _admin_depositor(d: dict) -> dict:
+    """A deposit's depositor as the console shows it: a key's id and name, or a login's email (as its name) and
+    token id."""
+    if d.get("kind") == "login":
+        return {"kind": "login", "keyId": None, "name": d["email"], "email": d["email"], "tokenId": d["token_id"]}
+    return {"keyId": d["key_id"], "name": d["name"]}
 
 
 def _edges_of(con, object_ids) -> list[dict]:
@@ -878,10 +887,10 @@ def _object_detail(con, object_id) -> dict | None:
 
 
 def _deposit_list(con, page, page_size) -> dict:
-    found = api_keys.deposits(con, limit=page_size, offset=(page - 1) * page_size)
+    found = api_keys.deposits(con, limit=page_size, offset=(page - 1) * page_size, admin=True)
     return {"total": int(found["total"]), "page": page, "pageSize": page_size,
             "rows": [{"depositId": d["deposit_id"], "receivedAt": _ts(d["received_at"]), "objectCount": int(d["object_count"]),
-                      "depositor": {"keyId": d["depositor"]["key_id"], "name": d["depositor"]["name"]}} for d in found["deposits"]]}
+                      "depositor": _admin_depositor(d["depositor"])} for d in found["deposits"]]}
 
 
 def _docs(con, ids) -> dict:

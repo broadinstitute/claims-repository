@@ -547,7 +547,9 @@ from deposits:
 | Release document | ResultCollection of Datasets of result files | ResultCollection of one Dataset per class, each with a File listing its member ids |
 
 **The manifest** (`api/collections/object-collection.schema.json`) names the
-DAPPER classes the collection holds (`object_kinds`), and for each the
+DAPPER classes the collection holds (`object_kinds`, optional since
+2026-11-25: a plain list names none, and its objects are members with no
+indexed fields), and for each the
 `fields` queries filter and order on (a slot each: string, number, or a list
 of them) and the `links` queries follow (a slot holding dapper ids). Classes
 and slots are checked against the vendored DAPPER schema. Vocabulary is the
@@ -561,11 +563,14 @@ link names) or `referenced_by` (objects of a class in the release whose link
 names the anchor), with a per-anchor limit. A condition whose variable is
 unset is dropped, so one template can take alternative parameters.
 
-**Life of a release.**
-1. Register the definition from its directory:
-   `scripts/publish_collection.py <dir>` (no `--release`). It stores the
-   manifest, query and vocabulary Files.
-2. A key granted the collection opens a release:
+**Life of a release.** `claims objects register` and `claims objects deposit`
+do all of this with a `claims login`, no database password and no key
+([Depositing objects](depositing-objects.md)).
+1. Register the definition from its directory: `claims objects register <dir>
+   --api qa` (POST `/v1/publish/objects/{c}:register`), or
+   `scripts/publish_collection.py <dir>` (no `--release`) on the database. It
+   stores the manifest, query and vocabulary Files.
+2. A login, or a key granted the collection, opens a release:
    `POST /v1/collections/{c}/releases {"version": ...}`.
 3. Deposits naming the collection and release add their objects. Membership
    and field values are recorded in the deposit's transaction, after checking
@@ -577,8 +582,9 @@ unset is dropped, so one template can take alternative parameters.
 
 Tables: `object_collections`, `object_releases`, `release_objects`,
 `release_object_fields`, `api_key_grants`, and `deposits.collection_key` /
-`release_version` (SQLite on connect; MySQL `schema/migrations/008_object_collections.sql`,
-not yet applied anywhere and untested on MySQL).
+`release_version` (SQLite on connect; MySQL `schema/migrations/008_object_collections.sql`).
+A login's deposits and releases are recorded under its token id and email
+(`schema/migrations/012_login_deposits.sql`).
 
 **Catalog collections in kpn-dapper-toolkit.**
 - `collections/dismech`: KnowledgeGaps and Mechanisms; `gaps-by-disease`
