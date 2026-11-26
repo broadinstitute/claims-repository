@@ -388,8 +388,14 @@ def provenance_resolver(con, object_id: str) -> str | None:
     document resolves: <resolver>/v1/entities/<id>, or None."""
     from urllib.parse import quote
 
-    for r in con.execute("SELECT manifest FROM collection_releases ORDER BY published_at DESC").fetchall():
-        for src in _json(r["manifest"]).get("provenance") or []:
+    # Read only each manifest's provenance list. Sorting whole JSON manifests is the likely cause of QA
+    # answering 500, not 404, for every unknown id (MySQL sorts the full rows), and it read them all each time.
+    for r in con.execute("SELECT json_extract(manifest, '$.provenance') AS provenance FROM collection_releases "
+                         "ORDER BY published_at DESC").fetchall():
+        sources = _json(r["provenance"]) if r["provenance"] is not None else None
+        for src in sources if isinstance(sources, list) else []:
+            if not isinstance(src, dict):
+                continue
             if not src.get("stored") and src.get("resolver") and object_id in set(src.get("ids") or []):
                 return f"{src['resolver'].rstrip('/')}/v1/entities/{quote(object_id, safe=':')}"
     return None

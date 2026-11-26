@@ -392,3 +392,8 @@ def test_a_second_release_becomes_current_and_names_the_first(closed):
     old = client.post("/v1/collections/catalog-test/queries/gaps-by-disease:run",
                       json={"variables": {"disease": "CAD"}, "release": "2026.11.0"}).json()
     assert [r["id"] for r in old["rows"]] == [GAP_A["id"], GAP_B["id"]]       # an earlier release stays readable
+
+
+def test_an_unknown_id_is_404_beside_an_object_release(closed):
+    for missing in ("dapper:GeneSet.nothere", "nope", "dapper:Claim.nothere"):
+        assert client.get(f"/v1/objects/{missing}").status_code == 404, missing
