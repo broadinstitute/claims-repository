@@ -835,11 +835,13 @@ schema = make_executable_schema(
 
 # Auto-docs are off: the hand-written api/openapi.yaml is the contract
 # authority, served at /v1/openapi.yaml with Swagger UI at /v1/docs.
-def _prewarm_index_cache():
-    """CLAIMS_INDEX_PREWARM=1: fill the index cache from the bucket in the background (store.prewarm). The
-    service answers health checks and queries at once; the fill only spares the first queries the S3 reads."""
+def start_index_prewarm():
+    """CLAIMS_INDEX_PREWARM=1: fill the index cache from the bucket in a background thread (store.prewarm), which
+    this returns. The service answers health checks and queries at once; the fill only spares the first queries
+    the S3 reads. Called from this app's lifespan; an app that mounts this one (dig-service-platform's
+    claims/app/main.py) must call it from its own, since a mounted app's lifespan does not run."""
     if os.environ.get("CLAIMS_INDEX_PREWARM") != "1":
-        return
+        return None
     import threading
 
     from .collections import store as cstore
@@ -856,12 +858,14 @@ def _prewarm_index_cache():
         except Exception as exc:  # a failed prewarm costs only speed: queries read what they need themselves
             print(f"index cache prewarm failed after {time.time() - started:.0f}s: {exc!r}", flush=True)
 
-    threading.Thread(target=run, name="index-prewarm", daemon=True).start()
+    thread = threading.Thread(target=run, name="index-prewarm", daemon=True)
+    thread.start()
+    return thread
 
 
 @asynccontextmanager
 async def _lifespan(_app):
-    _prewarm_index_cache()
+    start_index_prewarm()
     yield
 
 

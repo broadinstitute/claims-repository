@@ -81,6 +81,10 @@ one after another, four S3 reads each with a new S3 client per file, which took 
 dataset whose recorded counts hold no row of the kind asked for (a CFDE library's datasets hold no gene
 rows; many hold no rows at all), so those are never read.
 
+Measured on a laptop: 400 index files in 1.2 s in parallel, against 40 in 2.8 s one after another. Not yet
+measured on QA, whose task has half a CPU. Parallel reads do not speed up a warm query: its DuckDB scan
+over every trait's files stays (FTO across traits took 43 s warm on QA). Run those with `?async=true`.
+
 ## Built: answering in the background (`?async=true`)
 
 `POST /v1/graphql?async=true` and `POST /v1/collections/{c}/queries/{name}:run?async=true` answer 202

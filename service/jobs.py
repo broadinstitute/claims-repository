@@ -16,7 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 WORKERS = 4            # jobs running at once; the rest wait their turn
 MAX_PENDING = 64       # jobs submitted and not yet finished; past this a submit is refused (429)
-MAX_KEPT = 512         # finished jobs kept; the oldest go first
+MAX_KEPT = 256         # finished jobs kept; the oldest go first
+MAX_KEPT_BYTES = 256 * 1024 * 1024   # and their response bodies together, in this task's memory
 RESULT_TTL = 3600.0    # seconds a finished job's result is kept
 
 _lock = threading.Lock()
@@ -38,9 +39,15 @@ def _executor() -> ThreadPoolExecutor:
 def _prune(now: float) -> None:
     done = sorted((j["finished"], i) for i, j in _jobs.items() if j["finished"] is not None)
     excess = len(done) - MAX_KEPT
+    held = sum(_size(_jobs[i]["body"]) for _, i in done)
     for k, (finished, i) in enumerate(done):
-        if k < excess or now - finished > RESULT_TTL:
+        if k < excess or now - finished > RESULT_TTL or held > MAX_KEPT_BYTES:
+            held -= _size(_jobs[i]["body"])
             del _jobs[i]
+
+
+def _size(body) -> int:
+    return len(body) if isinstance(body, (bytes, str)) else 1024
 
 
 def submit(kind: str, describe: dict, work) -> dict:
