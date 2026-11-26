@@ -149,7 +149,8 @@ def test_register_deposit_resume_and_close(api, tmp_path, capsys):
     assert "skipped c2m2_files: 4" in out and "stays open" in out
     state = tmp_path / "cache" / "claims" / "objects" / "cli-genesets-2026.11.0.sent"
     lines = state.read_text().splitlines()
-    assert lines[0] == f"# claims objects deposit {api} cli-genesets 2026.11.0" and sorted(lines[1:]) == rels[:2]
+    assert lines[0] == f"# claims objects deposit {api} cli-genesets 2026.11.0 from={source} skip=c2m2_files"
+    assert sorted(lines[1:]) == rels[:2]
     assert _deposits("cli-genesets") == 2
 
     # Resumed: the same trial again sends nothing new.
@@ -273,6 +274,19 @@ def test_a_state_file_of_another_deposit_is_refused(api, tmp_path):
     _documents(source, 1, c2m2=False)
     state = tmp_path / "trial.sent"
     state.write_text("# claims objects deposit http://127.0.0.1:1 cli-state 1\n" + "x\n")
+    with pytest.raises(SystemExit) as stopped:
+        claims("objects", "deposit", col, "1", "--api", api, "--from", source, "--state-file", state)
+    assert "is the state of another deposit" in str(stopped.value)
+
+
+def test_a_state_file_of_other_skipped_groups_is_refused(api, tmp_path, capsys):
+    """Documents sent without a group are not done for a run that keeps it (or the reverse)."""
+    col = _collection(tmp_path, "cli-skip")
+    source = tmp_path / "release"
+    _documents(source, 1, c2m2=False)
+    state = tmp_path / "skip.sent"
+    claims("objects", "deposit", col, "1", "--api", api, "--from", source, "--state-file", state,
+           "--skip-group", "c2m2_files")
     with pytest.raises(SystemExit) as stopped:
         claims("objects", "deposit", col, "1", "--api", api, "--from", source, "--state-file", state)
     assert "is the state of another deposit" in str(stopped.value)

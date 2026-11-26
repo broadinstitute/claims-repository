@@ -8,7 +8,8 @@
 -- Additive: QA and prod share this database and the previous build keeps running
 -- on it. That build writes key_id and opened_by as before (both stay the same
 -- type, only nullable now) and never reads the new columns; its deposit lists
--- join api_keys, so they leave login deposits out until the new build is deployed.
+-- join api_keys, so they leave login deposits out until the new build is deployed (a page comes back short of
+-- its `total`, and GET /v1/deposits/{id} is 404 for a login deposit). No data is affected.
 -- Apply this BEFORE deploying the build that accepts login deposits.
 --
 -- One effect per statement: on a re-run, 1060 (column exists) means "already

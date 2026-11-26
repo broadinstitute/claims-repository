@@ -6,6 +6,8 @@ publicly they are attributed to "claims login", and the admin console shows the 
 """
 from __future__ import annotations
 
+import json
+
 import tempfile
 import time
 import uuid
@@ -297,6 +299,10 @@ def test_a_plain_list_collection_holds_members_without_kinds_or_queries(isolated
     assert closed.status_code == 200, closed.text
     assert closed.json()["classes"] == {"GeneSet": 3, "GeneSetCollection": 1}
     assert not _rows("SELECT 1 FROM release_object_fields WHERE collection_key = 'plain-list'")
+    # an older build sharing the database reads manifest["object_kinds"] / ["queries"] of every current release
+    stored = json.loads(_rows("SELECT manifest FROM collection_releases WHERE release_id = ?",
+                              (closed.json()["release_id"],))[0]["manifest"])
+    assert stored["manifest"]["object_kinds"] == {} and stored["manifest"]["queries"] == []
 
     members = writer.get("/v1/collections/plain-list/releases/1/members", params={"class": "GeneSet"})
     assert members.status_code == 200 and members.text.split() == sorted(s["id"] for s in SETS)
@@ -430,3 +436,24 @@ def test_the_contract_lists_the_register_route_and_both_credentials():
     for path, method in (("/v1/deposits", "post"), ("/v1/collections/{collection}/releases", "post"),
                          ("/v1/collections/{collection}/releases/{version}:close", "post")):
         assert contract["paths"][path][method]["security"] == [{"ApiKeyHeader": []}, {"PublisherToken": []}], path
+
+
+def test_open_and_close_recheck_a_login_inside_their_transaction(registered):
+    """A login revoked after the request was authenticated opens and closes nothing (as a deposit re-checks it)."""
+    from service.collections import objects as cobjects
+
+    late = login("late@example.org")
+    actor = {"kind": "login", "token_id": late["token_id"], "email": "late@example.org", "name": "late@example.org"}
+    con = _con()
+    try:
+        with con:
+            device_login.revoke(con, late["token_id"], "admin@example.org")
+        with pytest.raises(cobjects.NotGranted):
+            with con:
+                cobjects.open_release(con, actor, "catalog-test", "2026.12.8")
+        with pytest.raises(cobjects.NotGranted):
+            with con:
+                cobjects.close_release(con, actor, "catalog-test", "2026.12.0")
+    finally:
+        con.close()
+    assert not _rows("SELECT 1 FROM object_releases WHERE version = '2026.12.8'")

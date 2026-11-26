@@ -86,7 +86,10 @@ def build_definition(col: Collection, prefix: str | None = None) -> tuple[dict, 
         vocab_files.append(keep(_source_file_doc(SourceFile(path=path, rel=rel, data=path.read_bytes(), doc={}),
                                                  f"{col.key} {what} for {dim}.", "text/tab-separated-values",
                                                  location=at(rel))))
-    record = {"kind": "objects", "manifest": col.doc, "templates": [], "queries": queries,
+    # object_kinds and queries are optional now, but a build from before that (QA and prod share the database and
+    # deploy apart) reads manifest["object_kinds"] / ["queries"] of every current release: store them, empty.
+    manifest = {**col.doc, "object_kinds": col.doc.get("object_kinds") or {}, "queries": col.doc.get("queries") or []}
+    record = {"kind": "objects", "manifest": manifest, "templates": [], "queries": queries,
               "manifest_file_id": manifest_file, "vocabulary_file_ids": vocab_files,
               "mappings": {dim: {k: list(v) for k, v in m.items()} for dim, m in vocab.mappings.items()},
               "vocabulary": vocab.entries}
@@ -140,6 +143,9 @@ def _state(row) -> dict:
 def _granted(con, depositor: dict, key: str) -> None:
     from .. import api_keys
 
+    if api_keys.is_login(depositor) and not api_keys.still_valid(con, depositor):
+        # re-checked inside the open/close transaction, as a deposit re-checks it (api_keys.still_valid)
+        raise NotGranted("this claims login was revoked or has expired: run `claims login` again")
     if not api_keys.has_grant(con, depositor, key):
         raise NotGranted(f"this key may not write into the collection {key!r}: grant it in the admin console")
 

@@ -117,6 +117,8 @@ Login deposits need `schema/migrations/012_login_deposits.sql` (deposits' `key_i
 build keeps working on the migrated database. Apply it before deploying the build that accepts login deposits.
 A local SQLite file is upgraded when the service connects.
 
-A plain list (no `object_kinds`) needs this build on every service reading the shared database: an older build
-expects `object_kinds` in a closed release's manifest, and its collection catalog (`/v1/queries`) and collection
-page would fail once such a release is current. Close a plain list's first release only after the deploy.
+A plain list (no `object_kinds`) is stored with empty `object_kinds` and `queries`, because an older build sharing
+the database reads both from every current release's manifest (its `/v1/queries` catalog would otherwise fail).
+
+Until every service runs this build, an older one lists only key deposits: its `GET /v1/deposits` leaves login
+deposits out of a page while its `total` still counts them, and `GET /v1/deposits/{id}` is 404 for one.

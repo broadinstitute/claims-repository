@@ -233,7 +233,7 @@ def parts(document: dict, skip: set[str]):
     for group, items in groups:
         is_edge = group.endswith("_edges")
         for item in items:
-            item_size = len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode()) + 2
+            item_size = len(json.dumps(item, separators=(",", ":")).encode()) + 2  # sized as sent (ensure_ascii, as _call)
             if part and (size + item_size > MAX_BYTES or (objects >= MAX_OBJECTS and not is_edge)
                          or (edges >= MAX_EDGES and is_edge)):
                 yield done()
@@ -355,8 +355,10 @@ class State:
     """The documents of one release already deposited, one relative path per line, after a header naming the
     service, collection and release, so a state file is never reused for another."""
 
-    def __init__(self, path: Path, api: str, key: str, version: str):
-        self.path, self.header = path, f"{STATE_HEADER} {api} {key} {version}"
+    def __init__(self, path: Path, api: str, key: str, version: str, source: str = "", skip: tuple = ()):
+        # the source and the groups left out are part of what was sent: a run with others must not count as done
+        self.path = path
+        self.header = f"{STATE_HEADER} {api} {key} {version} from={source} skip={','.join(sorted(skip)) or '-'}"
         self.done: set[str] = set()
         self.lock = threading.Lock()
         if path.exists():
@@ -445,7 +447,7 @@ def cmd_deposit(args) -> None:
     if args.limit is not None:
         paths = paths[:args.limit]
     state = State(Path(args.state_file) if args.state_file else workdir / f"{key}-{version}.sent", api.base, key,
-                  version)
+                  version, args.source, tuple(args.skip_group or ()))
     todo = [p for p in paths if p not in state.done]
     print(f"selected     {len(paths):,} document(s) under {root}; {len(paths) - len(todo):,} already deposited "
           f"(state {state.path})", flush=True)
