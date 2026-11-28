@@ -30,9 +30,15 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import re
+
 import yaml
 
 from . import auth
+
+# The DAPPER release this checkout validates and mints against (vendor/dapper); every deposit names it.
+DAPPER_VERSION = re.search(r"(?m)^version:\s*(\S+)", (Path(__file__).resolve().parent.parent / "vendor" / "dapper"
+                                                        / "schema" / "dapper.yaml").read_text()).group(1)
 
 # The service takes 1,000 objects, 5,000 edges and 16 MB per deposit; parts stay well inside (as the tested
 # reference client did), since sizes are estimated here from compact JSON.
@@ -425,7 +431,8 @@ def _send_document(api: Api, key: str, version: str, root: Path, rel: str, skip:
     for part, objects, edges in split:
         if stop.is_set():
             raise Refused(0, "stopped")
-        _status, receipt = api.ok("POST", "/v1/deposits", {"collection": key, "release": version, "document": part})
+        _status, receipt = api.ok("POST", "/v1/deposits", {"collection": key, "release": version, "document": part,
+                                                           "dapper_version": DAPPER_VERSION})
         out["parts"] += 1
         out["objects"] += objects
         out["edges"] += edges

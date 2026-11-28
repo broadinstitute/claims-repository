@@ -276,7 +276,7 @@ PLAIN_MANIFEST = """collection: plain-list
 kind: objects
 title: A plain list of gene sets
 methods: [tests]
-dapper_profile: 0.2.1-a1
+dapper_profile: 0.3.0-a1
 """
 GSC = _mint("GeneSetCollection", name="Plain sets", collection_key="plain", version="1")
 SETS = [_mint("GeneSet", name=f"PLAIN_{i}", members=["NOD2"], member_type="gene", n_members=1,

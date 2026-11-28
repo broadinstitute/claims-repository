@@ -897,6 +897,16 @@ def _docs(con, ids) -> dict:
     return _core()._fetch_payloads(con, list(dict.fromkeys(i for i in ids if isinstance(i, str))))
 
 
+def _question_of(account: dict) -> str | None:
+    """The account's question: in DAPPER 0.3 the first Question or KnowledgeGap of its ordered `framing`; an
+    account stored under 0.2 names it in `question`."""
+    if isinstance(account.get("question"), str):
+        return account["question"]
+    framing = account.get("framing")
+    return next((f for f in (framing if isinstance(framing, list) else [])
+                 if isinstance(f, str) and f.startswith(("dapper:Question.", "dapper:KnowledgeGap."))), None)
+
+
 def _accounts(con, page, page_size) -> dict:
     core = _core()
     total = con.execute("SELECT COUNT(*) AS n FROM dapper_objects WHERE class_name = ?", (ACCOUNT_CLASS,)).fetchone()["n"]
@@ -904,14 +914,14 @@ def _accounts(con, page, page_size) -> dict:
         "SELECT id, payload, times_seen, created_at FROM dapper_objects WHERE class_name = ? "
         "ORDER BY created_at DESC, id LIMIT ? OFFSET ?", (ACCOUNT_CLASS, page_size, (page - 1) * page_size)).fetchall()
     docs = {r["id"]: _loads(r["payload"]) for r in rows}
-    linked = _docs(con, [d.get("question") for d in docs.values()]
+    linked = _docs(con, [_question_of(d) for d in docs.values()]
                    + [a for d in docs.values() for a in core._id_list(d.get("was_attributed_to"))])
     out = []
     for r in rows:
         doc = docs[r["id"]]
         deposits = _deposits_of(con, r["id"])
         out.append({
-            "id": r["id"], "question": _object_label(linked.get(doc.get("question"))),
+            "id": r["id"], "question": _object_label(linked.get(_question_of(doc))),
             "claims": len(core._id_list(doc.get("component_claims"))),
             "attributedTo": [_object_label(linked.get(a)) or a for a in core._id_list(doc.get("was_attributed_to"))],
             "storedAt": _ts(r["created_at"]), "timesSeen": int(r["times_seen"]),
@@ -942,7 +952,9 @@ def _account(con, account_id) -> dict | None:
     for e in edges:
         if e["predicate"] == "prov:wasDerivedFrom" and e["subject"] in file_ids:
             derived.setdefault(e["subject"], []).append(e["object"])
-    head_ids = [account.get("question"), account.get("was_generated_by")] + core._id_list(account.get("was_attributed_to"))
+    framing = [f for f in core._id_list(account.get("framing")) if isinstance(f, str)]
+    head_ids = ([_question_of(account), account.get("was_generated_by")] + framing
+                + core._id_list(account.get("was_attributed_to")))
     others = _docs(con, head_ids + [c.get("proposition") for c in claims.values()]
                    + [e.get("reference") for e in evidence.values()] + file_ids + [f for fs in derived.values() for f in fs])
     wanted = [i for i in head_ids + claim_ids + evidence_ids + locator_ids + file_ids if isinstance(i, str)]
@@ -974,7 +986,8 @@ def _account(con, account_id) -> dict | None:
         classes[name] = classes.get(name, 0) + 1
     return {
         "id": account_id, "document": account, "storedAt": _ts(row["created_at"]), "timesSeen": int(row["times_seen"]),
-        "question": node(account.get("question")), "activity": node(account.get("was_generated_by")),
+        "question": node(_question_of(account)), "framing": [node(f) for f in framing],
+        "activity": node(account.get("was_generated_by")),
         "attributedTo": [node(a) for a in core._id_list(account.get("was_attributed_to"))],
         "claims": [claim_view(c) for c in claim_ids],
         "deposits": _deposits_of(con, account_id), "edges": edges,

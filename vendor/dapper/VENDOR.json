@@ -1,12 +1,12 @@
 {
   "repository": "broadinstitute/dapper",
   "ref": "chase/0.3.0-a1",
-  "commit": "d515697b39a7c0e5d5c918070e2ca6b8f50cb0c3",
+  "commit": "7aedace4ebdf972dfaf2afe96e6c44532a8e630a",
   "files": {
     "schema/biology.yaml": "321874bebe53035974c2f77efc7d52bebfb8c347883aa168567ae3c32baeec9b",
     "schema/cell_programs.yaml": "ffb01485dd682507ef09102651b7ecafdd77b4820d261bdabc1641488f4063b3",
     "schema/cfde.yaml": "8ad3323600dffe8d96a5d0068a213d562586868d42d22aaa38dcb54f3d756fb8",
-    "schema/claims.yaml": "f4bff58639691692b2491bee403964203e0c035bb8bab2ae964dfd49eb9c91a6",
+    "schema/claims.yaml": "c4df7dbad150adc5d91d3155a06c8a4463f527e6fa931ea46841308c2fe7f6af",
     "schema/core.yaml": "a61ada209dba8637a37e1ec6d732e689459fcc46afead4464e0e12337cfc5a7f",
     "schema/dapper.yaml": "cbe66896ba5c4cd630972b996d16009a3632d7efac818c6d98ec80c0b11fea39",
     "schema/dismech.yaml": "9a1ef6bb94eeee680baaf11f3a135053beca25b59df36cc9947c8b5232289cb0",
@@ -18,6 +18,8 @@
     "schema/scm.yaml": "23b974fc3709f711ba26743c40696f93727413dd9d9dd58072a512202012ac39",
     "identity/dapper_identity.py": "19d3e27b590ab092810c648720e2f7ece719228dc57df580da4ba2db2fb32feb",
     "identity/test_vectors.json": "26577224eb6282c3f5b831ad68129d9c551ae808b1dddae7ea43995a88a31a31",
+    "converter/migrate.py": "34bc982eed3f9eb797b0b730d4aaf89648eea873e01d1eeb47378e4bf946709f",
+    "tools/scientific_claims.py": "7a09d47d62deacfb827cbd32d33fa804aa21f103b1a08abdb0c72cb9861a919a",
     "LICENSE": "a9dd59be2eaeb06d97411c7f08197c423136e8059f635ad7979264771deb529f"
   }
 }

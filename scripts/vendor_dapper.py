@@ -29,17 +29,27 @@ DEST = ROOT / "vendor" / "dapper"
 ARCHIVE = ROOT / "vendor" / "dapper-archive"
 
 
-def archive_current() -> str | None:
-    """Copy the vendored version being replaced to vendor/dapper-archive/<version>/."""
+def version_of(text: str) -> str:
+    return re.search(r"(?m)^version:\s*(\S+)", text).group(1)
+
+
+def archive_current(incoming: str) -> str | None:
+    """Copy the vendored version being replaced to vendor/dapper-archive/<version>/. Re-vendoring the
+    same version (a later commit of it) replaces it without archiving."""
     schema = DEST / "schema" / "dapper.yaml"
     if not schema.exists():
         return None
-    version = re.search(r"(?m)^version:\s*(\S+)", schema.read_text()).group(1)
+    version = version_of(schema.read_text())
+    if version == incoming:
+        return None
     target = ARCHIVE / version
     if not target.exists():
         shutil.copytree(DEST, target, ignore=shutil.ignore_patterns("__pycache__"))
     return version
-FILES = ["identity/dapper_identity.py", "identity/test_vectors.json", "LICENSE"]
+# The identity module, DAPPER's release-to-release converter (which the service runs to migrate stored
+# documents; it imports tools/scientific_claims.py), and the license.
+FILES = ["identity/dapper_identity.py", "identity/test_vectors.json", "converter/migrate.py",
+         "tools/scientific_claims.py", "LICENSE"]
 
 
 def git(dapper: Path, *args: str) -> bytes:
@@ -56,7 +66,7 @@ def main() -> None:
                if p.endswith(".yaml")]
     if "schema/dapper.yaml" not in modules:
         raise SystemExit(f"{args.ref} has no schema/dapper.yaml")
-    archived = archive_current()
+    archived = archive_current(version_of(git(args.dapper, "show", f"{commit}:schema/dapper.yaml").decode()))
     if archived:
         print(f"kept {archived} in {(ARCHIVE / archived).relative_to(ROOT)}")
     if DEST.exists():

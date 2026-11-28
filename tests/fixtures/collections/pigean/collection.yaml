@@ -12,7 +12,7 @@ description: >-
   evidence-tier claims and gene-set roster claims from each row.
 owners: [dig-aggregator-pipeline]
 methods: [PIGEAN]
-dapper_profile: 0.2.1-a1
+dapper_profile: 0.3.0-a1
 
 # Claims name this agent in was_attributed_to. Placeholder until agent
 # identities are agreed.

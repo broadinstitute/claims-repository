@@ -9,7 +9,7 @@ description: >-
   collections they belong to, as an upstream catalog would deposit them.
 owners: [tests]
 methods: [DisMech, CFDE]
-dapper_profile: 0.2.1-a1
+dapper_profile: 0.3.0-a1
 
 object_kinds:
   KnowledgeGap:

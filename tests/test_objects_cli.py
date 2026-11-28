@@ -26,7 +26,7 @@ MANIFEST = """collection: cli-genesets
 kind: objects
 title: Gene sets deposited from the CLI
 methods: [tests]
-dapper_profile: 0.2.1-a1
+dapper_profile: 0.3.0-a1
 object_kinds:
   GeneSet:
     fields:

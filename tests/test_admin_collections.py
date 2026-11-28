@@ -429,7 +429,7 @@ def test_collection_detail(published):
     d = _get("collections/pigean").json()
     assert d["release"]["id"] == published.release_id and d["release"]["isCurrent"]
     assert [r["id"] for r in d["releaseHistory"]] == [published.release_id]
-    assert d["dapperProfile"] == "0.2.1-a1"
+    assert d["dapperProfile"] == "0.3.0-a1"
     assert [x["name"] for x in d["dimensions"]] == ["trait", "library"]
     assert d["dimensions"][0].get("resolve") is None  # traits resolve through the collection's own mapping
     assert {m["name"] for m in d["metrics"]} == {"combined", "log_bf", "prior", "beta", "beta_uncorrected"}

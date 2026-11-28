@@ -47,7 +47,7 @@ from .refs import DAPPER_ID_RE, MAX_ID_LENGTH, dapper_refs
 
 ROOT = Path(__file__).resolve().parent.parent
 CONTRACT_VERSION = "0.2.0"
-DAPPER_PROFILE = "0.2.0-a1"
+DAPPER_PROFILE = cidn.DAPPER_VERSION  # the vendored DAPPER release (vendor/dapper)
 DEFAULT_COLLECTION = "cfde-inc-v2"  # deposit hints' default gene-set collection
 
 # Identity vs location (design decision 2026-11-09, per Chase): the
@@ -1739,7 +1739,8 @@ def _unresolved_references(con, bundle_objects, edges) -> list[str]:
 @app.post("/v1/deposits")
 async def deposit(request: Request, depositor: dict = Depends(api_keys.require_writer)):
     """The only external write path: deposit DAPPER objects of any class, validated. The depositor's X-API-Key, or a
-    `claims login` token (Authorization: Bearer), is checked before the body is read. The body is either a DAPPER document (`document`: nodes and edges under dapper's group names,
+    `claims login` token (Authorization: Bearer), is checked before the body is read. The body names the DAPPER
+    version it was written for (`dapper_version`, required), which must be the vendored one. The body is either a DAPPER document (`document`: nodes and edges under dapper's group names,
     which is what dapper's tooling mints, e.g. a whole ScientificAccount) or a flat list (`objects`). Every node must
     be valid for its class in the vendored DAPPER schema and sit at the DAPPER-ID-1 address of its content
     (service/dapper_validation.py). The bundle is stored whole or not at all and recorded as one deposit by the key or
@@ -1747,6 +1748,12 @@ async def deposit(request: Request, depositor: dict = Depends(api_keys.require_w
     body = await _deposit_body(request)
     if ("document" in body) == ("objects" in body):
         raise HTTPException(status_code=400, detail="send exactly one of document (a DAPPER document) or objects (a list of DAPPER nodes)")
+    if body.get("dapper_version") != cidn.DAPPER_VERSION:
+        named = body.get("dapper_version")
+        raise HTTPException(status_code=400, detail=(
+            "name the DAPPER version the document was written for in dapper_version; this service accepts "
+            f"{cidn.DAPPER_VERSION}" + (f", not {named!r}" if named is not None else "")
+            + " (DAPPER's converter/migrate.py converts documents between versions)"))
     collection, release = body.get("collection"), body.get("release")
     if collection is not None and (not isinstance(collection, str) or not api_keys.COLLECTION_KEY_RE.match(collection)):
         raise HTTPException(status_code=400, detail="collection must be a collection key such as dismech")
