@@ -1,12 +1,12 @@
 {
   "repository": "broadinstitute/dapper",
   "ref": "chase/0.3.0-a1",
-  "commit": "7aedace4ebdf972dfaf2afe96e6c44532a8e630a",
+  "commit": "9cd9691864c5ea29ad8b479659db0d44369c972e",
   "files": {
     "schema/biology.yaml": "321874bebe53035974c2f77efc7d52bebfb8c347883aa168567ae3c32baeec9b",
     "schema/cell_programs.yaml": "ffb01485dd682507ef09102651b7ecafdd77b4820d261bdabc1641488f4063b3",
     "schema/cfde.yaml": "8ad3323600dffe8d96a5d0068a213d562586868d42d22aaa38dcb54f3d756fb8",
-    "schema/claims.yaml": "c4df7dbad150adc5d91d3155a06c8a4463f527e6fa931ea46841308c2fe7f6af",
+    "schema/claims.yaml": "c69f7ab71a11d97fbc9221a515e1ecccac46e608a3aaf8442260d2c9a5774f82",
     "schema/core.yaml": "a61ada209dba8637a37e1ec6d732e689459fcc46afead4464e0e12337cfc5a7f",
     "schema/dapper.yaml": "cbe66896ba5c4cd630972b996d16009a3632d7efac818c6d98ec80c0b11fea39",
     "schema/dismech.yaml": "9a1ef6bb94eeee680baaf11f3a135053beca25b59df36cc9947c8b5232289cb0",
@@ -15,11 +15,11 @@
     "schema/mechanisms.yaml": "ed749355597f957b57aed0cd9a9285f062f207feba78fc09a119945057685941",
     "schema/nanopub.yaml": "37e92e11eeeb7f2bc75b47700bf2d6e6a7b527128af8a023b72925279af5ddc9",
     "schema/replay.yaml": "c0beffade3dd29e51d7cad57cc6e7d0e411f3755f75e0e90b6cba733dcac2ac9",
-    "schema/scm.yaml": "23b974fc3709f711ba26743c40696f93727413dd9d9dd58072a512202012ac39",
+    "schema/scm.yaml": "b35667ccdf03be2b8f90749ce994205a2d2428fa6f01b1fed14c446476c09217",
     "identity/dapper_identity.py": "19d3e27b590ab092810c648720e2f7ece719228dc57df580da4ba2db2fb32feb",
     "identity/test_vectors.json": "26577224eb6282c3f5b831ad68129d9c551ae808b1dddae7ea43995a88a31a31",
     "converter/migrate.py": "34bc982eed3f9eb797b0b730d4aaf89648eea873e01d1eeb47378e4bf946709f",
-    "tools/scientific_claims.py": "7a09d47d62deacfb827cbd32d33fa804aa21f103b1a08abdb0c72cb9861a919a",
+    "tools/scientific_claims.py": "3e21b849e72b5a0c1954bc5163af37faadbda151f130c243ec282e641252215a",
     "LICENSE": "a9dd59be2eaeb06d97411c7f08197c423136e8059f635ad7979264771deb529f"
   }
 }
