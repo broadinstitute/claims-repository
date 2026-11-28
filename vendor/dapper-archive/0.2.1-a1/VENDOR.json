@@ -1,0 +1,12 @@
+{
+  "repository": "broadinstitute/dapper",
+  "ref": "chase/no-triple-limit",
+  "commit": "1611a98d2094f297bf9d6b7f07c8a96e3db7d9ab",
+  "files": {
+    "schema/dapper.yaml": "892ef71bd5a4bd249a0bf4c4b08a16858dc189e210c0ffbf113fb610eb1c9a68",
+    "schema/claims.yaml": "af7f098d97bc0c9bcf1676a6e4f5176f85de0c1aa304c3342945c73b39d0e014",
+    "schema/identity/dapper_identity.py": "9359143ea718964d669c014030b35be41548c0ed1fa5cf3034313f46894f03e6",
+    "schema/identity/test_vectors.json": "a550144e6d9856805ec36383a5747b7b4cc806db0c749f5e3d982591f2382f21",
+    "LICENSE": "a9dd59be2eaeb06d97411c7f08197c423136e8059f635ad7979264771deb529f"
+  }
+}

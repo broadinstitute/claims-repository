@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 VENDOR = ROOT / "vendor" / "dapper"
-sys.path.insert(0, str(VENDOR / "schema" / "identity"))
+sys.path.insert(0, str(VENDOR / "identity"))
 import dapper_identity as _dapper  # noqa: E402
 
 PROFILE = _dapper.PROFILE  # "DAPPER-ID-1"

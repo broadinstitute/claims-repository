@@ -75,7 +75,7 @@ def _fetch(object_id):
 # --- identity ---------------------------------------------------------------
 
 def test_vendored_identity_reproduces_dappers_frozen_vectors():
-    vectors = json.loads((idn.VENDOR / "schema/identity/test_vectors.json").read_text())["vectors"]
+    vectors = json.loads((idn.VENDOR / "identity/test_vectors.json").read_text())["vectors"]
     assert vectors
     for v in vectors:
         assert idn.mint(v["class"], v["instance"])["id"] == v["expected_id"], v["name"]

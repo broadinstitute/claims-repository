@@ -23,7 +23,7 @@ from service.collections import identity as cidn
 ROOT = Path(__file__).resolve().parent.parent
 client = TestClient(app)        # conftest gives this one the session's deposit key
 anonymous = TestClient(app)
-VECTORS = json.loads((ROOT / "vendor/dapper/schema/identity/test_vectors.json").read_text())["vectors"]
+VECTORS = json.loads((ROOT / "vendor/dapper/identity/test_vectors.json").read_text())["vectors"]
 ACCOUNT = json.loads((ROOT / "tests/fixtures/deposits/reveal-scientific-account.dapper.json").read_text())
 SECRET = "s" * 40
 
