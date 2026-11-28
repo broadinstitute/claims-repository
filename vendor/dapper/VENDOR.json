@@ -1,7 +1,7 @@
 {
   "repository": "broadinstitute/dapper",
   "ref": "chase/0.3.0-a1",
-  "commit": "9cd9691864c5ea29ad8b479659db0d44369c972e",
+  "commit": "a9b1acb7f9808f96677faba1648d6deef32027c0",
   "files": {
     "schema/biology.yaml": "321874bebe53035974c2f77efc7d52bebfb8c347883aa168567ae3c32baeec9b",
     "schema/cell_programs.yaml": "ffb01485dd682507ef09102651b7ecafdd77b4820d261bdabc1641488f4063b3",
@@ -18,7 +18,7 @@
     "schema/scm.yaml": "b35667ccdf03be2b8f90749ce994205a2d2428fa6f01b1fed14c446476c09217",
     "identity/dapper_identity.py": "19d3e27b590ab092810c648720e2f7ece719228dc57df580da4ba2db2fb32feb",
     "identity/test_vectors.json": "26577224eb6282c3f5b831ad68129d9c551ae808b1dddae7ea43995a88a31a31",
-    "converter/migrate.py": "34bc982eed3f9eb797b0b730d4aaf89648eea873e01d1eeb47378e4bf946709f",
+    "converter/migrate.py": "58d704d778a852ef3b8f0393fe13ebdc3f2023f856f6ac424fd2557aa8fa6888",
     "tools/scientific_claims.py": "3e21b849e72b5a0c1954bc5163af37faadbda151f130c243ec282e641252215a",
     "LICENSE": "a9dd59be2eaeb06d97411c7f08197c423136e8059f635ad7979264771deb529f"
   }
