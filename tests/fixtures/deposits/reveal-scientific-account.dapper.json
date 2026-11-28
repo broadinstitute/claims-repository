@@ -653,9 +653,8 @@
   ],
   "scientific_accounts": [
     {
-      "id": "dapper:ScientificAccount.vp5Cf6LUg2TEzZLLzwLnQWiT9HtnMshd",
+      "id": "dapper:ScientificAccount.2NHiPvUfp0IFaE-8HIfyML9C7lwbuoCI",
       "name": "Genes and gene programs in a shared CAD-in-T2D mechanism",
-      "question": "dapper:KnowledgeGap.zNV20nhHamt-a4CeAktQQPoAivOJe6xk",
       "context": "A CAD-in-T2D evidence slice used to investigate the selected broader CAD gap. This authored design packet combines captured CFDE observations with explicitly illustrative KG membership assertions. No live agent ran.",
       "component_claims": [
         "dapper:Claim.TsqJgibQNjkHLCocO-AIKxiPUgi3o5km",
@@ -682,6 +681,9 @@
       "was_generated_by": "dapper:Activity.2QI1hHVOadL8MgOzm6YlDnmbXL2LerAz",
       "was_attributed_to": [
         "dapper:Person.WOE2xLQBfUB3k6J6OJh0OigMZNbJs6he"
+      ],
+      "framing": [
+        "dapper:KnowledgeGap.zNV20nhHamt-a4CeAktQQPoAivOJe6xk"
       ]
     }
   ],

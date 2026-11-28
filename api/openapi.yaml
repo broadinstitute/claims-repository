@@ -558,6 +558,12 @@ paths:
                 release:
                   type: string
                   description: The open release (version) of `collection`; optional while exactly one is open.
+                dapper_version:
+                  type: string
+                  description: >-
+                    Required. The DAPPER version the document was written for; only the vendored version is
+                    accepted (400 otherwise, naming it). Convert older documents with DAPPER's converter/migrate.py.
+                  example: 0.3.0-a1
                   example: "2026.11.0"
       responses:
         '200':
@@ -594,7 +600,7 @@ paths:
                     type: object
                     properties:
                       identity_profile: { type: string, examples: ['DAPPER-ID-1'] }
-                      dapper_version: { type: string, examples: ['0.2.1-a1'] }
+                      dapper_version: { type: string, examples: ['0.3.0-a1'] }
         '400':
           $ref: '#/components/responses/ValidationProblem'
         '401':
@@ -926,7 +932,14 @@ paths:
               required: [version]
               properties:
                 version: { type: string }
-            example: { version: "2026.11.0" }
+                carry_from:
+                  type: string
+                  description: >-
+                    A closed release of this collection whose members (and their indexed fields) the new release
+                    starts with, so a revision deposits only what is new or changed. 400 if it is missing, open or
+                    the same version; 409 if the release is already open with another carry_from. The release's
+                    status reports `carried_from: {version, objects}`.
+            example: { version: "2026.11.1", carry_from: "2026.11.0" }
       responses:
         '201':
           description: '{collection, version, state: open, release_id: null, opened_at, closed_at: null}'

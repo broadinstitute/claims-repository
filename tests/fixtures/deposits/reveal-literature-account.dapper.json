@@ -417,9 +417,8 @@
     ],
     "scientific_accounts": [
       {
-        "id": "dapper:ScientificAccount.1FmKLxZMYHdplxGK0qxpLjO93kaIr6-B",
+        "id": "dapper:ScientificAccount.MSlPOBbSu099O9tLz2AEEvgs-lzxZmeu",
         "context": "Assesses whether three top PIGEAN IBD candidates (LITAF, TNFSF15, ELF1) have published evidence of a role in IBD. Sources came from 8 Europe PMC searches. Five cited papers were read: 3 abstracts and 2 partial open-access full texts; a sixth abstract (Whiley 2025) was read but not used. Repository claims motivated the gene choice and were not cited.",
-        "question": "dapper:KnowledgeGap.2kkY6C6ST0pPiQn1CIn1gljixm-IURpD",
         "closing_remarks": "TNFSF15 is a well-established IBD gene, with replicated human genetics in several ancestries and genotype-linked TL1A expression in patient ileum. ELF1 is supported only as a Crohn disease GWAS locus shared with SLE. LITAF evidence is the weakest here: one correlative transcriptomic study plus a secondary citation. No primary GWAS or functional LITAF paper was read. Not read: the original IBD GWAS and meta-analyses that reported these loci (e.g., Franke 2010, Jostins 2012, Liu 2015), TL1A transgenic, knockout or antibody mouse colitis studies, the primary LITAF functional work cited as ref 35 in Lu et al., and full texts of the abstract-only papers. Search ranking favoured recent reviews, and the search budget was exhausted before a targeted ELF1 or LITAF genetics search.",
         "component_claims": [
           "dapper:Claim.sZA3VptxvrR08U3M_oKsuXrOPWv60Ghu",
@@ -429,6 +428,9 @@
         "was_generated_by": "dapper:Activity.XDbJUk04gTGSFbnq0iiBhmY0lEI5hA1s",
         "was_attributed_to": [
           "dapper:Organization.vOYxfXQxbQEqpPD5YP1wUCM3OJHZsn1m"
+        ],
+        "framing": [
+          "dapper:KnowledgeGap.2kkY6C6ST0pPiQn1CIn1gljixm-IURpD"
         ]
       }
     ],

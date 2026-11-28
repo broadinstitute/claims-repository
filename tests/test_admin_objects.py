@@ -156,7 +156,8 @@ def test_account_view_assembles_every_object_as_stored(deposited):
     account = DOCUMENT["scientific_accounts"][0]
     by_id = {n["id"]: n for _, n in _nodes()}
     d = _get(f"accounts/{account['id']}").json()
-    assert d["document"] == account and d["question"]["document"] == by_id[account["question"]]
+    assert d["document"] == account and d["question"]["document"] == by_id[account["framing"][0]]
+    assert [f["id"] for f in d["framing"]] == account["framing"]
     assert d["activity"]["document"] == by_id[account["was_generated_by"]] and d["missing"] == []
     assert [c["id"] for c in d["claims"]] == account["component_claims"]
     for shown in d["claims"]:

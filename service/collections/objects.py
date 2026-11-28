@@ -36,6 +36,7 @@ from .traits import MappingError, collection_vocabulary, vocabulary_files
 
 FILTER_OPS = {"eq": "=", "ne": "!=", "lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
 MAX_VALUE = 255     # release_object_fields.value is VARCHAR(255)
+CARRY_BATCH = 500   # stored documents read per query when re-indexing carried members
 MAX_JOIN = 200      # objects one step returns per anchor, at most
 
 
@@ -135,9 +136,11 @@ def _release(con, key: str, version: str, lock: bool = False):
 
 
 def _state(row) -> dict:
+    carried = _json(row["definition"]).get("carried_from") if row["definition"] else None
     return {"collection": row["collection_key"], "version": row["version"], "state": row["state"],
             "release_id": row["release_id"], "opened_at": str(row["opened_at"]),
-            "closed_at": str(row["closed_at"]) if row["closed_at"] else None}
+            "closed_at": str(row["closed_at"]) if row["closed_at"] else None,
+            "carried_from": carried}
 
 
 def _granted(con, depositor: dict, key: str) -> None:
@@ -156,13 +159,21 @@ def _audit(con, event: str, email: str, detail: str) -> None:
     audit(con, event, email, detail)
 
 
-def open_release(con, depositor: dict, key: str, version: str) -> tuple[dict, bool]:
+def open_release(con, depositor: dict, key: str, version: str, carry_from: str | None = None) -> tuple[dict, bool]:
     """(release state, whether this call opened it). Opening an open release again is a no-op. Who opened it is
-    recorded: a key's id, or a login's token id and email (audited as object_release_opened)."""
+    recorded: a key's id, or a login's token id and email (audited as object_release_opened).
+
+    `carry_from` names a closed release of the same collection whose members the new release starts with, so
+    a revision deposits only what is new or changed: its membership is copied in the same transaction, keeping
+    each member's original deposit, and its indexed fields are copied where the class's field spec is unchanged
+    and recomputed from the stored documents under the new definition otherwise. The release records what it
+    carried (`carried_from`: version and count)."""
     from .. import api_keys
 
     if not isinstance(version, str) or not version or len(version) > 64 or not version.isascii() or " " in version:
         raise ValueError("version must be a short ASCII string without spaces, e.g. 2026.11.0")
+    if carry_from is not None and (not isinstance(carry_from, str) or not carry_from or carry_from == version):
+        raise ValueError("carry_from names another, closed release of this collection, e.g. 2026.11.0")
     with con:
         _granted(con, depositor, key)
         defn = con.execute("SELECT definition FROM object_collections WHERE collection_key = ?", (key,)).fetchone()
@@ -172,17 +183,69 @@ def open_release(con, depositor: dict, key: str, version: str) -> tuple[dict, bo
         if row is not None:
             if row["state"] != "open":
                 raise ReleaseError(f"release {version} of {key} is closed; open a new version")
+            recorded = (_json(row["definition"]).get("carried_from") or {}).get("version")
+            if carry_from is not None and recorded != carry_from:
+                raise ReleaseError(f"release {version} of {key} is already open"
+                                   + (f", carried from {recorded}" if recorded else " without carried members"))
             return _state(row), False
         if con.execute("SELECT 1 FROM collection_releases WHERE collection_key = ? AND version = ?",
                        (key, version)).fetchone():
             raise ReleaseError(f"{key} already has a release {version}")
+        definition = _json(defn["definition"])
+        source = None
+        if carry_from is not None:
+            source = _release(con, key, carry_from, lock=True)
+            if source is None:
+                raise ValueError(f"{key} has no release {carry_from} to carry members from")
+            if source["state"] != "closed":
+                raise ValueError(f"release {carry_from} of {key} is still open; close it before carrying from it")
+            count = con.execute("SELECT COUNT(*) AS n FROM release_objects WHERE collection_key = ? AND version = ?",
+                                (key, carry_from)).fetchone()["n"]
+            definition["carried_from"] = {"version": carry_from, "objects": int(count)}
         key_id, token_id, email = api_keys.writer_columns(depositor)
         con.execute(f"INSERT INTO object_releases (collection_key, version, state, definition, opened_at, opened_by, "
                     f"opened_by_token_id, opened_by_email) VALUES (?, ?, 'open', ?, {con.dialect.now}, ?, ?, ?)",
-                    (key, version, defn["definition"], key_id, token_id, email))
+                    (key, version, json.dumps(definition), key_id, token_id, email))
+        if source is not None:
+            carry_members(con, key, carry_from, version, _json(source["definition"]), definition)
         if token_id:
-            _audit(con, "object_release_opened", email, f"{key} {version} with {token_id}")
+            _audit(con, "object_release_opened", email, f"{key} {version} with {token_id}"
+                   + (f", carrying {carry_from}" if source is not None else ""))
         return _state(_release(con, key, version)), True
+
+
+def carry_members(con, key: str, source: str, version: str, old_defn: dict, new_defn: dict) -> None:
+    """Copy release `source`'s members into `version`, and their indexed fields under `new_defn`."""
+    con.execute(f"{con.dialect.insert_or_ignore} release_objects (collection_key, version, object_id, class_name, "
+                "deposit_id) SELECT collection_key, ?, object_id, class_name, deposit_id FROM release_objects "
+                "WHERE collection_key = ? AND version = ?", (version, key, source))
+    old_kinds = old_defn["manifest"].get("object_kinds") or {}
+    new_kinds = new_defn["manifest"].get("object_kinds") or {}
+    classes = [r["class_name"] for r in con.execute(
+        "SELECT DISTINCT class_name FROM release_objects WHERE collection_key = ? AND version = ?", (key, version))]
+    for cls in classes:
+        spec = new_kinds.get(cls)
+        if not spec or not spec.get("fields"):
+            continue
+        old = old_kinds.get(cls) or {}
+        if old.get("fields") == spec["fields"]:
+            con.execute(f"{con.dialect.insert_or_ignore} release_object_fields (collection_key, version, object_id, "
+                        "field, value, num) SELECT f.collection_key, ?, f.object_id, f.field, f.value, f.num "
+                        "FROM release_object_fields f JOIN release_objects o ON o.collection_key = f.collection_key "
+                        "AND o.version = f.version AND o.object_id = f.object_id "
+                        "WHERE f.collection_key = ? AND f.version = ? AND o.class_name = ?", (version, key, source, cls))
+            continue
+        ids = [r["object_id"] for r in con.execute(
+            "SELECT object_id FROM release_objects WHERE collection_key = ? AND version = ? AND class_name = ?",
+            (key, version, cls))]
+        for start in range(0, len(ids), CARRY_BATCH):
+            batch = ids[start:start + CARRY_BATCH]
+            rows = con.execute("SELECT id, payload FROM dapper_objects WHERE id IN (" + ",".join("?" * len(batch))
+                               + ")", batch).fetchall()
+            fields = sorted({f for r in rows for f in field_rows(key, version, spec, r["id"], json.loads(r["payload"]))})
+            if fields:
+                con.executemany(f"{con.dialect.insert_or_ignore} release_object_fields (collection_key, version, "
+                                "object_id, field, value, num) VALUES (?, ?, ?, ?, ?, ?)", fields)
 
 
 def target(con, depositor: dict, key: str, version: str | None) -> tuple[str, dict]:
@@ -216,6 +279,16 @@ def _values(value) -> list:
     return []
 
 
+def field_rows(key: str, version: str, spec: dict, object_id: str, document: dict) -> list[tuple]:
+    """The release_object_fields rows one member's document gives under its kind's field spec."""
+    rows = []
+    for name, ref in spec["fields"].items():
+        for v in _values(document.get(ref["slot"])):
+            num = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+            rows.append((key, version, object_id, name, str(v)[:MAX_VALUE], num))
+    return rows
+
+
 def add_objects(con, key: str, version: str, defn: dict, deposit_id: str, items: list[dict]) -> int:
     """Record deposited objects as members of the release, and index the fields its object kinds declare.
     Idempotent: a member already recorded keeps its first deposit."""
@@ -226,11 +299,7 @@ def add_objects(con, key: str, version: str, defn: dict, deposit_id: str, items:
         spec = kinds.get(item["class_name"])
         if spec is None:
             continue
-        for name, ref in spec["fields"].items():
-            for v in _values(item["document"].get(ref["slot"])):
-                text = str(v)[:MAX_VALUE]
-                num = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
-                fields.append((key, version, item["id"], name, text, num))
+        fields += field_rows(key, version, spec, item["id"], item["document"])
     con.executemany(f"{con.dialect.insert_or_ignore} release_objects (collection_key, version, object_id, class_name, "
                     "deposit_id) VALUES (?, ?, ?, ?, ?)", members)
     if fields:

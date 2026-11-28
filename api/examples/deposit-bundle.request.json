@@ -1,4 +1,5 @@
 {
+  "dapper_version": "0.3.0-a1",
   "fixture_notice": "SYNTHETIC FIXTURE for the deposit contract (POST /v1/deposits). The objects are valid DAPPER at their real DAPPER-ID-1 addresses; the values, and the File, Activity and Agent they reference, are made up.",
   "objects": [
     {

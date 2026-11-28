@@ -580,6 +580,30 @@ do all of this with a `claims login`, no database password and no key
    records it in `collection_releases` and makes it current. Queries read
    closed releases only.
 
+**Every deposit names its DAPPER version** (2026-11-28): the body carries
+`"dapper_version": "0.3.0-a1"`, required, and the service refuses (400) any
+version but the vendored one, naming the one it accepts. `claims objects
+deposit` sends it. Documents written for an older version are converted first
+with DAPPER's `converter/migrate.py`, which is vendored with the schema.
+
+**A revision carries the release before it** (2026-11-28). Opening a release
+with `{"version": "2026.11.1", "carry_from": "2026.11.0"}` (CLI: `claims
+objects deposit ... --carry-from 2026.11.0`) starts it with every member of
+that closed release, copied inside the database in the same transaction as
+the open, each keeping its original deposit. Indexed fields are copied for
+classes whose field spec is unchanged and recomputed from the stored documents
+for classes whose spec the new definition changes. The release records
+`carried_from: {version, objects}` (in its definition, so no migration is
+needed) and reports it in its status. Deposits then add only what is new or
+changed, and the close mints a ResultCollection whose `was_revision_of` is the
+carried release. Carrying 100,000 members with their fields takes about 0.3 s
+on SQLite. Refused: carrying from a release that is missing, still open, or
+the same version (400); reopening an open release with a different
+`carry_from` (409).
+
+Not yet: removing a carried member that a deposit supersedes (a re-minted
+object whose old id should leave the revision). Today a revision only adds.
+
 Tables: `object_collections`, `object_releases`, `release_objects`,
 `release_object_fields`, `api_key_grants`, and `deposits.collection_key` /
 `release_version` (SQLite on connect; MySQL `schema/migrations/008_object_collections.sql`).

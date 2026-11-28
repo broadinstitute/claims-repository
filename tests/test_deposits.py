@@ -23,7 +23,7 @@ from service.collections import identity as cidn
 ROOT = Path(__file__).resolve().parent.parent
 client = TestClient(app)        # conftest gives this one the session's deposit key
 anonymous = TestClient(app)
-VECTORS = json.loads((ROOT / "vendor/dapper/schema/identity/test_vectors.json").read_text())["vectors"]
+VECTORS = json.loads((ROOT / "vendor/dapper/identity/test_vectors.json").read_text())["vectors"]
 ACCOUNT = json.loads((ROOT / "tests/fixtures/deposits/reveal-scientific-account.dapper.json").read_text())
 SECRET = "s" * 40
 
@@ -459,3 +459,16 @@ def test_cli_confirms_the_database_where_an_operator_would_type_it(tmp_path):
     wrong = run("issue", "a name", "--database", "some_other_database")
     assert wrong.returncode == 2 and "Refusing to change" in wrong.stderr and "unrecognized arguments" not in wrong.stderr
     assert run("revoke", "key_0123456789abcdef", "--database", "some_other_database").returncode == 2
+
+
+def test_a_deposit_names_the_dapper_version_it_was_written_for():
+    """dapper_version is required and must be the vendored version. `client.request` bypasses the suite's
+    default (conftest adds the version to `post` bodies that name none)."""
+    node = _minted("Proposition", statement="A deposit written for one DAPPER version.")
+    missing = client.request("POST", "/v1/deposits", json={"objects": [node]})
+    assert missing.status_code == 400 and cidn.DAPPER_VERSION in missing.json()["detail"], missing.text
+    older = client.request("POST", "/v1/deposits", json={"objects": [node], "dapper_version": "0.2.1-a1"})
+    assert older.status_code == 400 and "'0.2.1-a1'" in older.json()["detail"], older.text
+    named = client.request("POST", "/v1/deposits", json={"objects": [node], "dapper_version": cidn.DAPPER_VERSION})
+    assert named.status_code == 200, named.text
+    assert named.json()["validation"]["dapper_version"] == cidn.DAPPER_VERSION

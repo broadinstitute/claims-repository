@@ -66,7 +66,7 @@ def _gql(query, variables=None):
 def test_health():
     body = client.get("/v1/health").json()
     assert body["status"] == "ok"
-    assert body["dapper_profile"] == "0.2.0-a1"
+    assert body["dapper_profile"] == "0.3.0-a1"
 
 
 def test_swagger_docs_and_contract():
@@ -1247,7 +1247,8 @@ def test_reload_removes_rows_under_long_or_non_ascii_legacy_keys_on_sqlite():
 def test_numbers_strings_and_nesting_must_be_interoperable():
     from service.collections import identity as idn
 
-    def post(raw):
+    def post(raw):  # a raw body: the deposit's dapper_version is added to its text
+        raw = raw[:-1] + ',"dapper_version":"%s"}' % idn.DAPPER_VERSION if raw.endswith("}") else raw
         return client.post("/v1/deposits", content=raw.encode(), headers={"Content-Type": "application/json"})
     huge = "dapper:File." + "H" * 32
     for value in (10 ** 30, 2 ** 53, -(2 ** 53), 10 ** 400):

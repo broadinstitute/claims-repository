@@ -26,7 +26,7 @@ MANIFEST = """collection: cli-genesets
 kind: objects
 title: Gene sets deposited from the CLI
 methods: [tests]
-dapper_profile: 0.2.1-a1
+dapper_profile: 0.3.0-a1
 object_kinds:
   GeneSet:
     fields:
@@ -178,6 +178,26 @@ def test_register_deposit_resume_and_close(api, tmp_path, capsys):
     assert "closed" in out and "objects: 16 in 5 deposit(s)" in out
     claims("objects", "close", col, "2026.11.0", "--api", api)  # closing again changes nothing
     assert "not reported again" in capsys.readouterr().out
+
+
+def test_a_revision_carries_the_last_release_and_deposits_only_what_is_new(api, tmp_path, capsys):
+    """`--carry-from` opens the revision with the closed release's members; only the new document is sent."""
+    col = _collection(tmp_path)
+    source, extra = tmp_path / "release", tmp_path / "revision"
+    _documents(source, 3, c2m2=False)
+    claims("objects", "register", col, "--api", api)
+    claims("objects", "deposit", col, "r1", "--api", api, "--from", source, "--close")
+    before = _deposits("cli-genesets")
+    (extra / "sources").mkdir(parents=True)
+    (extra / "sources" / "sources.dapper.yaml").write_text(yaml.safe_dump(
+        {"gene_sets": [_gene_set("SET_new")], "gene_set_collections": [GSC]}))
+    capsys.readouterr()
+    claims("objects", "deposit", col, "r2", "--api", api, "--from", extra, "--carry-from", "r1", "--close")
+    out = capsys.readouterr().out
+    assert "opened       cli-genesets r2" in out and "carrying 10 members of r1" in out
+    assert "deposited    1 document(s) in 1 part(s)" in out
+    assert "GeneSet: 10" in out and "GeneSetCollection: 1" in out
+    assert _deposits("cli-genesets") == before + 1
 
 
 def test_a_group_the_service_cannot_verify_stops_the_run(api, tmp_path, capsys):

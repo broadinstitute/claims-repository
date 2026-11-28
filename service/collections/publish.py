@@ -243,6 +243,11 @@ def _trait(dims: dict) -> str | None:
     return dims["trait"]["value"] if "trait" in dims and ":" in dims["trait"]["value"] else None
 
 
+def _trait_contexts(trait: str | None) -> list | None:
+    """DAPPER 0.3 keeps a record's trait in its typed contexts (TraitContext), not in a `trait` slot."""
+    return [{"context_type": "TraitContext", "trait": trait}] if trait else None
+
+
 def dataset_doc(col: Collection, dims: dict, files: dict, bounds: dict, run_id: str) -> dict:
     """The Dataset record of one dataset: `dims` = {name: {value, label}}, `files` = {role: File record} in
     role order, `bounds` as where_for gives them, `run_id` the Activity that wrote the files."""
@@ -252,7 +257,7 @@ def dataset_doc(col: Collection, dims: dict, files: dict, bounds: dict, run_id: 
     return idn.mint("Dataset", {
         "name": f"{doc['title']}: {label}",
         "description": f"{doc['title']} for {label}." + (f" Holds only {where_text(bounds)}." if bounds else ""),
-        "trait": _trait(dims),
+        "contexts": _trait_contexts(_trait(dims)),
         "has_file": [f["id"] for f in files.values()],
         "dimension_values": [{"dimension": n, "dimension_value": dims[n]["value"]} for n in names],
         "file_roles": [{"role": r, "file": f["id"]} for r, f in files.items()],
@@ -397,7 +402,7 @@ def publish(con, col: Collection, spec: dict, base: Path, *, allow_dirty: bool =
             "name": f"{' / '.join(doc['methods'])} run: {label}",
             "description": ds.get("run") or f"The {' / '.join(doc['methods'])} run that wrote these result files.",
             "software_name": doc["methods"][0] if len(doc["methods"]) == 1 else None,
-            "trait": trait,
+            "contexts": _trait_contexts(trait),
         }))
         try:
             documented = prov.run_for({role: (f["doc"]["sha256"], f["location"]) for role, f in files.items()})

@@ -42,6 +42,27 @@ def _seed_test_key(con):
         con.commit()
 
 
+def _name_the_dapper_version():
+    """Deposits name the DAPPER version they were written for (`dapper_version`). Like the key, every test
+    client's `post` adds the vendored version to a deposit body that names none, so existing deposit calls keep
+    working. Tests of the refusal send their body with `client.request("POST", ...)`, which this leaves alone."""
+    from starlette.testclient import TestClient
+
+    from service.collections.identity import DAPPER_VERSION
+
+    if getattr(TestClient.post, "_names_version", False):
+        return
+    post = TestClient.post
+
+    def posting(self, url, *args, json=None, **kwargs):
+        if str(url).endswith("/v1/deposits") and isinstance(json, dict) and "dapper_version" not in json:
+            json = {**json, "dapper_version": DAPPER_VERSION}
+        return post(self, url, *args, json=json, **kwargs)
+
+    posting._names_version = True
+    TestClient.post = posting
+
+
 @pytest.fixture(scope="session")
 def depositor():
     """The session's deposit key: {key_id, name, key}."""
@@ -63,6 +84,7 @@ def _deposits_are_keyed(request):
         return con
 
     db.connect = connect
+    _name_the_dapper_version()
     seen = set()
     for item in request.session.items:
         client = getattr(item.module, "client", None)

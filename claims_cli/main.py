@@ -351,7 +351,7 @@ def cmd_collection_init(args):
         "description": f"{scaffold.TODO}: one paragraph on what this collection holds.",
         "owners": [f"{scaffold.TODO}-owner"],
         "methods": [method],
-        "dapper_profile": "0.2.1-a1",
+        "dapper_profile": objects_cli.DAPPER_VERSION,
         "attribution": {"agent": f"urn:{scaffold.TODO}:agent-the-claims-are-attributed-to"},
         "prefixes": prefixes,
         "relations": {"associated_with": "biolink:associated_with",

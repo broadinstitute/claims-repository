@@ -30,9 +30,15 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import re
+
 import yaml
 
 from . import auth
+
+# The DAPPER release this checkout validates and mints against (vendor/dapper); every deposit names it.
+DAPPER_VERSION = re.search(r"(?m)^version:\s*(\S+)", (Path(__file__).resolve().parent.parent / "vendor" / "dapper"
+                                                        / "schema" / "dapper.yaml").read_text()).group(1)
 
 # The service takes 1,000 objects, 5,000 edges and 16 MB per deposit; parts stay well inside (as the tested
 # reference client did), since sizes are estimated here from compact JSON.
@@ -380,10 +386,13 @@ class State:
 
 # --- deposit ---------------------------------------------------------------------------------------------------
 
-def _open(api: Api, key: str, version: str) -> None:
-    status, answer = api.send("POST", f"/v1/collections/{_q(key)}/releases", {"version": version})
+def _open(api: Api, key: str, version: str, carry_from: str | None = None) -> None:
+    body = {"version": version, **({"carry_from": carry_from} if carry_from else {})}
+    status, answer = api.send("POST", f"/v1/collections/{_q(key)}/releases", body)
     if status in (200, 201):
-        print(f"{'opened' if status == 201 else 'open':<12} {key} {version} at {api.base}", flush=True)
+        carried = answer.get("carried_from") if isinstance(answer, dict) else None
+        print(f"{'opened' if status == 201 else 'open':<12} {key} {version} at {api.base}"
+              + (f", carrying {carried['objects']:,} members of {carried['version']}" if carried else ""), flush=True)
         return
     sys.exit(f"claims: cannot open {key} {version} ({status}): {_detail(answer)}")
 
@@ -425,7 +434,8 @@ def _send_document(api: Api, key: str, version: str, root: Path, rel: str, skip:
     for part, objects, edges in split:
         if stop.is_set():
             raise Refused(0, "stopped")
-        _status, receipt = api.ok("POST", "/v1/deposits", {"collection": key, "release": version, "document": part})
+        _status, receipt = api.ok("POST", "/v1/deposits", {"collection": key, "release": version, "document": part,
+                                                           "dapper_version": DAPPER_VERSION})
         out["parts"] += 1
         out["objects"] += objects
         out["edges"] += edges
@@ -452,7 +462,7 @@ def cmd_deposit(args) -> None:
     todo = [p for p in paths if p not in state.done]
     print(f"selected     {len(paths):,} document(s) under {root}; {len(paths) - len(todo):,} already deposited "
           f"(state {state.path})", flush=True)
-    _open(api, key, version)
+    _open(api, key, version, getattr(args, "carry_from", None))
 
     skip = set(args.skip_group or [])
     if args.part_mb is not None and not 0.05 <= args.part_mb <= MAX_BYTES / 1e6:
@@ -562,6 +572,9 @@ def add_commands(sub) -> None:
     p.add_argument("--part-mb", type=float, default=None,
                    help=f"at most this many MB of JSON per deposit (default {MAX_BYTES / 1e6:g}); smaller parts keep a "
                         "document with many indexed values (e.g. big gene sets) within a gateway's request timeout")
+    p.add_argument("--carry-from", metavar="VERSION",
+                   help="open the release with the members of this closed release, so only new or changed "
+                        "documents need depositing (e.g. 2026.11.0)")
     p.add_argument("--close", action="store_true", help="close the release after the last document")
     p.add_argument("--workdir", help=f"where an s3:// source is mirrored and the state file kept (default "
                                      f"{default_workdir()})")

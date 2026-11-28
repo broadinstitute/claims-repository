@@ -75,12 +75,12 @@ def _fetch(object_id):
 # --- identity ---------------------------------------------------------------
 
 def test_vendored_identity_reproduces_dappers_frozen_vectors():
-    vectors = json.loads((idn.VENDOR / "schema/identity/test_vectors.json").read_text())["vectors"]
+    vectors = json.loads((idn.VENDOR / "identity/test_vectors.json").read_text())["vectors"]
     assert vectors
     for v in vectors:
         assert idn.mint(v["class"], v["instance"])["id"] == v["expected_id"], v["name"]
     assert idn.VENDOR_INFO["repository"] == "broadinstitute/dapper"
-    assert idn.DAPPER_VERSION == "0.2.1-a1"
+    assert idn.DAPPER_VERSION == "0.3.0-a1"
 
 
 def test_mint_refuses_fields_the_class_does_not_have():
