@@ -461,6 +461,12 @@ class Dialect:
         return "" if self.sqlite else " FOR SHARE"
 
     @property
+    def lock_update(self) -> str:
+        """Suffix that makes a SELECT lock its rows for writing until the transaction ends. SQLite has no row
+        locks; its single write lock serializes writing transactions."""
+        return "" if self.sqlite else " FOR UPDATE"
+
+    @property
     def insert_or_replace(self) -> str:
         return "INSERT OR REPLACE INTO" if self.sqlite else "REPLACE INTO"
 

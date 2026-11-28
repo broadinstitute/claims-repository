@@ -592,9 +592,17 @@ objects deposit ... --carry-from 2026.11.0`) starts it with every member of
 that closed release, copied inside the database in the same transaction as
 the open, each keeping its original deposit. Indexed fields are copied for
 classes whose field spec is unchanged and recomputed from the stored documents
-for classes whose spec the new definition changes. The release records
-`carried_from: {version, objects}` (in its definition, so no migration is
-needed) and reports it in its status. Deposits then add only what is new or
+for classes whose spec the new definition changes. Fields can run to millions
+of rows (cfde-genesets 2026.11.0 holds about 13 million: one per member gene),
+which in one transaction took 12 minutes for 8.4 million rows on MySQL 8, past
+any proxy timeout and too long to hold on a shared database. So they are copied
+after the open, 250 members per committed batch, for at most 20 s per call
+(`CARRY_FIELDS_BATCH`, `CARRY_SECONDS`), and opening the release again with the
+same `carry_from` continues where the last batch stopped. The release records
+`carried_from: {version, objects, fields_complete}` (in its definition, with
+the copy's cursor, so no migration is needed) and reports it in its status.
+Closing is refused (409) until `fields_complete`; the CLI keeps opening until
+it is. Deposits then add only what is new or
 changed, and the close mints a ResultCollection whose `was_revision_of` is the
 carried release. Carrying 100,000 members with their fields takes about 0.3 s
 on SQLite. Refused: carrying from a release that is missing, still open, or
