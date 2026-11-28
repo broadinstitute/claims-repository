@@ -131,6 +131,19 @@ How the old id behaves:
   edges as a new deposit (a system deposit by the migration's key), so an edge's provenance shows it came from a
   migration.
 
+## The cheap path: carry a release forward
+
+When a rescan shows a closed release's members keep their ids under the new version (the `cfde-genesets` case
+under 0.3), nothing has to be re-deposited. Open the next release with `carry_from` (docs/collections.md §13): its
+membership is copied from the closed release inside the database, and only new objects (for `cfde-genesets`, the
+source Organizations, Datasets and GeneSetLibraries) are deposited before it closes. The new release's
+ResultCollection names the old one in `was_revision_of`.
+
+Verifying the carried members under the new version at carry time is not done; the rescan does it beforehand.
+Measured cost, should it be wanted: recomputing an id takes about 3.5 ms for a GeneSet of 250 members, 29 ms for
+one of 2,000, and 0.2 ms for a File, so the whole `cfde-genesets` release (35,441 GeneSets, 45,723 Files) is a few
+minutes in one process.
+
 ## Releases stay immutable
 
 A closed release lists ids, and those ids keep resolving to the same bytes. A migration never edits a release.

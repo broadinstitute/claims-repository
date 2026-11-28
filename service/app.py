@@ -1117,14 +1117,19 @@ def _release_call(fn, *args):
 async def open_object_release(collection: str, request: Request, depositor: dict = Depends(api_keys.require_writer)):
     """Open a release of an object collection, to be filled by deposits naming the collection and this version
     (any number of parts), then closed. Needs a key granted the collection, or a `claims login` (any
-    collection). Opening an open release again returns it unchanged (200); a new one is 201."""
+    collection). Opening an open release again returns it unchanged (200); a new one is 201. With
+    `"carry_from": "<closed version>"` the new release starts with that release's members (and their indexed
+    fields), so a revision deposits only what is new or changed."""
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail='Send {"version": "..."}.')
     if not isinstance(body, dict) or not isinstance(body.get("version"), str):
         raise HTTPException(status_code=400, detail='Send {"version": "..."}.')
-    state, opened = await run_in_threadpool(_release_call, cobjects.open_release, depositor, collection, body["version"])
+    if body.get("carry_from") is not None and not isinstance(body["carry_from"], str):
+        raise HTTPException(status_code=400, detail="carry_from names a closed release of this collection")
+    state, opened = await run_in_threadpool(_release_call, cobjects.open_release, depositor, collection,
+                                            body["version"], body.get("carry_from"))
     return JSONResponse(state, status_code=201 if opened else 200)
 
 
