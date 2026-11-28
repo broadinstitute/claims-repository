@@ -63,37 +63,34 @@ schema. `scripts/vendor_dapper.py` now copies the outgoing version there before 
 `service/collections/identity_versions.py` loads any of them in one process (each identity module under its own
 module name) and exposes `mint_id`, `hashed`, `hashable` and `unknown_slots`.
 
-Proposed next step: let a deposit be checked under an archived version.
-- **Why.** REVEAL's hosted agent pins 0.2.1-a1. Moving the service to 0.3 alone would refuse every REVEAL
-  account deposit, because they use `question` and `mechanistic_model`.
-- **Rule.** A deposit names its version (`dapper_version` in the deposit body; default: current). The service
-  checks it against that vendored version and records the version with each object. A collection's manifest
-  `dapper_profile` becomes binding: deposits into a release must use that version.
-- **Retiring a version.** Once nothing deposits under it, drop it from the accepted list. Keep it in the archive
-  for rescans.
+**Decided (2026-11-27):**
+- **Deposits name their version explicitly.** A deposit carries `dapper_version`, required. The service checks
+  it against that vendored version and records the version with each object, and refuses a version it does not
+  accept. A collection's manifest `dapper_profile` becomes binding: deposits into a release must use it.
+- **Everything moves to 0.3 together.** REVEAL mechanisms, reveal-claims and the claims repository update to
+  0.3.0 at the same time, so there is no period in which the service accepts 0.2.1 deposits from live
+  producers. The archive keeps 0.2.1-a1 for rescans and conversion, not for new deposits.
+- **DAPPER owns the converters.** The service runs DAPPER's `converter/migrate.py`, vendored with the schema,
+  and never writes its own (see "Shape conversion", below).
 
-This also fixes most of the 16 test failures on this branch:
-- the suite's fixtures are 0.2.1-shaped documents (accounts with `question`, the 0.2.1 test vectors);
-- with per-deposit versions they would deposit as 0.2.1, unchanged.
-
-They are left failing on purpose until the rule above is agreed.
+So the 16 test failures on this branch are fixed by moving the suite's fixtures to 0.3 shapes with that
+converter, not by accepting 0.2.1 deposits.
 
 ## Shape conversion versus re-minting
 
 - **Re-mint only**: the payload is valid under the new version but hashes different slots (`different`). The new
   id is `compute_id` of the same payload. No content changes.
 - **Convert, then re-mint**: the payload is not valid under the new version (`invalid_current`). It needs a
-  conversion first. DAPPER has no 0.2→0.3 converter: `dapper/converter/` converts dig.geneset provenance, and
-  the 0.3 release notes describe the 0.2→0.3 steps in prose ("Migration from 0.2.0"). Proposed: DAPPER ships
-  one converter per release step (`converter/migrate_0_2_1_to_0_3_0.py`), as a pure function from a document
-  under the old version to one under the new. Some steps are mechanical:
-  - rename `mechanistic_model`;
-  - wrap `question` and `hypothesis` into `framing`;
-  - move `trait` and `ancestry` into `contexts`.
-
-  One isn't: a CausalStep needs its two variables named. So the converter must be able to refuse an object and
-  say why; such objects stay on their old id. The claims repository vendors the converters with the schema, so
-  rescans and re-mints use the same code DAPPER tests.
+  conversion first, by DAPPER's converter. DAPPER now ships `converter/migrate.py` (dapper commit `f58ecad`):
+  `migrate(document, from_version)` converts step by step to the checkout's release, re-mints, verifies, and
+  returns `{old id: new id}` for every record. Every DAPPER release that changes a shape must ship its step,
+  with fixtures of the previous release and tests, before it is tagged (dapper `docs/guides/releasing.md`).
+  The 0.2.1-a1 → 0.3.0-a1 step renames `mechanistic_model`, wraps `question` and `hypothesis` into `framing`,
+  moves `trait` and `ancestry` into `contexts`, turns CausalSteps into CausalLinks between CausalVariables, and
+  turns DISMECH fields into CorrespondsToDismech edges. It refuses, listing every problem, what it cannot carry
+  over faithfully (DISMECH fields with no page, a CausalStep with no subject or object); refused objects stay
+  on their old id. `vendor_dapper.py` should copy `converter/migrate.py` with the schema, so rescans and
+  re-mints run the code DAPPER tests.
 - **References move with it.** Converting a document changes the ids of its records and of every record that
   references them. A re-mint must run over whole documents (the deposit's objects together), in dependency order,
   as `dapper_identity.assign_ids` already does, never object by object.
@@ -139,8 +136,7 @@ How the old id behaves:
 A closed release lists ids, and those ids keep resolving to the same bytes. A migration never edits a release.
 For an object collection whose members changed id:
 
-- the migration opens a **new release** of the collection (for example `2026.11.0` → `2026.11.0+dapper-0.3.0`,
-  or the next version the owner chooses);
+- the migration opens a **new release** of the collection, with the next version the owner chooses;
 - it deposits the re-minted objects plus every unchanged member, then closes it;
 - the new release's ResultCollection names the old one in `was_revision_of`, so the chain is in DAPPER itself.
 
@@ -240,13 +236,10 @@ their new ids would cascade to whatever references them. Everything else, includ
 129,926 EvidenceItems and the 87,135 Propositions, is unchanged. The run takes about five minutes on a laptop.
 The full report is the TSV and JSON the script writes.
 
-## Open questions
+## Decisions
 
-- Should a deposit name its DAPPER version explicitly, or should the service try the current version and then the
-  archived ones? Explicit is safer: a payload valid under two versions with different meanings shouldn't be
-  guessed at.
-- How long should the service accept 0.2.1-a1 deposits after 0.3 is current? That is until REVEAL's hosted agent
-  moves to 0.3.
-- Successor release naming for migrated object collections: a new owner-chosen version, or a derived label such
-  as `2026.11.0+dapper-0.3.0`?
-- Should DAPPER own the per-release converters (proposed), or the claims repository?
+- Deposits name their DAPPER version explicitly.
+- REVEAL mechanisms, reveal-claims and the claims repository move to 0.3.0 together; 0.2.1 stays archived for
+  rescans and conversion only.
+- A migrated collection's successor release takes the next version its owner chooses; no derived naming scheme.
+- DAPPER owns the per-release converters; the claims repository vendors and runs them.
