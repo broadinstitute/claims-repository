@@ -389,12 +389,21 @@ class State:
 def _open(api: Api, key: str, version: str, carry_from: str | None = None) -> None:
     body = {"version": version, **({"carry_from": carry_from} if carry_from else {})}
     status, answer = api.send("POST", f"/v1/collections/{_q(key)}/releases", body)
-    if status in (200, 201):
-        carried = answer.get("carried_from") if isinstance(answer, dict) else None
-        print(f"{'opened' if status == 201 else 'open':<12} {key} {version} at {api.base}"
-              + (f", carrying {carried['objects']:,} members of {carried['version']}" if carried else ""), flush=True)
-        return
-    sys.exit(f"claims: cannot open {key} {version} ({status}): {_detail(answer)}")
+    if status not in (200, 201):
+        sys.exit(f"claims: cannot open {key} {version} ({status}): {_detail(answer)}")
+    carried = answer.get("carried_from") if isinstance(answer, dict) else None
+    print(f"{'opened' if status == 201 else 'open':<12} {key} {version} at {api.base}"
+          + (f", carrying {carried['objects']:,} members of {carried['version']}" if carried else ""), flush=True)
+    # The carried members' fields are copied a batch at a time; opening again continues the copy.
+    rounds = 0
+    while carried and carried.get("fields_complete") is False:
+        rounds += 1
+        if rounds % 10 == 0:
+            print(f"copying    the carried members' fields ({rounds} rounds)", flush=True)
+        status, answer = api.send("POST", f"/v1/collections/{_q(key)}/releases", body)
+        if status != 200:
+            sys.exit(f"claims: copying the fields carried into {key} {version} failed ({status}): {_detail(answer)}")
+        carried = answer.get("carried_from")
 
 
 def _close(api: Api, key: str, version: str) -> dict:

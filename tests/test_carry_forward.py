@@ -103,7 +103,7 @@ def test_a_revision_starts_with_the_members_and_fields_of_the_release_it_carries
     opened = _open("1.1", carry_from="1.0")
     assert opened.status_code == 201, opened.text
     carried = first["closed"]["objects"]
-    assert opened.json()["carried_from"] == {"version": "1.0", "objects": carried}
+    assert opened.json()["carried_from"] == {"version": "1.0", "objects": carried, "fields_complete": True}
     status = client.get(f"/v1/collections/{KEY}/releases/1.1").json()
     assert status["objects"] == carried and status["classes"] == first["closed"]["classes"]
     assert status["deposits"] == 0                                    # nothing was sent again
@@ -174,3 +174,25 @@ def test_carrying_a_hundred_thousand_members_takes_seconds(first):
     print(f"\ncarried 100,000 members with their fields in {seconds:.2f} s")
     assert client.get(f"/v1/collections/{KEY}/releases/9.1").json()["objects"] == 100_000
     assert seconds < 60
+
+
+def test_carried_fields_are_copied_in_batches_that_resume_and_closing_waits_for_them(first, monkeypatch):
+    """Millions of field rows are not copied in one transaction: each call copies batches until its time is up,
+    opening again continues, and the release cannot close before the copy is complete."""
+    from service.collections import objects as cobjects
+
+    monkeypatch.setattr(cobjects, "CARRY_FIELDS_BATCH", 2)
+    monkeypatch.setattr(cobjects, "CARRY_SECONDS", 0.0)       # one batch per call
+    opened = _open("1.3", carry_from="1.0")
+    assert opened.status_code == 201, opened.text
+    assert opened.json()["carried_from"]["fields_complete"] is False
+    refused = client.post(f"/v1/collections/{KEY}/releases/1.3:close")
+    assert refused.status_code == 409 and "still copying" in refused.text
+    assert client.get(f"/v1/collections/{KEY}/releases/1.3").json()["state"] == "open"
+    calls = 1
+    while not _open("1.3", carry_from="1.0").json()["carried_from"]["fields_complete"]:
+        calls += 1
+        assert calls < 50
+    assert calls >= first["closed"]["objects"] // 2
+    assert _fields("1.3") == _fields("1.0")
+    assert client.post(f"/v1/collections/{KEY}/releases/1.3:close").status_code == 200

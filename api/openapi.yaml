@@ -937,8 +937,11 @@ paths:
                   description: >-
                     A closed release of this collection whose members (and their indexed fields) the new release
                     starts with, so a revision deposits only what is new or changed. 400 if it is missing, open or
-                    the same version; 409 if the release is already open with another carry_from. The release's
-                    status reports `carried_from: {version, objects}`.
+                    the same version; 409 if the release is already open with another carry_from. Membership is
+                    copied when the release opens; the members' indexed fields are copied afterwards in committed
+                    batches for at most about 20 s per call. The release's status reports `carried_from: {version,
+                    objects, fields_complete}`; while `fields_complete` is false, POST the same body again to
+                    continue the copy (200). Closing before it is complete answers 409.
             example: { version: "2026.11.1", carry_from: "2026.11.0" }
       responses:
         '201':

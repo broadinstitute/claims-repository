@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 
 from .. import dapper_validation as dval
 from ..refs import DAPPER_ID_RE, dapper_refs
@@ -137,6 +138,8 @@ def _release(con, key: str, version: str, lock: bool = False):
 
 def _state(row) -> dict:
     carried = _json(row["definition"]).get("carried_from") if row["definition"] else None
+    if carried:   # the copy's cursor (fields_after) is internal
+        carried = {k: v for k, v in carried.items() if k in ("version", "objects", "fields_complete")}
     return {"collection": row["collection_key"], "version": row["version"], "state": row["state"],
             "release_id": row["release_id"], "opened_at": str(row["opened_at"]),
             "closed_at": str(row["closed_at"]) if row["closed_at"] else None,
@@ -164,10 +167,12 @@ def open_release(con, depositor: dict, key: str, version: str, carry_from: str |
     recorded: a key's id, or a login's token id and email (audited as object_release_opened).
 
     `carry_from` names a closed release of the same collection whose members the new release starts with, so
-    a revision deposits only what is new or changed: its membership is copied in the same transaction, keeping
-    each member's original deposit, and its indexed fields are copied where the class's field spec is unchanged
-    and recomputed from the stored documents under the new definition otherwise. The release records what it
-    carried (`carried_from`: version and count)."""
+    a revision deposits only what is new or changed. Its membership is copied in the opening transaction,
+    keeping each member's original deposit. Its indexed fields (copied where the class's field spec is
+    unchanged, recomputed from the stored documents under the new definition otherwise) can run to millions of
+    rows, so they are copied afterwards in batches, each committed on its own, for at most CARRY_SECONDS per
+    call: `carried_from` (version, objects) says `fields_complete`, and opening the release again with the same
+    `carry_from` continues the copy. The release cannot close until it is complete."""
     from .. import api_keys
 
     if not isinstance(version, str) or not version or len(version) > 64 or not version.isascii() or " " in version:
@@ -187,7 +192,20 @@ def open_release(con, depositor: dict, key: str, version: str, carry_from: str |
             if carry_from is not None and recorded != carry_from:
                 raise ReleaseError(f"release {version} of {key} is already open"
                                    + (f", carried from {recorded}" if recorded else " without carried members"))
-            return _state(row), False
+            resume = recorded is not None
+        else:
+            resume = None
+    if resume is not None:
+        if resume:
+            carry_fields(con, key, version)
+        return _state(_release(con, key, version)), False
+    with con:
+        _granted(con, depositor, key)
+        defn = con.execute("SELECT definition FROM object_collections WHERE collection_key = ?", (key,)).fetchone()
+        if defn is None:
+            raise CollectionNotFound(f"no object collection {key!r} is registered")
+        if _release(con, key, version, lock=True) is not None:   # another call opened it meanwhile
+            return open_release(con, depositor, key, version, carry_from)
         if con.execute("SELECT 1 FROM collection_releases WHERE collection_key = ? AND version = ?",
                        (key, version)).fetchone():
             raise ReleaseError(f"{key} already has a release {version}")
@@ -201,51 +219,85 @@ def open_release(con, depositor: dict, key: str, version: str, carry_from: str |
                 raise ValueError(f"release {carry_from} of {key} is still open; close it before carrying from it")
             count = con.execute("SELECT COUNT(*) AS n FROM release_objects WHERE collection_key = ? AND version = ?",
                                 (key, carry_from)).fetchone()["n"]
-            definition["carried_from"] = {"version": carry_from, "objects": int(count)}
+            definition["carried_from"] = {"version": carry_from, "objects": int(count), "fields_complete": False}
         key_id, token_id, email = api_keys.writer_columns(depositor)
         con.execute(f"INSERT INTO object_releases (collection_key, version, state, definition, opened_at, opened_by, "
                     f"opened_by_token_id, opened_by_email) VALUES (?, ?, 'open', ?, {con.dialect.now}, ?, ?, ?)",
                     (key, version, json.dumps(definition), key_id, token_id, email))
         if source is not None:
-            carry_members(con, key, carry_from, version, _json(source["definition"]), definition)
+            carry_members(con, key, carry_from, version)
         if token_id:
             _audit(con, "object_release_opened", email, f"{key} {version} with {token_id}"
                    + (f", carrying {carry_from}" if source is not None else ""))
-        return _state(_release(con, key, version)), True
+    if source is not None:
+        carry_fields(con, key, version)
+    return _state(_release(con, key, version)), True
 
 
-def carry_members(con, key: str, source: str, version: str, old_defn: dict, new_defn: dict) -> None:
-    """Copy release `source`'s members into `version`, and their indexed fields under `new_defn`."""
+CARRY_FIELDS_BATCH = 250   # carried members whose fields one committed batch copies
+CARRY_SECONDS = 20.0       # a call copying carried fields stops after this, so a request ends well inside a proxy timeout
+
+
+def carry_members(con, key: str, source: str, version: str) -> None:
+    """Inside the opening transaction: copy release `source`'s membership into `version`."""
     con.execute(f"{con.dialect.insert_or_ignore} release_objects (collection_key, version, object_id, class_name, "
                 "deposit_id) SELECT collection_key, ?, object_id, class_name, deposit_id FROM release_objects "
                 "WHERE collection_key = ? AND version = ?", (version, key, source))
-    old_kinds = old_defn["manifest"].get("object_kinds") or {}
-    new_kinds = new_defn["manifest"].get("object_kinds") or {}
-    classes = [r["class_name"] for r in con.execute(
-        "SELECT DISTINCT class_name FROM release_objects WHERE collection_key = ? AND version = ?", (key, version))]
-    for cls in classes:
-        spec = new_kinds.get(cls)
-        if not spec or not spec.get("fields"):
-            continue
-        old = old_kinds.get(cls) or {}
-        if old.get("fields") == spec["fields"]:
-            con.execute(f"{con.dialect.insert_or_ignore} release_object_fields (collection_key, version, object_id, "
-                        "field, value, num) SELECT f.collection_key, ?, f.object_id, f.field, f.value, f.num "
-                        "FROM release_object_fields f JOIN release_objects o ON o.collection_key = f.collection_key "
-                        "AND o.version = f.version AND o.object_id = f.object_id "
-                        "WHERE f.collection_key = ? AND f.version = ? AND o.class_name = ?", (version, key, source, cls))
-            continue
-        ids = [r["object_id"] for r in con.execute(
-            "SELECT object_id FROM release_objects WHERE collection_key = ? AND version = ? AND class_name = ?",
-            (key, version, cls))]
-        for start in range(0, len(ids), CARRY_BATCH):
-            batch = ids[start:start + CARRY_BATCH]
-            rows = con.execute("SELECT id, payload FROM dapper_objects WHERE id IN (" + ",".join("?" * len(batch))
-                               + ")", batch).fetchall()
-            fields = sorted({f for r in rows for f in field_rows(key, version, spec, r["id"], json.loads(r["payload"]))})
-            if fields:
-                con.executemany(f"{con.dialect.insert_or_ignore} release_object_fields (collection_key, version, "
-                                "object_id, field, value, num) VALUES (?, ?, ?, ?, ?, ?)", fields)
+
+
+def carry_fields(con, key: str, version: str, seconds: float | None = None) -> bool:
+    """Copy the indexed fields of `version`'s carried members, in batches of CARRY_FIELDS_BATCH members in
+    object-id order, each batch committed with the release's progress (`carried_from.fields_after`), until all
+    are copied or `seconds` (CARRY_SECONDS) have passed. A field spec unchanged since the source release is
+    copied row for row; a changed one is recomputed from the stored documents. True when complete.
+
+    Each batch locks the release row, so two calls never copy the same batch, and copies with insert-or-ignore,
+    so a batch repeated after a failure writes nothing twice."""
+    deadline = time.monotonic() + (CARRY_SECONDS if seconds is None else seconds)
+    while True:
+        with con:
+            row = con.execute("SELECT definition, state FROM object_releases WHERE collection_key = ? AND version = ?"
+                              + con.dialect.lock_update, (key, version)).fetchone()
+            defn = _json(row["definition"])
+            carried = defn.get("carried_from") or {}
+            if row["state"] != "open" or carried.get("fields_complete", True):
+                return True
+            after = carried.get("fields_after") or ""
+            batch = con.execute("SELECT object_id, class_name FROM release_objects WHERE collection_key = ? AND "
+                                "version = ? AND object_id > ? ORDER BY object_id LIMIT ?",
+                                (key, version, after, CARRY_FIELDS_BATCH)).fetchall()
+            source = _json(_release(con, key, carried["version"])["definition"])
+            old_kinds = source["manifest"].get("object_kinds") or {}
+            new_kinds = defn["manifest"].get("object_kinds") or {}
+            by_class: dict[str, list[str]] = {}
+            for r in batch:
+                by_class.setdefault(r["class_name"], []).append(r["object_id"])
+            for cls, ids in by_class.items():
+                spec = new_kinds.get(cls)
+                if not spec or not spec.get("fields"):
+                    continue
+                marks = ",".join("?" * len(ids))
+                if (old_kinds.get(cls) or {}).get("fields") == spec["fields"]:
+                    con.execute(f"{con.dialect.insert_or_ignore} release_object_fields (collection_key, version, "
+                                "object_id, field, value, num) SELECT collection_key, ?, object_id, field, value, num "
+                                f"FROM release_object_fields WHERE collection_key = ? AND version = ? AND object_id IN ({marks})",
+                                (version, key, carried["version"], *ids))
+                    continue
+                rows = con.execute(f"SELECT id, payload FROM dapper_objects WHERE id IN ({marks})", ids).fetchall()
+                fields = sorted({f for r in rows for f in field_rows(key, version, spec, r["id"], json.loads(r["payload"]))})
+                if fields:
+                    con.executemany(f"{con.dialect.insert_or_ignore} release_object_fields (collection_key, version, "
+                                    "object_id, field, value, num) VALUES (?, ?, ?, ?, ?, ?)", fields)
+            if batch:
+                carried["fields_after"] = batch[-1]["object_id"]
+            carried["fields_complete"] = len(batch) < CARRY_FIELDS_BATCH
+            defn["carried_from"] = carried
+            con.execute("UPDATE object_releases SET definition = ? WHERE collection_key = ? AND version = ?",
+                        (json.dumps(defn), key, version))
+            if carried["fields_complete"]:
+                return True
+        if time.monotonic() >= deadline:
+            return False
 
 
 def target(con, depositor: dict, key: str, version: str | None) -> tuple[str, dict]:
@@ -343,6 +395,10 @@ def close_release(con, depositor: dict, key: str, version: str) -> tuple[dict, b
         if not flipped:
             return release_status(con, key, version), False
         defn = _json(row["definition"])
+        if not (defn.get("carried_from") or {}).get("fields_complete", True):
+            raise ReleaseError(f"release {version} of {key} is still copying the fields of the members it carried "
+                               f"from {defn['carried_from']['version']}; open it again with the same carry_from "
+                               "until carried_from.fields_complete is true, then close it")
         members = [r["object_id"] for r in con.execute(
             "SELECT object_id FROM release_objects WHERE collection_key = ? AND version = ? ORDER BY object_id",
             (key, version))]
